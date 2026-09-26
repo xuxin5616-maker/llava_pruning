@@ -59,7 +59,7 @@ class TriadBackend:
     def generate(self, sample: Sample, prompt: str, method: PruningMethod,
                  rate: int, roi_mode: str, *, capture_visualization: bool,
                  capture_attention: bool,
-                 random_seed: int) -> dict:
+                 random_seed: int, do_sample: bool = True) -> dict:
         import torch
         from llava.constants import (DEFAULT_IMAGE_TOKEN, DEFAULT_IM_END_TOKEN,
                                      DEFAULT_IM_START_TOKEN, IMAGE_TOKEN_INDEX)
@@ -102,9 +102,16 @@ class TriadBackend:
         with torch.inference_mode():
             torch.cuda.synchronize()
             start = time.perf_counter()
+            generation_options = {
+                "do_sample": do_sample,
+                "max_new_tokens": 256,
+                "use_cache": True,
+            }
+            if do_sample:
+                generation_options.update(temperature=0.2, top_p=0.7)
             generated = self.model.generate(
                 inputs=tokens, images=pixels, image_sizes=[image.size],
-                do_sample=False, max_new_tokens=256, use_cache=True,
+                **generation_options,
             )
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - start

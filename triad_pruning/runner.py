@@ -2,6 +2,7 @@
 
 import csv
 import json
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,10 +15,15 @@ from .prompts import resolve_prompt
 
 def run(*, model_path, input_json, data_root, prompt_version, method_name,
         method_config, roi_mode, save_prune_vis, save_attention_vis,
-        output_dir, seed):
+        output_dir, seed=None, no_sample=False):
     samples = load_samples(input_json, data_root)
     if not samples:
         raise ValueError("Input JSON has no samples")
+    generated_seed = seed is None
+    if generated_seed:
+        seed = secrets.randbelow(2**31)
+    if not 0 <= seed <= 2**32 - len(samples):
+        raise ValueError("--seed must keep seed + sample index within NumPy's 32-bit range")
     method = load_method(method_name, method_config)
     # Validate all prompts before the expensive model load.
     prompts = [resolve_prompt(prompt_version, item.category, item.text) for item in samples]
@@ -39,8 +45,11 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         "save_prune_vis": save_prune_vis,
         "save_attention_vis": save_attention_vis,
         "seed": seed,
+        "seed_origin": "generated" if generated_seed else "explicit",
+        "do_sample": not no_sample,
         "samples": len(samples),
-        "decoding": "greedy, max_new_tokens=256",
+        "decoding": ("sampling, temperature=0.2, top_p=0.7, max_new_tokens=256"
+                     if not no_sample else "greedy, max_new_tokens=256"),
         "metric_rule": "A=defect (1), B=no defect (0); unparsed labeled answers count as incorrect",
     }
     (output / "run.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -63,6 +72,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                     capture_visualization=visualize,
                     capture_attention=visualize and save_attention_vis,
                     random_seed=seed + index,
+                    do_sample=not no_sample,
                 )
                 paths = None
                 if visualize:

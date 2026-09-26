@@ -21,8 +21,11 @@ def build_parser():
     parser.add_argument("--roi-mode", choices=("randomroi", "randompatch", "anyres_max_9"), default="randomroi")
     parser.add_argument("--save-prune-vis", action="store_true")
     parser.add_argument("--save-attention-vis", action="store_true")
+    parser.add_argument("--no-sample", action="store_true",
+                        help="Use greedy decoding instead of default sampling")
     parser.add_argument("--output-dir", type=Path, default=PROJECT / "outputs" / "run")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Fixed seed for a repeatable run; default generates a new seed")
     return parser
 
 
@@ -34,7 +37,7 @@ def main():
         method_name=args.method, method_config=args.method_config,
         roi_mode=args.roi_mode, save_prune_vis=args.save_prune_vis,
         save_attention_vis=args.save_attention_vis, output_dir=args.output_dir,
-        seed=args.seed,
+        seed=args.seed, no_sample=args.no_sample,
     )
     print(f"Saved results to {output}")
 
