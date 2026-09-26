@@ -33,6 +33,7 @@ class DataTests(unittest.TestCase):
             self.assertEqual(sample.gt, 1)
             self.assertEqual(choose_roi(sample, "randomroi")[0], "mask")
             self.assertEqual(choose_roi(sample, "randompatch")[0], "random")
+            self.assertEqual(choose_roi(sample, "anyres_max_9")[0], "anyres")
 
     def test_prompt_versions_and_fallback(self):
         for version in ("v0", "v1", "v2", "v3"):

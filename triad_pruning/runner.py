@@ -1,5 +1,6 @@
 """Rate sweep and reproducible result layout."""
 
+import csv
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 from .backend import TriadBackend
 from .data import load_samples
 from .methods import load_method
+from .metrics import Accuracy
 from .prompts import resolve_prompt
 
 
@@ -22,7 +24,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
     output = Path(output_dir).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {output}")
-    backend = TriadBackend(model_path)
+    backend = TriadBackend(model_path, roi_mode=roi_mode)
     output.mkdir(parents=True, exist_ok=True)
     config = json.loads(Path(method_config).read_text(encoding="utf-8"))
     metadata = {
@@ -39,12 +41,20 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         "seed": seed,
         "samples": len(samples),
         "decoding": "greedy, max_new_tokens=256",
+        "metric_rule": "A=defect (1), B=no defect (0); unparsed labeled answers count as incorrect",
     }
     (output / "run.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    summary_path = output / "summary.csv"
+    summary_fields = ("prune_rate", "complete", "expected_samples", "evaluated_samples",
+                      "labeled_samples", "correct", "incorrect", "unparsed", "accuracy")
+    with summary_path.open("w", encoding="utf-8", newline="") as summary_file:
+        csv.writer(summary_file).writerow(summary_fields)
     for rate in method.rates:
         rate_dir = output / f"prune_{rate:02d}"
         rate_dir.mkdir()
         records_path = rate_dir / "predictions.jsonl"
+        metrics_path = rate_dir / "metrics.json"
+        accuracy = Accuracy(expected_samples=len(samples))
         with records_path.open("w", encoding="utf-8") as stream:
             for index, (sample, (prompt, prompt_source)) in enumerate(zip(samples, prompts)):
                 visualize = rate in method.visualize_rates and (save_prune_vis or save_attention_vis)
@@ -82,5 +92,18 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                 }
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
                 stream.flush()
+                accuracy.add(sample.gt, result["answer"])
+                metrics_path.write_text(
+                    json.dumps(accuracy.result(rate, complete=False), ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
                 print(f"rate={rate:02d} sample={index + 1}/{len(samples)} id={sample.sample_id}", flush=True)
+        metrics = accuracy.result(rate, complete=True)
+        metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+        with summary_path.open("a", encoding="utf-8", newline="") as summary_file:
+            csv.writer(summary_file).writerow(metrics[field] for field in summary_fields)
+        score = "N/A" if metrics["accuracy"] is None else f"{metrics['accuracy']:.2%}"
+        print(f"rate={rate:02d} accuracy={score} "
+              f"({metrics['correct']}/{metrics['labeled_samples']}, "
+              f"unparsed={metrics['unparsed']})", flush=True)
     return output

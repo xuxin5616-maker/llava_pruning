@@ -9,6 +9,8 @@ from .data import Sample
 
 
 def choose_roi(sample: Sample, mode: str):
+    if mode == "anyres_max_9":
+        return "anyres", None, None
     if mode == "randompatch":
         return "random", None, None
     if mode != "randomroi":

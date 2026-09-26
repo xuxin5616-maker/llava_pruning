@@ -15,13 +15,17 @@ class MethodTests(unittest.TestCase):
     def test_fastv_config_and_layer_is_method_specific(self):
         config = Path(__file__).resolve().parents[1] / "configs" / "fastv.json"
         method = load_method("fastv", config)
-        self.assertEqual(method.rates, tuple(range(10, 100, 10)))
+        self.assertEqual(method.rates, tuple(range(0, 100, 10)))
         self.assertEqual(method.visualize_rates, {10, 30, 50, 70, 90})
         core = FakeCore()
         method.configure(core, 30, capture_attention=True)
         self.assertEqual(core.kwargs["layer"], 2)
         self.assertAlmostEqual(core.kwargs["keep_ratio"], 0.7)
         self.assertTrue(core.kwargs["capture_attention"])
+        method.configure(core, 0, capture_attention=True)
+        self.assertFalse(core.kwargs["enabled"])
+        self.assertFalse(core.kwargs["capture_attention"])
+        self.assertEqual(method.stats(core, 0)["mode"], "disabled_baseline")
 
     def test_invalid_visualize_rate(self):
         with tempfile.TemporaryDirectory() as directory:

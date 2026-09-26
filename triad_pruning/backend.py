@@ -16,7 +16,7 @@ VENDOR = Path(__file__).resolve().parents[1] / "vendor" / "llava"
 
 
 class TriadBackend:
-    def __init__(self, model_path: str | Path):
+    def __init__(self, model_path: str | Path, roi_mode: str = "randomroi"):
         # Delay heavy imports so JSON/configuration checks run without a GPU stack.
         if str(VENDOR) not in sys.path:
             sys.path.insert(0, str(VENDOR))
@@ -31,9 +31,14 @@ class TriadBackend:
         path = Path(model_path).expanduser().resolve()
         if not path.is_dir():
             raise NotADirectoryError(f"Model checkpoint not found: {path}")
+        if roi_mode not in {"randomroi", "randompatch", "anyres_max_9"}:
+            raise ValueError(f"Unknown ROI mode: {roi_mode}")
         config = LlavaQwenConfig.from_pretrained(path)
-        config.image_aspect_ratio = "randomroi"
-        config.mm_patch_merge_type = "spatial_avgpool_auto_unpad_add_newl"
+        config.image_aspect_ratio = "anyres_max_9" if roi_mode == "anyres_max_9" else "randomroi"
+        config.mm_patch_merge_type = (
+            "spatial_unpad" if roi_mode == "anyres_max_9"
+            else "spatial_avgpool_auto_unpad_add_newl"
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(path)
         self.model = LlavaQwenForCausalLM.from_pretrained(
             path, config=config, low_cpu_mem_usage=True,
@@ -109,8 +114,8 @@ class TriadBackend:
             "answer": answer,
             "generation_seconds": elapsed,
             "roi_source": roi_source,
-            "roi_boxes": crop_metadata[0]["roi_boxes"],
-            "stats": method.stats(core),
+            "roi_boxes": crop_metadata[0].get("roi_boxes", []),
+            "stats": method.stats(core, rate),
         }
         if capture_attention:
             result["attentions"] = method.image_attentions(core)[0]

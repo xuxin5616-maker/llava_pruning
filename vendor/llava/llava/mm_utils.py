@@ -562,8 +562,26 @@ def process_images(images, image_processor, model_cfg, masks=None, boxes_list=No
     #########################################################
     elif image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio:
         for image in images:
+            source_size = image.size
             image = process_anyres_image(image, image_processor, model_cfg.image_grid_pinpoints)
             new_images.append(image)
+            if return_pro_data:
+                grid_width, grid_height = get_anyres_image_grid_shape(
+                    source_size, model_cfg.image_grid_pinpoints,
+                    image_processor.crop_size["height"],
+                )
+                pro_datas.append({
+                    "mode": image_aspect_ratio,
+                    "final_newline": "add_newl" in model_cfg.mm_patch_merge_type,
+                    "original_size": list(source_size),
+                    "roi_boxes": [],
+                    "grid_patches": [grid_width, grid_height],
+                    "processed_view_sizes": [
+                        [image_processor.crop_size["width"], image_processor.crop_size["height"]],
+                        [grid_width * image_processor.crop_size["width"],
+                         grid_height * image_processor.crop_size["height"]],
+                    ],
+                })
     elif image_aspect_ratio == "crop_split":
         for image in images:
             image = process_highres_image_crop_split(image, model_cfg, image_processor)

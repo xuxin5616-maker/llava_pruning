@@ -1,11 +1,12 @@
-"""Project actual FastV decisions onto the source image (SigLip randomroi).
+"""Project FastV decisions onto the source image for SigLip image packing.
 
-This module needs only Pillow and NumPy. The token layout mirrors
-llava_arch.py's spatial_avgpool_auto_unpad_add_newl branch. Patch coordinates
-describe spatial anchors, not the full receptive field of contextual tokens.
+This module needs only Pillow and NumPy. Its randomroi and pure-anyres layouts
+mirror the corresponding llava_arch.py branches. Patch coordinates describe
+spatial anchors, not the full receptive field of contextual tokens.
 """
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -55,6 +56,58 @@ def build_randomroi_layout(pro_data, base_grid, patch_size):
     return layouts
 
 
+def build_anyres_layout(pro_data, base_grid, patch_size):
+    """Mirror the anyres_max_9 unpad/downsample/token-order path in llava_arch."""
+    width, height = map(int, pro_data["original_size"])
+    grid_width, grid_height = map(int, pro_data["grid_patches"])
+    if min(width, height, grid_width, grid_height, base_grid, patch_size) <= 0:
+        raise ValueError("Invalid anyres image or patch grid")
+    rows, cols = grid_height * base_grid, grid_width * base_grid
+    if width / height > cols / rows:
+        new_height = int(height * cols / width)
+        padding = (rows - new_height) // 2
+        rows -= 2 * padding
+    else:
+        new_width = int(width * rows / height)
+        padding = (cols - new_width) // 2
+        cols -= 2 * padding
+    if min(rows, cols) <= 0:
+        raise ValueError("Anyres unpadding produced an empty token grid")
+    scale = math.sqrt(rows * cols / (9 * base_grid * base_grid))
+    if scale > 1.1:
+        rows, cols = int(rows // scale), int(cols // scale)
+    if min(rows, cols) <= 0:
+        raise ValueError("Anyres downsampling produced an empty token grid")
+    global_count = base_grid * base_grid
+    return [
+        {
+            "name": "global", "source_box_xyxy": [0, 0, width, height],
+            "processed_size": [base_grid * patch_size, base_grid * patch_size],
+            "grid_shape": [base_grid, base_grid], "pool_factor": 1,
+            "cell_size_processed_pixels": patch_size,
+            "token_offset": 0, "token_count": global_count,
+            "token_row_stride": base_grid, "projection": "global",
+        },
+        {
+            "name": "anyres", "source_box_xyxy": [0, 0, width, height],
+            "processed_size": [cols * patch_size, rows * patch_size],
+            "grid_shape": [rows, cols], "pool_factor": None,
+            "cell_size_processed_pixels": patch_size,
+            "token_offset": global_count, "token_count": rows * cols,
+            "token_row_stride": cols + 1, "projection": "anyres",
+            "grid_patches": [grid_width, grid_height],
+            "row_newline_count": rows,
+        },
+    ]
+
+
+def _spatial_indices(layout):
+    rows, cols = layout["grid_shape"]
+    stride = layout.get("token_row_stride", cols)
+    return (layout["token_offset"] +
+            np.arange(rows)[:, None] * stride + np.arange(cols)[None, :]).reshape(-1)
+
+
 def project_view_mask(original_size, layout, keep):
     """Rasterize patch anchors using source-pixel centers.
 
@@ -69,6 +122,10 @@ def project_view_mask(original_size, layout, keep):
     if keep.size != rows * cols:
         raise ValueError("Keep mask length does not match this view's grid")
     keep = keep.reshape(rows, cols)
+    if layout.get("projection") == "anyres":
+        xs = np.minimum(((np.arange(width) + 0.5) * cols / width).astype(int), cols - 1)
+        ys = np.minimum(((np.arange(height) + 0.5) * rows / height).astype(int), rows - 1)
+        return ~keep[ys[:, None], xs[None, :]], np.ones((height, width), dtype=bool)
     covered = np.zeros((height, width), dtype=bool)
     pruned = np.zeros_like(covered)
     x0, y0, x1, y1 = layout["source_box_xyxy"]
@@ -94,40 +151,53 @@ def prepare_image_masks(original_size, pro_data, image_mask, base_grid, patch_si
     """Split a packed image mask and combine overlapping views explicitly."""
     if list(original_size) != list(pro_data.get("original_size", [])):
         raise ValueError("Original image size disagrees with preprocessing metadata")
-    layouts = build_randomroi_layout(pro_data, base_grid, patch_size)
+    anyres = pro_data.get("mode") == "anyres_max_9"
+    layouts = (build_anyres_layout(pro_data, base_grid, patch_size) if anyres
+               else build_randomroi_layout(pro_data, base_grid, patch_size))
     keep = np.asarray(image_mask["keep"], dtype=bool)
     start, end = image_mask["span"]
     patch_count = sum(view["token_count"] for view in layouts)
-    # The supported merge mode appends exactly one structural newline token.
-    if keep.ndim != 1 or len(keep) != patch_count + 1 or end - start != len(keep):
+    # Anyres adds one row-newline token per unpadded row; add_newl is optional.
+    row_newlines = layouts[1]["grid_shape"][0] if anyres else 0
+    final_newline = not anyres or bool(pro_data.get("final_newline", False))
+    sequence_tokens = patch_count + row_newlines + int(final_newline)
+    if keep.ndim != 1 or len(keep) != sequence_tokens or end - start != len(keep):
         raise ValueError(
-            f"Expected {patch_count} patch tokens + 1 newline, got {keep.size}. "
+            f"Expected {patch_count} patch tokens + {row_newlines + int(final_newline)} newlines, got {keep.size}. "
             "Image-token truncation or a different merge mode cannot be visualized safely."
         )
     width, height = original_size
     covered_any = np.zeros((height, width), dtype=bool)
     kept_any = np.zeros_like(covered_any)
     views = []
+    pruned_patches = 0
     for layout in layouts:
-        offset, count = layout["token_offset"], layout["token_count"]
-        view_keep = keep[offset:offset + count]
+        indices = _spatial_indices(layout)
+        view_keep = keep[indices]
+        pruned_patches += int((~view_keep).sum())
         pruned, covered = project_view_mask(original_size, layout, view_keep)
         covered_any |= covered
         kept_any |= covered & ~pruned
         view_info = dict(layout)
         view_info.update({
-            "sequence_span": [start + offset, start + offset + count],
+            "sequence_span": [start + layout["token_offset"],
+                              start + int(indices[-1]) + 1],
             "kept_local_indices": np.flatnonzero(view_keep).tolist(),
             "pruned_local_indices": np.flatnonzero(~view_keep).tolist(),
         })
+        if layout.get("projection") == "anyres":
+            rows, cols = layout["grid_shape"]
+            newline_indices = layout["token_offset"] + np.arange(rows) * (cols + 1) + cols
+            view_info["row_newline_kept"] = keep[newline_indices].tolist()
         views.append({"metadata": view_info, "pruned": pruned, "covered": covered})
     return {
         "views": views,
         "combined_pruned": covered_any & ~kept_any,
         "covered": covered_any,
         "patch_tokens": patch_count,
-        "pruned_patch_tokens": int((~keep[:-1]).sum()),
-        "image_newline_kept": bool(keep[-1]),
+        "sequence_tokens": sequence_tokens,
+        "pruned_patch_tokens": pruned_patches,
+        "image_newline_kept": bool(keep[-1]) if final_newline else None,
     }
 
 
@@ -136,11 +206,13 @@ def build_attention_overlay(original, image_attention, image_mask, prepared):
     scores = np.asarray(image_attention["scores"], dtype=np.float32)
     if (image_attention["span"] != image_mask["span"]
             or scores.ndim != 1
-            or scores.size != prepared["patch_tokens"] + 1
+            or scores.size != prepared["sequence_tokens"]
             or not np.isfinite(scores).all()):
         raise ValueError("Ranking attention does not match the image token layout")
-    # The final image-newline token has no spatial cell.
-    patch_scores = np.maximum(scores[:-1], 0)
+    # Structural newline tokens have no spatial cells.
+    spatial_indices = np.concatenate([_spatial_indices(view["metadata"])
+                                      for view in prepared["views"]])
+    patch_scores = np.maximum(scores[spatial_indices], 0)
     maximum = float(patch_scores.max()) if patch_scores.size else 0.0
     scale = maximum if maximum > 0 else 1.0
     columns = []
@@ -149,9 +221,9 @@ def build_attention_overlay(original, image_attention, image_mask, prepared):
         width, height = layout["processed_size"]
         source = original.convert("RGB").crop(layout["source_box_xyxy"])
         source = source.resize((width, height), Image.Resampling.BILINEAR)
-        offset, count = layout["token_offset"], layout["token_count"]
+        indices = _spatial_indices(layout)
         rows, cols = layout["grid_shape"]
-        grid = (patch_scores[offset:offset + count] / scale).reshape(rows, cols)
+        grid = (np.maximum(scores[indices], 0) / scale).reshape(rows, cols)
         heat = Image.fromarray(grid.astype(np.float32), mode="F")
         heat = np.asarray(heat.resize((width, height), Image.Resampling.BILINEAR))
         heat = np.clip(heat, 0.0, 1.0)
@@ -260,7 +332,7 @@ def save_fastv_visualizations(original_images, pro_datas, image_masks, *,
                 draw.text((index * panel_width + 6, 5), caption, fill="black")
             draw.text((6, 25), f"FastV layer index={fastv_layer}, keep_ratio={keep_ratio}; "
                       f"pruned patches={masks['pruned_patch_tokens']}/{masks['patch_tokens']}", fill="black")
-            draw.text((6, 43), "Uncovered margins unchanged. ROI decisions are also saved separately.", fill="black")
+            draw.text((6, 43), "Uncovered margins unchanged. View decisions are also saved separately.", fill="black")
             comparison.save(directory / "comparison.png")
         if overlays is not None:
             overlays[image_index].save(directory / "attention_overlay.png")

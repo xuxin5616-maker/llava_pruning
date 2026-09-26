@@ -13,7 +13,7 @@ class PruningMethod(Protocol):
 
     def configure(self, core, prune_rate: int, *, capture_attention: bool) -> None: ...
 
-    def stats(self, core) -> dict: ...
+    def stats(self, core, prune_rate: int) -> dict: ...
 
     def image_masks(self, core) -> list: ...
 
@@ -39,10 +39,12 @@ class FastVMethod:
         rates = tuple(config["prune_rates"])
         visualize = frozenset(config.get("visualize_rates", []))
         if (not rates or len(set(rates)) != len(rates) or
-                any(type(rate) is not int or not 0 < rate < 100 for rate in rates)):
-            raise ValueError("FastV prune_rates must be distinct integers from 1 to 99")
+                any(type(rate) is not int or not 0 <= rate < 100 for rate in rates)):
+            raise ValueError("FastV prune_rates must be distinct integers from 0 to 99")
         if not visualize.issubset(rates):
             raise ValueError("FastV visualize_rates must be a subset of prune_rates")
+        if 0 in visualize:
+            raise ValueError("Zero-rate baseline has no FastV pruning/attention visualization")
         layer = config["layer"]
         min_tokens = config.get("min_tokens", 1)
         if type(layer) is not int or layer < 1 or type(min_tokens) is not int or min_tokens < 1:
@@ -54,15 +56,18 @@ class FastVMethod:
         if prune_rate not in self.rates:
             raise ValueError(f"Prune rate {prune_rate} is not configured")
         core.configure_fastv(
-            enabled=True,
+            enabled=prune_rate != 0,
             layer=self.layer,
             keep_ratio=1.0 - prune_rate / 100.0,
             min_tokens=self.min_tokens,
             preserve_image_newline=self.preserve_image_newline,
-            capture_attention=capture_attention,
+            capture_attention=capture_attention and prune_rate != 0,
         )
 
-    def stats(self, core) -> dict:
+    def stats(self, core, prune_rate: int) -> dict:
+        if prune_rate == 0:
+            return {"mode": "disabled_baseline", "keep_ratio": 1.0,
+                    "fastv_layer": None, "batch": []}
         return core.get_fastv_stats()
 
     def image_masks(self, core) -> list:
