@@ -9,7 +9,7 @@ from pathlib import Path
 from .backend import TriadBackend
 from .data import load_samples
 from .methods import load_method
-from .metrics import Accuracy
+from .metrics import Accuracy, METRIC_RULE
 from .prompts import resolve_prompt
 
 
@@ -51,12 +51,13 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         "decoding": ("sampling, temperature=0.2, top_p=0.7, max_new_tokens<=512"
                      if not no_sample else "greedy, max_new_tokens<=512 (Triad context budget)"),
         "inference": getattr(backend, "inference_config", {}),
-        "metric_rule": "A=defect (1), B=no defect (0); unparsed labeled answers count as incorrect",
+        "metric_rule": METRIC_RULE,
     }
     (output / "run.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     summary_path = output / "summary.csv"
     summary_fields = ("prune_rate", "complete", "expected_samples", "evaluated_samples",
-                      "labeled_samples", "correct", "incorrect", "unparsed", "accuracy")
+                      "labeled_samples", "correct", "incorrect", "unparsed", "accuracy",
+                      "parsed_samples", "tp", "fp", "tn", "fn", "precision", "recall", "tnr")
     with summary_path.open("w", encoding="utf-8", newline="") as summary_file:
         csv.writer(summary_file).writerow(summary_fields)
     for rate in method.rates:
@@ -120,4 +121,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         print(f"rate={rate:02d} accuracy={score} "
               f"({metrics['correct']}/{metrics['labeled_samples']}, "
               f"unparsed={metrics['unparsed']})", flush=True)
+        detail = " ".join(f"{name}={metrics[name]:.2%}" if metrics[name] is not None else f"{name}=N/A"
+                          for name in ("precision", "recall", "tnr"))
+        print(f"rate={rate:02d} {detail} (parsed labeled samples={metrics['parsed_samples']})", flush=True)
     return output

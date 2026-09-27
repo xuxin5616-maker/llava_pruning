@@ -73,7 +73,61 @@ Each image directory now saves only `comparison.png` (`--save-prune-vis`) and `a
 
 Each completed rate prints image-level accuracy and appends a row to `summary.csv`. Each `prune_XX/metrics.json` also tracks partial progress while running (`complete: false` until the rate finishes). Accuracy uses the first answer option only: `A` means defect (`gt=1`), `B` means no defect (`gt=0`); unparsed labeled answers count as incorrect. Records without `gt` are excluded. This is binary classification accuracy, not segmentation accuracy or AUROC. The `accuracy` field is a fraction, e.g. `0.9` means 90%.
 
+`run.py` now automatically saves **one `metrics_vs_pruning.png`** in the output directory after all configured rates finish. It plots ACC, PRE (Precision), Recall and TNR on one set of axes, with pruning percentage on the horizontal axis and a fixed **50%--100%** vertical range. The paper-style figure uses a white background, serif type, blue/red marked solid/dashed lines and a light dotted grid. Values below 50% are outside the view, not raised to 50%; the figure warns about these points and their exact values remain in the data files. No Excel, GPU profiling, sample-count limit or `ex.py` scheduling is added to this workflow. Existing sample-visualization flags remain independent.
+
+The existing `summary.csv` and each `metrics.json` now also record `parsed_samples`, `tp`, `fp`, `tn`, `fn`, `precision`, `recall` and `tnr`. Defect (`gt=1`, answer A) is the positive class. **ACC still uses all labeled samples and counts unparsed answers as incorrect; PRE/Recall/TNR use only parsed, labeled A/B answers.** On that parsed subset, PRE = TP/(TP+FP), Recall = TP/(TP+FN), TNR = TN/(TN+FP). Unparsed counts are retained separately. Zero denominators produce JSON `null` / empty CSV cells and gaps in the chart, never invented zeros. All stored metrics are fractions in [0,1]; the chart converts them to percentages. Scores are pooled over samples, not category-macro averages.
+
+In an existing working server environment, install only the added plotting dependency (do not reinstall Torch/FlashAttention):
+
+```bash
+python -m pip install "matplotlib>=3.7,<4"
+```
+
+Continue using the same `run.py` command and your chosen input JSON; no new flags are needed. Matplotlib is checked before model loading and uses a headless backend. To redraw from a **new-format** saved `summary.csv` without inference:
+
+```bash
+python -m triad_pruning.metric_plot /path/to/run/output
+```
+
+Older accuracy-only summaries lack PRE/Recall/TNR and cannot be plotted by this command without recomputing those statistics from the predictions. Plot export failure leaves evaluation results intact.
+
 The common CLI intentionally has no `--layer`: another pruning method may have no layer parameter or different parameters. Add a method implementation in `triad_pruning/methods.py`, register it in `METHODS`, and give it its own config file. Keep model-family-specific code in `triad_pruning/backend.py` or add a separate backend when the supported checkpoint family changes.
+
+## 0--90% benchmark, plots and Excel with `ex.py`
+
+`python ex.py` runs **0, 10, 20, ..., 90%**. By default, GPU 4 runs 0/20/40/60/80% and GPU 5 runs 10/30/50/70/90%, with **at most one worker per GPU**. Each rate starts a fresh process/model copy, so allocator peaks are reset independently and each total time includes model loading. Defaults match the earlier command: checkpoint `/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/`, MVTec `question_musc.jsonl` and data root under `/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/`, prompt v0, anyres_max_9 and greedy decoding. **All jobs disable sample visualization completely:** no attention-overlay/pruning images, no visualization attention/mask capture, and no `visualizations/` directory. The scores required for pruning itself still run at nonzero rates. It reuses the other settings in `configs/fastv.json` without changing that file; normal `run.py` visualization switches remain available. The final benchmark curves are separate from sample visualizations.
+
+```bash
+python -m pip install -r requirements-report.txt
+python ex.py --output-dir output/ex_0_90_100
+# Optional: --model-path /path/to/Triad_ov --input-json /path/to/questions.jsonl
+#           --data-root /path/to/dataset --seed 42
+
+# Better controlled timing: all ten rates sequentially on the same GPU.
+python ex.py --gpus 5 --output-dir output/ex_0_90_gpu5_100
+```
+
+All jobs process only the **first 100 input records in file order**, with no shuffling (or all available records if there are fewer than 100). The launcher saves their shared subset as `input_first_100.json` in the experiment directory; the source JSON/JSONL is not changed. No inference is run on later records. Accuracy and generation time cover only this subset; total time and memory peaks still include model loading. The job specs and benchmark summary record the source path, subset path, selected count, shared seed and GPU assignment. This limit applies only to `ex.py`; normal `run.py` is unchanged. Reporting dependencies are checked before GPU workers launch; install only `requirements-report.txt` into an already-working server environment, not a replacement Torch/FlashAttention stack.
+
+Do not prefix this command with a single-GPU restriction; the launcher sets each child's `CUDA_VISIBLE_DEVICES` before Torch is imported. Use `--gpus 4 5` (default) or `--gpus 5` to select physical GPU IDs. Without `--output-dir`, it creates a timestamped `output/ex_YYYYMMDD_HHMMSS` directory. Explicit output directories must be new/empty. Watch `gpu<N>_prune_<RR>.log` there; model outputs are in `gpu<N>_prune_<RR>/prune_<RR>/`. The terminal reports the start and completion of every rate; detailed progress stays in its log.
+
+After all rates finish, the experiment directory contains:
+
+- `benchmark_curves.png` (300 dpi) and `benchmark_curves.pdf` (vector): four horizontal panels for accuracy, total/generation time, allocated/reserved peak memory, and mean per-image generation time. White background, serif type, blue circles/red squares, solid/dashed lines and light dotted grids follow the supplied paper-figure style. Labels are English for portable server rendering. No smoothing or invented data points.
+- `benchmark.xlsx`: numeric `Metrics` table (one row per rate), `Settings`, `Definitions` (units and measurement scope), and an embedded `Figure`. Includes accuracy, counts, timings, memory, mean generation milliseconds/image, generation-only images/s, GPU identity and error fields. Missing values remain blank; failure/partial results remain explicitly marked, with gaps in curves rather than zeros.
+- `benchmark.json`: raw resource measurements and shared settings; `benchmark.csv`: flat numeric table including derived metrics. Logs, predictions and per-rate accuracy metrics are also retained.
+
+The reports contain `total_seconds` (process launch to exit, including model loading, inference and JSON/log saving), `generation_seconds_sum` (sum of existing synchronized per-image generate timings), and peak PyTorch `allocated`/`reserved` VRAM in GiB. For inference timing, prefer `generation_seconds_sum`: it excludes loading, image preprocessing and result-file writing, but includes the pruning-score computation and the first cold call (no warmup exclusion). `mean_generation_ms` is this sum divided by evaluated samples, times 1000; it is **not per-token latency or time to first token**. Peaks are reset before model loading and cover the whole run, not just the final sample. These exclude CUDA contexts, other processes and memory allocated outside PyTorch; they are **not whole-board nvidia-smi usage or GPU utilization percentages**. `experiment_wall_seconds` is the complete scheduled sweep's elapsed time, not the sum of all workers' durations. Per-job timings exclude waiting in the GPU queue, and all measured timings exclude final report export. Failed jobs retain logs and a resource report where possible, with nonzero exit status rather than fabricated zero memory values; the remaining rates still run after a worker failure.
+
+To re-export reports from existing measurements (including an older two-rate run), without loading the model or rerunning inference:
+
+```bash
+python ex.py --report-only output/ex_0_90_100
+```
+
+This replaces only the derived `benchmark.csv`, plot files and workbook in that directory. It preserves `benchmark.json`, logs and predictions, and does not invent rates absent from an old run. If export fails, raw JSON/CSV remain available and the launcher prints this recovery command.
+
+Nonzero rates still include independent Q/K scoring overhead. The current implementation masks attention and retains the full hidden-state/KV-cache sequence; it does not guarantee a speedup even with sample visualization disabled. The two GPUs may also differ or share CPU/disk bottlenecks; these timings alone do not establish a pruning speedup. For more controlled comparisons, use the single-GPU option and repeat measurements. Run this on the inference server with the selected GPUs available; the launcher does not stop other users' jobs. Stop an old benchmark before restarting with the updated script and a new output directory; editing this file cannot change already-running workers. When updating the server, copy `ex.py`, `benchmark_report.py` and `requirements-report.txt` together.
 
 ## Research cautions
 

@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from triad_pruning.methods import METHODS
+from triad_pruning.metric_plot import check_plot_dependencies, save_metric_plot
 from triad_pruning.runner import run
 
 
@@ -35,6 +36,7 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    check_plot_dependencies()
     output = run(
         model_path=args.model_path, input_json=args.input_json,
         data_root=args.data_root, prompt_version=args.prompt_version,
@@ -44,6 +46,14 @@ def main():
         seed=args.seed, no_sample=args.no_sample,
     )
     print(f"Saved results to {output}")
+    try:
+        figure = save_metric_plot(output / "summary.csv")
+    except Exception as error:
+        raise RuntimeError(
+            f"Evaluation finished; predictions and summary.csv are saved, but plotting failed. "
+            f'Retry without inference: python -m triad_pruning.metric_plot "{output}"'
+        ) from error
+    print(f"Saved ACC/PRE/Recall/TNR curves to {figure}")
 
 
 if __name__ == "__main__":

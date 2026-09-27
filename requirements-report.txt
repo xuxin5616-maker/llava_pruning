@@ -1,0 +1,4 @@
+# Reporting only: do not reinstall/replace the server's Torch or FlashAttention.
+matplotlib>=3.7,<4
+openpyxl>=3.1,<4
+pillow>=10,<11

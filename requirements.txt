@@ -1,5 +1,6 @@
 accelerate==0.34.0
 numpy==1.26.1
+matplotlib>=3.7,<4
 opencv-python==4.10.0.84
 pillow==10.4.0
 torch==2.1.2
