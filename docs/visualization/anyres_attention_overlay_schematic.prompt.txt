@@ -1,0 +1,42 @@
+Use case: scientific-educational.
+Create ONE clear annotated Chinese teaching infographic explaining the exact layout produced by the Python function build_attention_overlay() for anyres_max_9 in a Triad/LLaVA FastV project. This is an explanatory mockup, NOT real inference evidence. Raster image, high-resolution, clean white background, restrained navy text, readable Chinese sans-serif, professional research-notebook style. Prefer a wide overall canvas around 2200x1700 pixels so the tall actual-output mockup fits on the left and concise numbered explanations fit on the right.
+
+Title, verbatim: "anyres_max_9：attention_overlay.png 布局示意"
+Subtitle, verbatim: "示例：方形原图，2×2 高分辨率切块；热力值为示意"
+
+Most important: faithfully depict the actual output as TWO UNEQUAL COLUMNS and TWO ROWS, NOT a uniform 2x2 image grid and NOT a nine-tile collage.
+The actual file has a narrow left column labeled exactly "global" and a wider right column labeled exactly "anyres". For this specific teaching example the right image has TWICE the width and height of the left image. Both columns show the SAME complete source object, same pose and background; only size/resolution differs.
+Precise source-code geometry for this example: global view 378x378 px; anyres view 756x756 px. Actual file has an 8 px horizontal gap, 26 px title strip, an 8 px gap between rows, total canvas 1142x1546 px. Scale this mockup uniformly to fit the left side of the infographic; do not distort its proportions.
+Within the mockup: global original at (0,26), anyres original at (386,26); global attention overlay at (0,790), anyres attention overlay at (386,790). Thus there is a substantial WHITE EMPTY AREA below the small top-left image before the lower row starts, and another white empty area below the small bottom-left image. These white areas must remain visible. The global lower image must start at the SAME y coordinate as the anyres lower image; do not pack the small images tightly together. All four panels are square. Inside the actual-output mockup the only native headers are global and anyres.
+
+Source image example: a realistic top-down industrial inspection photograph of ONE silver hexagonal metal nut with a circular dark central hole, centered on a lightly textured gray surface, no writing or brand. Show the same complete nut in every panel; no separate objects or alternative camera angles.
+Top row: the uncolored source views, small whole-image global at left and larger whole-image anyres at right.
+Bottom row: the same source views with a translucent smoothly interpolated JET-style attention heatmap. The nut and background must remain clearly visible through the colors, as if blending 60% source RGB with 40% color heatmap. Mostly dark blue/cyan lower attention, a few green/yellow/orange higher-attention areas, and a localized red maximum on the large right view. The global and anyres attention patterns may differ. Use one shared scale: do NOT force both views to have equal red maxima. Heatmap is illustrative text-to-image token attention, not anomaly ground-truth segmentation, not physical temperature. No blacked-out patch squares, no binary segmentation mask, no ROI rectangles, no 3x3 panel grid.
+
+Place numbered annotation markers 1,2,3,4 at the four panel corners and connect them to a clearly organized right-hand explanation column. These markers/callouts are explanatory additions, not actual model output.
+Exact explanatory text, with suitable line breaks:
+"① 左上 global"
+"整张原图的缩小视图"
+"② 右上 anyres"
+"高分辨率分支对应的整图显示"
+"③ 左下 global"
+"全局图像 token 的 attention 叠加"
+"④ 右下 anyres"
+"高分辨率 token 映射回整图后的 attention 叠加"
+
+Add a small callout with a leader pointing specifically into the white blank left-column gap, not into a photo:
+"白色留空来自行高对齐，不是剪枝"
+
+Additional concise explanatory text on right:
+"右列不是把 ROI 或切块逐张展开"
+"两列共用最大 attention 归一化"
+"叠加 = 60% 原图 + 40% 热力图"
+Include a slim horizontal JET color legend with blue end labeled "低", red end labeled "高", caption "相对 attention 强度".
+Additional technical caption:
+"来源：排名层最后一个有效提示词 token"
+"对图像 token 的注意力，多头平均"
+"颜色不是缺陷概率，也不表示是否被剪掉"
+
+Footer, verbatim:
+"热力值非模型实测；编号、箭头、说明和色条为示意标注，实际文件不包含。"
+Constraints: keep all Chinese text correct and comfortably readable, do not add random labels or extra panels. Preserve the asymmetric column widths and substantial left-column white gaps. The purpose is to explain actual output structure and the meaning of each part accurately.

@@ -21,8 +21,12 @@ def build_parser():
     parser.add_argument("--roi-mode", choices=("randomroi", "randompatch", "anyres_max_9"), default="randomroi")
     parser.add_argument("--save-prune-vis", action="store_true")
     parser.add_argument("--save-attention-vis", action="store_true")
-    parser.add_argument("--no-sample", action="store_true",
-                        help="Use greedy decoding instead of default sampling")
+    decoding = parser.add_mutually_exclusive_group()
+    decoding.add_argument("--no-sample", dest="no_sample", action="store_true",
+                          help="Greedy decoding (default, matching current Triad)")
+    decoding.add_argument("--sample", dest="no_sample", action="store_false",
+                          help="Opt into sampling; not an exact Triad baseline comparison")
+    parser.set_defaults(no_sample=True)
     parser.add_argument("--output-dir", type=Path, default=PROJECT / "outputs" / "run")
     parser.add_argument("--seed", type=int, default=None,
                         help="Fixed seed for a repeatable run; default generates a new seed")

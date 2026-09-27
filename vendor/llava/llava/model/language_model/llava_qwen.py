@@ -14,7 +14,6 @@
 
 
 import math
-import warnings
 from typing import List, Optional, Tuple, Union, Dict
 import torch
 import torch.nn as nn
@@ -30,6 +29,7 @@ from transformers.generation.utils import GenerateOutput
 # from ...constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
+from .fastv_attention import last_prompt_attention
 
 # from .qwen.modeling_qwen import QWenLMHeadModel, QWenModel
 # from .qwen.configuration_qwen import QWenConfig
@@ -70,7 +70,8 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         """Configure FastV mask evaluation for subsequent ``generate`` calls.
 
         ``layer`` is the first decoder layer that receives the reduced visual
-        key set.  Its ranking is computed from the attention of ``layer - 1``.
+        key set. Ranking is independently recomputed from the input and Q/K
+        projections of ``layer - 1``; decoder attention outputs are never read.
         This follows the layer convention in the original FastV implementation.
         """
         layer = int(layer)
@@ -85,11 +86,6 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
             raise ValueError(f"fastv_keep_ratio must be in (0, 1], got {keep_ratio}")
         if min_tokens < 1:
             raise ValueError(f"fastv_min_tokens must be >= 1, got {min_tokens}")
-        if enabled and self.config._attn_implementation == "flash_attention_2":
-            raise ValueError(
-                "FastV needs one layer of attention weights. Load Qwen2 with "
-                "attn_implementation='sdpa' (the evaluation entry point does this automatically)."
-            )
 
         self.fastv_enabled = bool(enabled)
         self.fastv_layer = layer
@@ -148,39 +144,24 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
             for batch in self._fastv_image_attentions
         ]
 
-    def _build_fastv_keep_mask(self, attention_weights, attention_mask):
-        if attention_weights is None:
-            raise RuntimeError(
-                "FastV did not receive attention weights from its ranking layer. "
-                "Use attn_implementation='sdpa' or 'eager'."
-            )
-
-        batch_size, _, query_length, key_length = attention_weights.shape
+    def _build_fastv_keep_mask(self, scores):
+        # Scores already contain the independently computed last-query row,
+        # averaged over heads, rather than a decoder's full attention matrix.
+        batch_size, key_length = scores.shape
         if len(self._fastv_image_spans) != batch_size:
             raise RuntimeError(
                 "FastV image spans do not match the model batch: "
                 f"{len(self._fastv_image_spans)} spans for batch size {batch_size}."
             )
 
-        # Average heads in float32 for stable ranking. The query is the last
-        # non-padding prompt token, as used by FastV for visual-token scoring.
-        scores = attention_weights.detach().float().mean(dim=1)
-        if attention_mask is not None and attention_mask.dim() == 2:
-            query_indices = attention_mask[:, :query_length].long().sum(dim=-1) - 1
-            query_indices = query_indices.clamp(min=0, max=query_length - 1)
-        else:
-            query_indices = torch.full(
-                (batch_size,), query_length - 1, dtype=torch.long, device=scores.device
-            )
-
         keep_mask = torch.ones(
-            (batch_size, key_length), dtype=torch.bool, device=attention_weights.device
+            (batch_size, key_length), dtype=torch.bool, device=scores.device
         )
         batch_stats = []
         captured_attention = []
 
         for batch_index, spans in enumerate(self._fastv_image_spans):
-            token_scores = scores[batch_index, query_indices[batch_index]]
+            token_scores = scores[batch_index]
             captured_images = []
             image_tokens = 0
             kept_image_tokens = 0
@@ -236,19 +217,17 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         self._fastv_image_attentions = captured_attention if getattr(self, "fastv_capture_attention", False) else []
         self._fastv_stats = {
             "mode": "mask",
+            "attention_source": "independent_qk",
+            "score_dtype": "float32",
             "fastv_layer": self.fastv_layer,
             "keep_ratio": self.fastv_keep_ratio,
             "prompt_tokens": key_length,
             "batch": batch_stats,
         }
 
-    def _apply_fastv_mask(self, causal_mask):
+    def _apply_fastv_mask(self, causal_mask, key_length):
         if self._fastv_keep_mask is None:
             return causal_mask
-        if causal_mask is None or causal_mask.dim() != 4:
-            raise RuntimeError("FastV expected a four-dimensional causal attention mask.")
-
-        key_length = causal_mask.shape[-1]
         keep_mask = self._fastv_keep_mask
         if keep_mask.shape[-1] < key_length:
             # Tokens generated after the prompt are never removed by FastV.
@@ -261,8 +240,23 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         else:
             keep_mask = keep_mask[:, :key_length]
 
+        if self.config._attn_implementation == "flash_attention_2":
+            # FlashAttention accepts a 2D key/padding mask, not a 4D bias.
+            # Its prefill kernel also unpads the discarded query positions;
+            # those positions remain masked in all later layers/cache steps.
+            if causal_mask is None:
+                return keep_mask
+            if causal_mask.ndim != 2:
+                raise RuntimeError("FlashAttention2 requires a two-dimensional mask")
+            return causal_mask[:, :key_length].to(keep_mask.device).bool() & keep_mask
+        if causal_mask is None or causal_mask.ndim != 4:
+            raise RuntimeError("Non-flash attention requires a four-dimensional mask")
+        # SDPA's explicit mask can have a spare column during cache decoding.
+        extra = causal_mask.shape[-1] - keep_mask.shape[-1]
+        if extra > 0:
+            keep_mask = torch.nn.functional.pad(keep_mask, (0, extra), value=True)
         min_dtype = torch.finfo(causal_mask.dtype).min
-        return causal_mask.masked_fill(~keep_mask[:, None, None, :], min_dtype)
+        return causal_mask.masked_fill(~keep_mask[:, None, None, :].to(causal_mask.device), min_dtype)
 
     def forward(
         self,
@@ -277,15 +271,30 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        """Qwen2Model.forward with FastV ranking and key masking.
+        """Original Qwen2 at rate zero; independent scoring at nonzero rates.
 
         The surrounding flow intentionally mirrors Transformers 4.46.1.  The
         sequence itself is not shortened, which keeps DynamicCache generation
         correct and makes this implementation suitable for accuracy evaluation.
         """
+        if not self.fastv_enabled or not any(self._fastv_image_spans):
+            # Crucial baseline invariant: do not run our decoder loop, scoring
+            # helper, or mask builder when FastV is disabled.
+            return super().forward(
+                input_ids=input_ids, attention_mask=attention_mask,
+                position_ids=position_ids, past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds, use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states, return_dict=return_dict,
+                cache_position=cache_position,
+            )
+        if self.training:
+            raise RuntimeError("This FastV implementation is inference-only")
         output_attentions = (
             output_attentions if output_attentions is not None else self.config.output_attentions
         )
+        if output_attentions:
+            raise ValueError("FastV uses independent Q/K scores; output_attentions must be False")
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -296,13 +305,6 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-        if self.gradient_checkpointing and self.training and use_cache:
-            warnings.warn(
-                "use_cache=True is incompatible with gradient checkpointing; disabling cache.",
-                stacklevel=2,
-            )
-            use_cache = False
-
         return_legacy_cache = False
         if use_cache and not isinstance(past_key_values, Cache):
             return_legacy_cache = True
@@ -332,66 +334,51 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
             and inputs_embeds.shape[1] > 1
             and self._fastv_keep_mask is None
         )
-        # Passing output_attentions=True only to this mask builder prevents SDPA
-        # from eliding the explicit causal mask; decoder layers still receive
-        # attention-output requests selectively below.
+        # FlashAttention returns a 2D mask (or None) here and never falls back
+        # to eager attention. Other implementations need an explicit 4D mask.
         causal_mask = self._update_causal_mask(
             attention_mask,
             inputs_embeds,
             cache_position,
             past_key_values,
-            output_attentions or fastv_active,
+            self.config._attn_implementation != "flash_attention_2",
         )
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
         for layer_index, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_output_attentions = output_attentions or (
-                fastv_prefill and layer_index == self.fastv_layer - 1
-            )
+            if fastv_prefill and layer_index == self.fastv_layer - 1:
+                scores = last_prompt_attention(
+                    decoder_layer, hidden_states, position_embeddings, attention_mask,
+                )
+                self._build_fastv_keep_mask(scores)
             layer_causal_mask = causal_mask
             if fastv_active and layer_index >= self.fastv_layer:
-                layer_causal_mask = self._apply_fastv_mask(causal_mask)
+                layer_causal_mask = self._apply_fastv_mask(
+                    causal_mask, past_seen_tokens + inputs_embeds.shape[1],
+                )
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    layer_causal_mask,
-                    position_ids,
-                    past_key_values,
-                    layer_output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=layer_causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=layer_output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                )
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=layer_causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=False,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
 
             hidden_states = layer_outputs[0]
-            if fastv_prefill and layer_index == self.fastv_layer - 1:
-                self._build_fastv_keep_mask(layer_outputs[1], attention_mask)
 
             if use_cache:
-                next_decoder_cache = layer_outputs[2 if layer_output_attentions else 1]
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                next_decoder_cache = layer_outputs[1]  # KV cache, not attention weights.
 
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
@@ -403,14 +390,14 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         if not return_dict:
             return tuple(
                 value
-                for value in (hidden_states, next_cache, all_hidden_states, all_self_attns)
+                for value in (hidden_states, next_cache, all_hidden_states)
                 if value is not None
             )
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
-            attentions=all_self_attns,
+            attentions=None,
         )
 
 
@@ -465,7 +452,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
-                cache_position=cache_position,
             )
 
             hidden_states = outputs[0]
@@ -484,7 +470,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
-                cache_position=cache_position,
                 **loss_kwargs,
             )
 
@@ -505,10 +490,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         self.get_model().reset_fastv_state()
 
         if images is not None:
-            # Supplying this mask also avoids the Qwen2 pad-token/eos-token
-            # warning and lets FastV find the final non-padding prompt token.
-            if attention_mask is None:
-                attention_mask = torch.ones_like(inputs, dtype=torch.long)
+            # Preserve original Triad's generation inputs, including its None
+            # mask/position_ids behavior. HF prepares the mask after packing.
             (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)

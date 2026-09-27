@@ -20,7 +20,7 @@ class FakeBackend:
 
     def generate(self, sample, prompt, method, rate, roi_mode, *,
                  capture_visualization, capture_attention, random_seed,
-                 do_sample=True):
+                 do_sample=False):
         self.calls.append((rate, random_seed, do_sample))
         result = {
             "answer": "A", "generation_seconds": 0.1,
@@ -94,9 +94,9 @@ class RunnerTests(unittest.TestCase):
                     self.assertIsNone(row["visualizations"])
             self.assertEqual(len((output / "summary.csv").read_text(encoding="utf-8").splitlines()), 11)
             metadata = json.loads((output / "run.json").read_text(encoding="utf-8"))
-            self.assertTrue(metadata["do_sample"])
+            self.assertFalse(metadata["do_sample"])
             self.assertEqual(metadata["seed"], 42)
-            self.assertEqual(FakeBackend.calls[0], (0, 42, True))
+            self.assertEqual(FakeBackend.calls[0], (0, 42, False))
 
     def test_anyres_mode_writes_visualizations_and_accuracy(self):
         with tempfile.TemporaryDirectory() as directory:

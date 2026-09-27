@@ -5,3 +5,5 @@ pillow==10.4.0
 torch==2.1.2
 torchvision==0.16.2
 transformers==4.46.1
+# Also install the SAME flash-attn build as the original Triad environment.
+# This is a CUDA/Linux extension; do not substitute SDPA if it is unavailable.

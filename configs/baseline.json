@@ -1,0 +1,7 @@
+{
+  "layer": 2,
+  "prune_rates": [0],
+  "visualize_rates": [],
+  "min_tokens": 1,
+  "preserve_image_newline": true
+}

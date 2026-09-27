@@ -12,6 +12,16 @@ class FakeCore:
 
 
 class MethodTests(unittest.TestCase):
+    def test_baseline_only_config(self):
+        config = Path(__file__).resolve().parents[1] / "configs" / "baseline.json"
+        method = load_method("fastv", config)
+        self.assertEqual(method.rates, (0,))
+        self.assertEqual(method.visualize_rates, frozenset())
+        core = FakeCore()
+        method.configure(core, 0, capture_attention=True)
+        self.assertFalse(core.kwargs["enabled"])
+        self.assertFalse(core.kwargs["capture_attention"])
+
     def test_fastv_config_and_layer_is_method_specific(self):
         config = Path(__file__).resolve().parents[1] / "configs" / "fastv.json"
         method = load_method("fastv", config)

@@ -23,6 +23,8 @@ class TriadBackend:
         import torch
         if not torch.cuda.is_available():
             raise RuntimeError("Triad inference requires a CUDA GPU")
+        # Match the current original Triad loader. Do not override TF32 flags
+        # or silently fall back to another precision/attention implementation.
         from transformers import AutoTokenizer
         from llava.constants import (DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_END_TOKEN,
                                      DEFAULT_IM_START_TOKEN)
@@ -35,14 +37,14 @@ class TriadBackend:
             raise ValueError(f"Unknown ROI mode: {roi_mode}")
         config = LlavaQwenConfig.from_pretrained(path)
         config.image_aspect_ratio = "anyres_max_9" if roi_mode == "anyres_max_9" else "randomroi"
-        config.mm_patch_merge_type = (
-            "spatial_unpad" if roi_mode == "anyres_max_9"
-            else "spatial_avgpool_auto_unpad_add_newl"
-        )
+        if roi_mode != "anyres_max_9":
+            config.mm_patch_merge_type = "spatial_avgpool_auto_unpad_add_newl"
+        # Like Triad's --overwrite_image_aspect_ratio, anyres leaves the
+        # checkpoint's merge type intact (normally spatial_unpad).
         self.tokenizer = AutoTokenizer.from_pretrained(path)
         self.model = LlavaQwenForCausalLM.from_pretrained(
             path, config=config, low_cpu_mem_usage=True,
-            attn_implementation="sdpa", torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2", torch_dtype=torch.float16,
             device_map="auto",
         )
         if getattr(config, "mm_use_im_patch_token", True):
@@ -55,17 +57,53 @@ class TriadBackend:
         if not self.vision_tower.is_loaded:
             self.vision_tower.load_model(device_map="auto")
         self.processor = self.vision_tower.image_processor
+        self.inference_config = {
+            "model_dtype": str(self.model.dtype),
+            "vision_dtype": str(self.vision_tower.dtype),
+            "attention": self.model.config._attn_implementation,
+            "matmul_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "cudnn_tf32": torch.backends.cudnn.allow_tf32,
+            "image_aspect_ratio": self.model.config.image_aspect_ratio,
+            "mm_patch_merge_type": self.model.config.mm_patch_merge_type,
+            "attention_source": "independent_qk_at_nonzero_rates_only",
+            "score_dtype": "float32",
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "gpu": torch.cuda.get_device_name(),
+        }
+        from importlib.metadata import version
+        self.inference_config.update({
+            "transformers": version("transformers"),
+            "flash_attn": version("flash-attn"),
+        })
+        print(
+            f"Inference config: dtype={self.model.dtype}, "
+            f"vision_dtype={self.vision_tower.dtype}, "
+            f"attention={self.model.config._attn_implementation}, "
+            f"matmul_tf32={torch.backends.cuda.matmul.allow_tf32}, "
+            f"cudnn_tf32={torch.backends.cudnn.allow_tf32}, "
+            f"image_aspect_ratio={self.model.config.image_aspect_ratio}, "
+            f"mm_patch_merge_type={self.model.config.mm_patch_merge_type}",
+            flush=True,
+        )
 
     def generate(self, sample: Sample, prompt: str, method: PruningMethod,
                  rate: int, roi_mode: str, *, capture_visualization: bool,
                  capture_attention: bool,
-                 random_seed: int, do_sample: bool = True) -> dict:
+                 random_seed: int, do_sample: bool = False) -> dict:
         import torch
         from llava.constants import (DEFAULT_IMAGE_TOKEN, DEFAULT_IM_END_TOKEN,
                                      DEFAULT_IM_START_TOKEN, IMAGE_TOKEN_INDEX)
         from llava.mm_utils import process_images, tokenizer_image_token
 
         method.configure(self.model.get_model(), rate, capture_attention=capture_attention)
+        if (capture_visualization and roi_mode == "anyres_max_9"
+                and self.model.config.mm_patch_merge_type not in
+                {"spatial_unpad", "spatial_unpad_add_newl"}):
+            raise ValueError(
+                "Anyres visualization requires spatial_unpad packing. The checkpoint's "
+                "merge type is preserved to match Triad; it is not silently overwritten."
+            )
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
         torch.cuda.manual_seed_all(random_seed)
@@ -88,6 +126,8 @@ class TriadBackend:
             pixels = pixels.to(self.model.device, dtype=self.model.dtype)
 
         message = prompt if DEFAULT_IMAGE_TOKEN in prompt else f"{DEFAULT_IMAGE_TOKEN}\n{prompt}"
+        if len(prompt) > 4096:
+            raise ValueError("Triad's single-image prompt limit is 4096 characters")
         if message.count(DEFAULT_IMAGE_TOKEN) != 1:
             raise ValueError("A sample prompt must contain exactly one <image> token")
         # Equivalent to the old qwen_1_5 single-turn conversation template.
@@ -99,16 +139,24 @@ class TriadBackend:
         tokens = tokenizer_image_token(text, self.tokenizer, IMAGE_TOKEN_INDEX,
                                        return_tensors="pt").unsqueeze(0).to(self.model.device)
 
+        # Match SimpleModelWorker's context budget, including its base-view
+        # patch count approximation (not a newly chosen anyres token budget).
+        max_new_tokens = min(
+            512, getattr(self.model.config, "max_position_embeddings", 2048)
+            - tokens.shape[-1] - self.vision_tower.num_patches,
+        )
+        if max_new_tokens < 1:
+            raise ValueError("Prompt exceeds the original Triad context budget")
         with torch.inference_mode():
             torch.cuda.synchronize()
             start = time.perf_counter()
             generation_options = {
                 "do_sample": do_sample,
-                "max_new_tokens": 256,
+                "temperature": 0.2,
+                "top_p": 0.7,
+                "max_new_tokens": max_new_tokens,
                 "use_cache": True,
             }
-            if do_sample:
-                generation_options.update(temperature=0.2, top_p=0.7)
             generated = self.model.generate(
                 inputs=tokens, images=pixels, image_sizes=[image.size],
                 **generation_options,
@@ -123,6 +171,9 @@ class TriadBackend:
             "roi_source": roi_source,
             "roi_boxes": crop_metadata[0].get("roi_boxes", []),
             "stats": method.stats(core, rate),
+            "input_token_ids": tokens[0].detach().cpu().tolist(),
+            "generated_token_ids": generated[0].detach().cpu().tolist(),
+            "max_new_tokens": max_new_tokens,
         }
         if capture_attention:
             result["attentions"] = method.image_attentions(core)[0]

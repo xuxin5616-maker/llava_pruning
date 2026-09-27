@@ -258,15 +258,11 @@ def _blackout(image, pruned):
     return Image.fromarray(pixels)
 
 
-def _save_binary_mask(mask, path):
-    Image.fromarray(mask.astype(np.uint8) * 255).save(path)
-
-
 def save_fastv_visualizations(original_images, pro_datas, image_masks, *,
                               base_grid, patch_size, output_dir, sample_id,
                               fastv_layer, keep_ratio, image_attentions=None,
                               save_prune=True, save_attention=False):
-    """Save originals, blackouts, comparison panels and auditable decisions.
+    """Save only comparison/attention PNGs and auditable decision metadata.
 
     Repeated samples/QA rounds receive numbered directories, so earlier results
     are preserved. Return paths for the existing stats JSONL.
@@ -305,19 +301,8 @@ def save_fastv_visualizations(original_images, pro_datas, image_masks, *,
         directory = call_dir / f"image_{image_index}"
         directory.mkdir(parents=True, exist_ok=False)
         original = image.convert("RGB")
-        original.save(directory / "original.png")
         if save_prune:
             combined = _blackout(original, masks["combined_pruned"])
-            combined.save(directory / "original_blackout.png")
-            _save_binary_mask(masks["combined_pruned"], directory / "pruned_mask.png")
-            _save_binary_mask(masks["covered"], directory / "coverage_mask.png")
-
-            for view in masks["views"]:
-                info = view["metadata"]
-                projected = _blackout(original, view["pruned"])
-                projected.save(directory / f"{info['name']}_on_original.png")
-                projected.crop(info["source_box_xyxy"]).save(directory / f"{info['name']}_crop.png")
-
             global_blackout = _blackout(original, masks["views"][0]["pruned"])
             width, height = original.size
             panel_width = min(640, width)
@@ -332,7 +317,7 @@ def save_fastv_visualizations(original_images, pro_datas, image_masks, *,
                 draw.text((index * panel_width + 6, 5), caption, fill="black")
             draw.text((6, 25), f"FastV layer index={fastv_layer}, keep_ratio={keep_ratio}; "
                       f"pruned patches={masks['pruned_patch_tokens']}/{masks['patch_tokens']}", fill="black")
-            draw.text((6, 43), "Uncovered margins unchanged. View decisions are also saved separately.", fill="black")
+            draw.text((6, 43), "Uncovered margins unchanged. Black marks pruned spatial token anchors.", fill="black")
             comparison.save(directory / "comparison.png")
         if overlays is not None:
             overlays[image_index].save(directory / "attention_overlay.png")
@@ -360,7 +345,6 @@ def save_fastv_visualizations(original_images, pro_datas, image_masks, *,
             "image_index": image_index,
             "directory": str(directory.resolve()),
             "comparison": str((directory / "comparison.png").resolve()) if save_prune else None,
-            "blackout": str((directory / "original_blackout.png").resolve()) if save_prune else None,
             "attention_overlay": str((directory / "attention_overlay.png").resolve()) if overlays is not None else None,
         })
     return paths

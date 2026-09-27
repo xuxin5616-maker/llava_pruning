@@ -15,7 +15,7 @@ from .prompts import resolve_prompt
 
 def run(*, model_path, input_json, data_root, prompt_version, method_name,
         method_config, roi_mode, save_prune_vis, save_attention_vis,
-        output_dir, seed=None, no_sample=False):
+        output_dir, seed=None, no_sample=True):
     samples = load_samples(input_json, data_root)
     if not samples:
         raise ValueError("Input JSON has no samples")
@@ -48,8 +48,9 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         "seed_origin": "generated" if generated_seed else "explicit",
         "do_sample": not no_sample,
         "samples": len(samples),
-        "decoding": ("sampling, temperature=0.2, top_p=0.7, max_new_tokens=256"
-                     if not no_sample else "greedy, max_new_tokens=256"),
+        "decoding": ("sampling, temperature=0.2, top_p=0.7, max_new_tokens<=512"
+                     if not no_sample else "greedy, max_new_tokens<=512 (Triad context budget)"),
+        "inference": getattr(backend, "inference_config", {}),
         "metric_rule": "A=defect (1), B=no defect (0); unparsed labeled answers count as incorrect",
     }
     (output / "run.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -98,6 +99,9 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                     "roi_boxes": result["roi_boxes"],
                     "generation_seconds": result["generation_seconds"],
                     "pruning_stats": result["stats"],
+                    "input_token_ids": result.get("input_token_ids"),
+                    "generated_token_ids": result.get("generated_token_ids"),
+                    "max_new_tokens": result.get("max_new_tokens"),
                     "visualizations": paths,
                 }
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")

@@ -33,6 +33,26 @@ class VisualizationTests(unittest.TestCase):
             )
             self.assertTrue(Path(saved["comparison"]).is_file())
             self.assertTrue(Path(saved["attention_overlay"]).is_file())
+            self.assertEqual({path.name for path in Path(saved["directory"]).glob("*.png")},
+                             {"comparison.png", "attention_overlay.png"})
+            self.assertTrue((Path(saved["directory"]) / "decisions.json").is_file())
+
+    def test_randomroi_saves_only_two_images_even_with_crops(self):
+        image = Image.new("RGB", (8, 8), "white")
+        crop = {"original_size": [8, 8], "roi_boxes": [[0, 0, 4, 4]],
+                "processed_view_sizes": [[8, 8], [8, 8]]}
+        mask = {"span": [0, 9], "keep": [True, False] * 4 + [True]}
+        attention = {"span": [0, 9], "scores": [0.1] * 9}
+        with tempfile.TemporaryDirectory() as directory:
+            saved, = save_fastv_visualizations(
+                [image], [crop], [mask], base_grid=2, patch_size=4,
+                output_dir=directory, sample_id="roi", fastv_layer=2,
+                keep_ratio=0.5, image_attentions=[attention],
+                save_prune=True, save_attention=True,
+            )
+            self.assertEqual({path.name for path in Path(directory).rglob("*.png")},
+                             {"comparison.png", "attention_overlay.png"})
+            self.assertNotIn("blackout", saved)
 
     def test_anyres_max_nine_downsampling(self):
         crop = {"mode": "anyres_max_9", "original_size": [16, 16],
@@ -56,6 +76,8 @@ class VisualizationTests(unittest.TestCase):
             )
             self.assertTrue(Path(prune["comparison"]).is_file())
             self.assertIsNone(prune["attention_overlay"])
+            self.assertEqual({path.name for path in Path(prune["directory"]).glob("*.png")},
+                             {"comparison.png"})
             attention_only, = save_fastv_visualizations(
                 [image], [crop], [mask], base_grid=2, patch_size=4,
                 output_dir=output, sample_id="108", fastv_layer=2,
@@ -65,6 +87,8 @@ class VisualizationTests(unittest.TestCase):
             self.assertIsNone(attention_only["comparison"])
             self.assertTrue(Path(attention_only["attention_overlay"]).is_file())
             self.assertTrue(Path(attention_only["directory"]).name == "image_0")
+            self.assertEqual({path.name for path in Path(attention_only["directory"]).glob("*.png")},
+                             {"attention_overlay.png"})
 
 
 if __name__ == "__main__":
