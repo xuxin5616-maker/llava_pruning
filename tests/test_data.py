@@ -5,9 +5,9 @@ from pathlib import Path
 
 import numpy as np
 
-from triad_pruning.data import load_samples
-from triad_pruning.prompts import resolve_prompt
-from triad_pruning.roi import choose_roi, load_mask
+from llava_pruning.data import load_samples
+from llava_pruning.prompts import resolve_prompt
+from llava_pruning.roi import choose_roi, load_mask
 
 
 class DataTests(unittest.TestCase):

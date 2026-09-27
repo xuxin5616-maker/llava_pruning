@@ -1,5 +1,7 @@
 """Read the question JSON/JSONL format without dataset-specific path strings."""
 
+from __future__ import annotations
+
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,7 +82,7 @@ def load_samples(input_json: str | Path, data_root: str | Path) -> list[Sample]:
         if mask_name is not None and not isinstance(mask_name, str):
             raise ValueError(f"Record {index} mask must be a string path")
         bbox = record.get("bbox")
-        # Legacy Triad records can include an outer per-image list.
+        # Legacy LLaVA records can include an outer per-image list.
         if isinstance(bbox, list) and len(bbox) == 1 and isinstance(bbox[0], list) and bbox[0] and isinstance(bbox[0][0], list):
             bbox = bbox[0]
         if bbox is not None:

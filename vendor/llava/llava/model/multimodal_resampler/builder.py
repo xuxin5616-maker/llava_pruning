@@ -1,4 +1,4 @@
-"""Triad checkpoints in this project use no additional vision resampler."""
+"""LLaVA checkpoints in this project use no additional vision resampler."""
 
 import torch
 
@@ -15,5 +15,5 @@ class IdentityMap(torch.nn.Module):
 def build_vision_resampler(config, delay_load=False, **kwargs):
     kind = getattr(config, "mm_resampler_type", None)
     if kind is not None:
-        raise ValueError(f"Unsupported vision resampler for this Triad backend: {kind}")
+        raise ValueError(f"Unsupported vision resampler for this LLaVA backend: {kind}")
     return IdentityMap()

@@ -10,7 +10,7 @@ class ComparisonTests(unittest.TestCase):
     def test_alignment_preserves_ids_and_compares_full_answers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            baseline = root / "triad.json"
+            baseline = root / "llava.json"
             candidate = root / "pruning.jsonl"
             baseline.write_text(json.dumps([
                 {"id": "001", "conversations": [{"from": "gpt", "value": " A "}]},

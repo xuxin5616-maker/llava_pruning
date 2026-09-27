@@ -1,4 +1,6 @@
-"""Fixed Triad OneVision/Qwen2 backend; no model-family selection in the CLI."""
+"""Fixed LLaVA OneVision/Qwen2 backend; no model-family selection in the CLI."""
+
+from __future__ import annotations
 
 import sys
 import time
@@ -15,15 +17,15 @@ from .roi import choose_roi, load_mask
 VENDOR = Path(__file__).resolve().parents[1] / "vendor" / "llava"
 
 
-class TriadBackend:
+class LlavaBackend:
     def __init__(self, model_path: str | Path, roi_mode: str = "randomroi"):
         # Delay heavy imports so JSON/configuration checks run without a GPU stack.
         if str(VENDOR) not in sys.path:
             sys.path.insert(0, str(VENDOR))
         import torch
         if not torch.cuda.is_available():
-            raise RuntimeError("Triad inference requires a CUDA GPU")
-        # Match the current original Triad loader. Do not override TF32 flags
+            raise RuntimeError("LLaVA inference requires a CUDA GPU")
+        # Match the current original LLaVA loader. Do not override TF32 flags
         # or silently fall back to another precision/attention implementation.
         from transformers import AutoTokenizer
         from llava.constants import (DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_END_TOKEN,
@@ -39,7 +41,7 @@ class TriadBackend:
         config.image_aspect_ratio = "anyres_max_9" if roi_mode == "anyres_max_9" else "randomroi"
         if roi_mode != "anyres_max_9":
             config.mm_patch_merge_type = "spatial_avgpool_auto_unpad_add_newl"
-        # Like Triad's --overwrite_image_aspect_ratio, anyres leaves the
+        # Like reference LLaVA's --overwrite_image_aspect_ratio, anyres leaves the
         # checkpoint's merge type intact (normally spatial_unpad).
         self.tokenizer = AutoTokenizer.from_pretrained(path)
         self.model = LlavaQwenForCausalLM.from_pretrained(
@@ -96,13 +98,14 @@ class TriadBackend:
                                      DEFAULT_IM_START_TOKEN, IMAGE_TOKEN_INDEX)
         from llava.mm_utils import process_images, tokenizer_image_token
 
-        method.configure(self.model.get_model(), rate, capture_attention=capture_attention)
+        method.configure(self.model.get_model(), rate, capture_attention=capture_attention,
+                         capture_visualization=capture_visualization)
         if (capture_visualization and roi_mode == "anyres_max_9"
                 and self.model.config.mm_patch_merge_type not in
                 {"spatial_unpad", "spatial_unpad_add_newl"}):
             raise ValueError(
                 "Anyres visualization requires spatial_unpad packing. The checkpoint's "
-                "merge type is preserved to match Triad; it is not silently overwritten."
+                "merge type is preserved to match reference; it is not silently overwritten."
             )
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
@@ -127,7 +130,7 @@ class TriadBackend:
 
         message = prompt if DEFAULT_IMAGE_TOKEN in prompt else f"{DEFAULT_IMAGE_TOKEN}\n{prompt}"
         if len(prompt) > 4096:
-            raise ValueError("Triad's single-image prompt limit is 4096 characters")
+            raise ValueError("reference LLaVA's single-image prompt limit is 4096 characters")
         if message.count(DEFAULT_IMAGE_TOKEN) != 1:
             raise ValueError("A sample prompt must contain exactly one <image> token")
         # Equivalent to the old qwen_1_5 single-turn conversation template.
@@ -146,7 +149,7 @@ class TriadBackend:
             - tokens.shape[-1] - self.vision_tower.num_patches,
         )
         if max_new_tokens < 1:
-            raise ValueError("Prompt exceeds the original Triad context budget")
+            raise ValueError("Prompt exceeds the original LLaVA context budget")
         with torch.inference_mode():
             torch.cuda.synchronize()
             start = time.perf_counter()
@@ -175,10 +178,8 @@ class TriadBackend:
             "generated_token_ids": generated[0].detach().cpu().tolist(),
             "max_new_tokens": max_new_tokens,
         }
-        if capture_attention:
-            result["attentions"] = method.image_attentions(core)[0]
         if capture_visualization:
-            result["masks"] = method.image_masks(core)[0]
+            result.update(method.visualization_data(core, capture_attention=capture_attention))
             result["image"] = image
             result["crop_metadata"] = crop_metadata
         return result

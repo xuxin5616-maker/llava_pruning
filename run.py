@@ -1,32 +1,33 @@
-"""Small public CLI for the Triad pruning study."""
+"""Public CLI for LLaVA visual-token pruning experiments."""
 
 import argparse
 from pathlib import Path
 
-from triad_pruning.methods import METHODS
-from triad_pruning.metric_plot import check_plot_dependencies, save_metric_plot
-from triad_pruning.runner import run
+from llava_pruning.methods import METHODS
+from llava_pruning.metric_plot import check_plot_dependencies, save_metric_plot
+from llava_pruning.runner import run
 
 
 PROJECT = Path(__file__).resolve().parent
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Triad OneVision/Qwen2 pruning sweep")
-    parser.add_argument("--model-path", required=True, help="Triad checkpoint directory")
+    parser = argparse.ArgumentParser(description="LLaVA OneVision/Qwen2 pruning sweep")
+    parser.add_argument("--model-path", required=True, help="LLaVA checkpoint directory")
     parser.add_argument("--input-json", required=True, help="JSON list or JSONL with image/mask records")
     parser.add_argument("--data-root", required=True, help="Root directory for image and mask paths")
     parser.add_argument("--prompt-version", choices=("v0", "v1", "v2", "v3"), default="v0")
     parser.add_argument("--method", choices=tuple(METHODS), default="fastv")
-    parser.add_argument("--method-config", type=Path, default=PROJECT / "configs" / "fastv.json")
+    parser.add_argument("--method-config", type=Path, default=None,
+                        help="Defaults to configs/<method>.json")
     parser.add_argument("--roi-mode", choices=("randomroi", "randompatch", "anyres_max_9"), default="randomroi")
     parser.add_argument("--save-prune-vis", action="store_true")
     parser.add_argument("--save-attention-vis", action="store_true")
     decoding = parser.add_mutually_exclusive_group()
     decoding.add_argument("--no-sample", dest="no_sample", action="store_true",
-                          help="Greedy decoding (default, matching current Triad)")
+                          help="Greedy decoding (default, matching the reference baseline)")
     decoding.add_argument("--sample", dest="no_sample", action="store_false",
-                          help="Opt into sampling; not an exact Triad baseline comparison")
+                          help="Opt into sampling; not an exact greedy baseline comparison")
     parser.set_defaults(no_sample=True)
     parser.add_argument("--output-dir", type=Path, default=PROJECT / "outputs" / "run")
     parser.add_argument("--seed", type=int, default=None,
@@ -51,7 +52,7 @@ def main():
     except Exception as error:
         raise RuntimeError(
             f"Evaluation finished; predictions and summary.csv are saved, but plotting failed. "
-            f'Retry without inference: python -m triad_pruning.metric_plot "{output}"'
+            f'Retry without inference: python -m llava_pruning.metric_plot "{output}"'
         ) from error
     print(f"Saved ACC/PRE/Recall/TNR curves to {figure}")
 

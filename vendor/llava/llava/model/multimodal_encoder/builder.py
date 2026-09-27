@@ -1,4 +1,4 @@
-"""Construct the SigLIP vision tower used by Triad checkpoints."""
+"""Construct the SigLIP vision tower used by LLaVA checkpoints."""
 
 from .siglip_encoder import SigLipVisionTower
 

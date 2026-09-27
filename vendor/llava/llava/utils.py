@@ -1,4 +1,4 @@
-"""Logging helpers used by the retained Triad model code."""
+"""Logging helpers used by the retained LLaVA model code."""
 
 import torch.distributed as dist
 

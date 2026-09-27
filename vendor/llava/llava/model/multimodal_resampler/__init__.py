@@ -1,1 +1,1 @@
-"""Identity resampler for Triad inference."""
+"""Identity resampler for LLaVA inference."""

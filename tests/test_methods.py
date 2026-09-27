@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from triad_pruning.methods import load_method
+from llava_pruning.methods import load_method
 
 
 class FakeCore:

@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from triad_pruning.visualization import (build_anyres_layout, prepare_image_masks,
+from llava_pruning.visualization import (build_anyres_layout, prepare_image_masks,
                                          save_fastv_visualizations)
 
 

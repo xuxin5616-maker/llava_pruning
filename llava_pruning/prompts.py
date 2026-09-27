@@ -1,4 +1,6 @@
-"""Keep the original Triad MVTec prompt version mapping."""
+"""Keep the original LLaVA MVTec prompt version mapping."""
+
+from __future__ import annotations
 
 from .mvtec_prompts import MVTEC_PROMPT_V0, MVTEC_PROMPT_V1_1, MVTEC_PROMPT_V1, MVTEC_PROMPT_V1_2
 

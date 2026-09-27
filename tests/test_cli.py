@@ -4,7 +4,14 @@ from run import build_parser
 
 
 class CliTests(unittest.TestCase):
-    def test_greedy_matches_triad_by_default_and_sampling_is_optional(self):
+    def test_method_selection_defaults_to_its_own_configuration(self):
+        from llava_pruning.methods import resolve_method_config
+        basic = ["--model-path", "checkpoint", "--input-json", "input.jsonl", "--data-root", "dataset"]
+        for method in ("fastv", "vico"):
+            args = build_parser().parse_args(basic + ["--method", method])
+            self.assertEqual(resolve_method_config(args.method, args.method_config).name, f"{method}.json")
+
+    def test_greedy_matches_llava_by_default_and_sampling_is_optional(self):
         basic = ["--model-path", "checkpoint", "--input-json", "input.jsonl",
                  "--data-root", "dataset"]
         default = build_parser().parse_args(basic)

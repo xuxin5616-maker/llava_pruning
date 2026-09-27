@@ -108,7 +108,7 @@ class ExperimentTests(unittest.TestCase):
 
             with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "5"}), \
                  patch.dict("sys.modules", {"torch": SimpleNamespace(cuda=cuda),
-                                            "triad_pruning.runner": SimpleNamespace(run=fake_run)}), \
+                                            "llava_pruning.runner": SimpleNamespace(run=fake_run)}), \
                  contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(ex.run_worker(job["spec_path"]), 0)
             report = json.loads(Path(job["resource_report"]).read_text(encoding="utf-8"))

@@ -1,5 +1,7 @@
 """Strict image-level A/B accuracy for the MVTec prompt templates."""
 
+from __future__ import annotations
+
 import re
 from dataclasses import dataclass
 

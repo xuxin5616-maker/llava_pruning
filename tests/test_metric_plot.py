@@ -12,7 +12,7 @@ from PIL import Image
 
 from run import main
 from test_runner import FakeBackend
-from triad_pruning.metric_plot import build_metric_figure, check_plot_dependencies, load_metric_rows, save_metric_plot
+from llava_pruning.metric_plot import build_metric_figure, check_plot_dependencies, load_metric_rows, save_metric_plot
 
 
 class MetricPlotTests(unittest.TestCase):
@@ -95,7 +95,7 @@ class RunMetricPlotTests(unittest.TestCase):
             output = root / "result"
             args = ["run.py", "--model-path", str(root), "--input-json", str(source), "--data-root", str(root),
                     "--roi-mode", "anyres_max_9", "--no-sample", "--seed", "42", "--output-dir", str(output)]
-            with patch("sys.argv", args), patch("triad_pruning.runner.TriadBackend", FakeBackend), \
+            with patch("sys.argv", args), patch("llava_pruning.runner.LlavaBackend", FakeBackend), \
                  contextlib.redirect_stdout(io.StringIO()):
                 main()
             self.assertEqual(len(FakeBackend.calls), 1010)

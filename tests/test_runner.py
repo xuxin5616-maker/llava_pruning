@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from triad_pruning.runner import run
+from llava_pruning.runner import run
 
 
 class FakeBackend:
@@ -71,7 +71,7 @@ class RunnerTests(unittest.TestCase):
             }) + "\n", encoding="utf-8")
             output = root / "result"
             config = Path(__file__).resolve().parents[1] / "configs" / "fastv.json"
-            with patch("triad_pruning.runner.TriadBackend", FakeBackend):
+            with patch("llava_pruning.runner.LlavaBackend", FakeBackend):
                 run(model_path=root, input_json=source, data_root=root,
                     prompt_version="v0", method_name="fastv", method_config=config,
                     roi_mode="randomroi", save_prune_vis=True,
@@ -112,7 +112,7 @@ class RunnerTests(unittest.TestCase):
                 "layer": 2, "prune_rates": [0, 10], "visualize_rates": [10],
             }), encoding="utf-8")
             output = root / "results"
-            with patch("triad_pruning.runner.TriadBackend", FakeBackend):
+            with patch("llava_pruning.runner.LlavaBackend", FakeBackend):
                 run(model_path=root, input_json=source, data_root=root,
                     prompt_version="v0", method_name="fastv", method_config=config,
                     roi_mode="anyres_max_9", save_prune_vis=True,
@@ -138,8 +138,8 @@ class RunnerTests(unittest.TestCase):
                 "layer": 2, "prune_rates": [0], "visualize_rates": [],
             }), encoding="utf-8")
             output = root / "results"
-            with patch("triad_pruning.runner.TriadBackend", FakeBackend), \
-                 patch("triad_pruning.runner.secrets.randbelow", return_value=12345):
+            with patch("llava_pruning.runner.LlavaBackend", FakeBackend), \
+                 patch("llava_pruning.runner.secrets.randbelow", return_value=12345):
                 run(model_path=root, input_json=source, data_root=root,
                     prompt_version="v0", method_name="fastv", method_config=config,
                     roi_mode="randomroi", save_prune_vis=False,

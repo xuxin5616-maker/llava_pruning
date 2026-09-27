@@ -1,6 +1,6 @@
 import unittest
 
-from triad_pruning.metrics import Accuracy
+from llava_pruning.metrics import Accuracy
 
 
 class MetricsTests(unittest.TestCase):

@@ -1,4 +1,4 @@
-"""Compare single-turn Triad and pruning answers by ID, not accuracy alone."""
+"""Compare single-turn LLaVA and pruning answers by ID, not accuracy alone."""
 
 import argparse
 import json

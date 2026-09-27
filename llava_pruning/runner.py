@@ -6,9 +6,9 @@ import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .backend import TriadBackend
+from .backend import LlavaBackend
 from .data import load_samples
-from .methods import load_method
+from .methods import load_method, resolve_method_config
 from .metrics import Accuracy, METRIC_RULE
 from .prompts import resolve_prompt
 
@@ -24,13 +24,14 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         seed = secrets.randbelow(2**31)
     if not 0 <= seed <= 2**32 - len(samples):
         raise ValueError("--seed must keep seed + sample index within NumPy's 32-bit range")
+    method_config = resolve_method_config(method_name, method_config)
     method = load_method(method_name, method_config)
     # Validate all prompts before the expensive model load.
     prompts = [resolve_prompt(prompt_version, item.category, item.text) for item in samples]
     output = Path(output_dir).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {output}")
-    backend = TriadBackend(model_path, roi_mode=roi_mode)
+    backend = LlavaBackend(model_path, roi_mode=roi_mode)
     output.mkdir(parents=True, exist_ok=True)
     config = json.loads(Path(method_config).read_text(encoding="utf-8"))
     metadata = {
@@ -49,7 +50,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         "do_sample": not no_sample,
         "samples": len(samples),
         "decoding": ("sampling, temperature=0.2, top_p=0.7, max_new_tokens<=512"
-                     if not no_sample else "greedy, max_new_tokens<=512 (Triad context budget)"),
+                     if not no_sample else "greedy, max_new_tokens<=512 (LLaVA context budget)"),
         "inference": getattr(backend, "inference_config", {}),
         "metric_rule": METRIC_RULE,
     }
@@ -66,6 +67,10 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         records_path = rate_dir / "predictions.jsonl"
         metrics_path = rate_dir / "metrics.json"
         accuracy = Accuracy(expected_samples=len(samples))
+        layer_path = rate_dir / "layer_tokens.csv"
+        layer_fields = ("question_id", "method", "prune_rate", "layer", "image_tokens_in",
+                        "image_tokens_out", "sequence_tokens_in", "sequence_tokens_out",
+                        "removed_after_layer", "cumulative_prune_rate")
         with records_path.open("w", encoding="utf-8") as stream:
             for index, (sample, (prompt, prompt_source)) in enumerate(zip(samples, prompts)):
                 visualize = rate in method.visualize_rates and (save_prune_vis or save_attention_vis)
@@ -95,6 +100,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                     "prompt_source": prompt_source,
                     "answer": result["answer"],
                     "prune_rate": rate,
+                    "method": method.name,
                     "roi_mode": roi_mode,
                     "roi_source": result["roi_source"],
                     "roi_boxes": result["roi_boxes"],
@@ -107,6 +113,15 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                 }
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
                 stream.flush()
+                if result["stats"].get("layers"):
+                    write_header = not layer_path.exists()
+                    with layer_path.open("a", encoding="utf-8", newline="") as layer_file:
+                        writer = csv.DictWriter(layer_file, fieldnames=layer_fields)
+                        if write_header:
+                            writer.writeheader()
+                        for layer_row in result["stats"]["layers"]:
+                            writer.writerow({"question_id": sample.sample_id, "method": method.name,
+                                             "prune_rate": rate, **layer_row})
                 accuracy.add(sample.gt, result["answer"])
                 metrics_path.write_text(
                     json.dumps(accuracy.result(rate, complete=False), ensure_ascii=False, indent=2),

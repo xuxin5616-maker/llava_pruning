@@ -30,6 +30,7 @@ from transformers.generation.utils import GenerateOutput
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
 from .fastv_attention import last_prompt_attention
+from .vico import ViCoMixin
 
 # from .qwen.modeling_qwen import QWenLMHeadModel, QWenModel
 # from .qwen.configuration_qwen import QWenConfig
@@ -39,14 +40,14 @@ class LlavaQwenConfig(Qwen2Config):
     model_type = "llava_qwen"
 
 
-class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
+class LlavaQwenModel(ViCoMixin, LlavaMetaModel, Qwen2Model):
     config_class = LlavaQwenConfig
 
     def __init__(self, config: Qwen2Config):
         super(LlavaQwenModel, self).__init__(config)
 
         # FastV is opt-in.  These values are intentionally runtime-only so an
-        # ordinary Triad checkpoint can be loaded without editing config.json.
+        # ordinary LLaVA checkpoint can be loaded without editing config.json.
         self.fastv_enabled = False
         self.fastv_layer = 2
         self.fastv_keep_ratio = 0.5
@@ -57,6 +58,7 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         self._fastv_keep_mask = None
         self._fastv_image_attentions = []
         self._fastv_stats = {}
+        self.init_vico()
 
     def configure_fastv(
         self,
@@ -87,6 +89,8 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         if min_tokens < 1:
             raise ValueError(f"fastv_min_tokens must be >= 1, got {min_tokens}")
 
+        self.vico_enabled = False
+        self.vico_configured = False
         self.fastv_enabled = bool(enabled)
         self.fastv_layer = layer
         self.fastv_keep_ratio = keep_ratio
@@ -101,6 +105,7 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         self._fastv_keep_mask = None
         self._fastv_image_attentions = []
         self._fastv_stats = {}
+        self.reset_vico_state()
 
     def set_fastv_image_spans(self, image_spans):
         """Receive dynamic image-token spans produced by multimodal packing.
@@ -173,7 +178,7 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                 if end <= start:
                     continue
 
-                # Triad randomroi with add_newl appends one global image-newline
+                # LLaVA randomroi with add_newl appends one global image-newline
                 # token.  It is structural rather than a patch, so keep it.
                 protected_tokens = 1 if self.fastv_preserve_image_newline else 0
                 protected_tokens = min(protected_tokens, end - start)
@@ -277,6 +282,13 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         sequence itself is not shortened, which keeps DynamicCache generation
         correct and makes this implementation suitable for accuracy evaluation.
         """
+        if self.vico_enabled:
+            return self.vico_forward(
+                input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
+                past_key_values=past_key_values, inputs_embeds=inputs_embeds, use_cache=use_cache,
+                output_attentions=output_attentions, output_hidden_states=output_hidden_states,
+                return_dict=return_dict, cache_position=cache_position,
+            )
         if not self.fastv_enabled or not any(self._fastv_image_spans):
             # Crucial baseline invariant: do not run our decoder loop, scoring
             # helper, or mask builder when FastV is disabled.
@@ -490,7 +502,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         self.get_model().reset_fastv_state()
 
         if images is not None:
-            # Preserve original Triad's generation inputs, including its None
+            # Preserve original reference LLaVA's generation inputs, including its None
             # mask/position_ids behavior. HF prepares the mask after packing.
             (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
         else:

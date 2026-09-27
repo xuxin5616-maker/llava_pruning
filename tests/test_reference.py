@@ -1,6 +1,6 @@
-"""Optional read-only comparisons with the user's downloaded Triad checkout.
+"""Optional read-only comparisons with the user's downloaded LLaVA checkout.
 
-Set TRIAD_REFERENCE_DIR to its repository root on another machine. These tests
+Set LLAVA_REFERENCE_DIR to its repository root on another machine. These tests
 never import the original model loader or download any model weights.
 """
 
@@ -17,7 +17,7 @@ import torch
 from PIL import Image
 
 PROJECT = Path(__file__).resolve().parents[1]
-REFERENCE = Path(os.environ.get("TRIAD_REFERENCE_DIR", PROJECT.parent / "Triad" / "Triad"))
+REFERENCE = Path(os.environ.get("LLAVA_REFERENCE_DIR", PROJECT.parent / "Triad" / "Triad"))
 sys.path.insert(0, str(PROJECT / "vendor" / "llava"))
 from llava.constants import IMAGE_TOKEN_INDEX
 from llava.mm_utils import process_images
@@ -67,11 +67,11 @@ class ToyPacking(LlavaMetaForCausalLM):
 
 
 @unittest.skipUnless((REFERENCE / "LLaVA-NeXT" / "llava").is_dir(),
-                     "Original Triad checkout unavailable; set TRIAD_REFERENCE_DIR")
-class TriadReferenceTests(unittest.TestCase):
+                     "Original LLaVA checkout unavailable; set LLAVA_REFERENCE_DIR")
+class ReferenceTests(unittest.TestCase):
     def test_chat_prompt_matches_original_qwen_template(self):
-        original = load_reference("_triad_reference_conversation", "llava/conversation.py")
-        backend = ast.parse((PROJECT / "triad_pruning/backend.py").read_text(encoding="utf-8"))
+        original = load_reference("_llava_reference_conversation", "llava/conversation.py")
+        backend = ast.parse((PROJECT / "llava_pruning/backend.py").read_text(encoding="utf-8"))
         expression = next(node.value for node in ast.walk(backend)
                           if isinstance(node, ast.Assign)
                           and any(isinstance(target, ast.Name) and target.id == "text"
@@ -99,7 +99,7 @@ class TriadReferenceTests(unittest.TestCase):
             self.assertEqual(ast.dump(current[name]), ast.dump(original[name]), name)
 
     def test_anyres_preprocessing_pixels_match_original(self):
-        original = load_reference("_triad_reference_mm", "llava/mm_utils.py")
+        original = load_reference("_llava_reference_mm", "llava/mm_utils.py")
         processor = SigLipImageProcessor(size=(28, 28), crop_size={"height": 28, "width": 28})
         config = SimpleNamespace(image_aspect_ratio="anyres_max_9", mm_patch_merge_type="spatial_unpad",
                                  image_grid_pinpoints=[[28, 28], [56, 28], [28, 56], [56, 56]])
@@ -111,7 +111,7 @@ class TriadReferenceTests(unittest.TestCase):
             self.assertTrue(torch.equal(actual, expected), (width, height))
 
     def test_anyres_packed_embeddings_masks_and_positions_match_original(self):
-        original = load_reference("llava.model._triad_reference_arch", "llava/model/llava_arch.py")
+        original = load_reference("llava.model._llava_reference_arch", "llava/model/llava_arch.py")
         for dtype in (torch.float16, torch.float32):
             toy = ToyPacking(dtype)
             for dimensions, views in (((8, 8), 2), ((16, 8), 3)):

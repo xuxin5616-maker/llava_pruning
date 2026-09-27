@@ -139,7 +139,7 @@ def run_worker(spec_path):
         torch.cuda.reset_peak_memory_stats(0)
         report["gpu_name"] = torch.cuda.get_device_name(0)
         print(f"GPU {job['gpu']} -> cuda:0; pruning {job['prune_rate']}%; {report['gpu_name']}", flush=True)
-        from triad_pruning.runner import run
+        from llava_pruning.runner import run
         run(
             model_path=job["model_path"], input_json=job["input_json"],
             data_root=job["data_root"], prompt_version="v0", method_name="fastv",

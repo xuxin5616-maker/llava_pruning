@@ -1,5 +1,5 @@
 Use case: scientific-educational.
-Create ONE clear annotated Chinese teaching infographic explaining the exact layout produced by the Python function build_attention_overlay() for anyres_max_9 in a Triad/LLaVA FastV project. This is an explanatory mockup, NOT real inference evidence. Raster image, high-resolution, clean white background, restrained navy text, readable Chinese sans-serif, professional research-notebook style. Prefer a wide overall canvas around 2200x1700 pixels so the tall actual-output mockup fits on the left and concise numbered explanations fit on the right.
+Create ONE clear annotated Chinese teaching infographic explaining the exact layout produced by the Python function build_attention_overlay() for anyres_max_9 in a LLaVA FastV project. This is an explanatory mockup, NOT real inference evidence. Raster image, high-resolution, clean white background, restrained navy text, readable Chinese sans-serif, professional research-notebook style. Prefer a wide overall canvas around 2200x1700 pixels so the tall actual-output mockup fits on the left and concise numbered explanations fit on the right.
 
 Title, verbatim: "anyres_max_9：attention_overlay.png 布局示意"
 Subtitle, verbatim: "示例：方形原图，2×2 高分辨率切块；热力值为示意"

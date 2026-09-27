@@ -202,7 +202,7 @@ def prepare_image_masks(original_size, pro_data, image_mask, base_grid, patch_si
 
 
 def build_attention_overlay(original, image_attention, image_mask, prepared):
-    """Show source views above their ranking-attention overlays, as in Triad."""
+    """Show source views above their ranking-attention overlays, as in reference."""
     scores = np.asarray(image_attention["scores"], dtype=np.float32)
     if (image_attention["span"] != image_mask["span"]
             or scores.ndim != 1
@@ -213,6 +213,9 @@ def build_attention_overlay(original, image_attention, image_mask, prepared):
     spatial_indices = np.concatenate([_spatial_indices(view["metadata"])
                                       for view in prepared["views"]])
     patch_scores = np.maximum(scores[spatial_indices], 0)
+    valid = np.asarray(image_attention.get("valid", np.ones(scores.size, dtype=bool)), dtype=bool)
+    if valid.shape != scores.shape:
+        raise ValueError("Attention validity mask does not match original token coordinates")
     maximum = float(patch_scores.max()) if patch_scores.size else 0.0
     scale = maximum if maximum > 0 else 1.0
     columns = []
@@ -227,13 +230,19 @@ def build_attention_overlay(original, image_attention, image_mask, prepared):
         heat = Image.fromarray(grid.astype(np.float32), mode="F")
         heat = np.asarray(heat.resize((width, height), Image.Resampling.BILINEAR))
         heat = np.clip(heat, 0.0, 1.0)
-        # JET-style map and the same 60/40 image/heat blend used by Triad-main.
+        # JET-style map and the same 60/40 image/heat blend used by reference visualization.
         color = np.stack([
             np.clip(1.5 - np.abs(4 * heat - 3), 0, 1),
             np.clip(1.5 - np.abs(4 * heat - 2), 0, 1),
             np.clip(1.5 - np.abs(4 * heat - 1), 0, 1),
         ], axis=-1) * 255
         overlay = np.clip(0.6 * np.asarray(source) + 0.4 * color, 0, 255).astype(np.uint8)
+        # A token deleted at an earlier stage has NO current attention score.
+        # Gray it out rather than misrepresenting its missing value as low heat.
+        if not valid[indices].all():
+            active = Image.fromarray((valid[indices].reshape(rows, cols) * 255).astype(np.uint8))
+            active = np.asarray(active.resize((width, height), Image.Resampling.NEAREST)) > 0
+            overlay[~active] = 96
         columns.append((layout["name"], source, Image.fromarray(overlay)))
 
     margin = 8
@@ -348,3 +357,98 @@ def save_fastv_visualizations(original_images, pro_datas, image_masks, *,
             "attention_overlay": str((directory / "attention_overlay.png").resolve()) if overlays is not None else None,
         })
     return paths
+
+
+def _stack_stage_panels(panels, *, max_width=1920):
+    """Compose labelled stage rows without writing any intermediate images."""
+    resized = []
+    for title, panel in panels:
+        if panel.width > max_width:
+            panel = panel.resize((max_width, max(1, round(panel.height * max_width / panel.width))),
+                                 Image.Resampling.LANCZOS)
+        resized.append((title, panel))
+    header, gap = 52, 12
+    width = max(1000, max(panel.width for _, panel in resized))
+    height = sum(header + panel.height + gap for _, panel in resized)
+    canvas = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(canvas)
+    y = 0
+    for title, panel in resized:
+        draw.multiline_text((8, y + 6), title, fill="black", spacing=4)
+        canvas.paste(panel, (0, y + header))
+        y += header + panel.height + gap
+    return canvas
+
+
+def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
+                             base_grid, patch_size, output_dir, sample_id,
+                             save_prune=True, save_attention=False):
+    """Two multi-stage PNGs in original token coordinates, plus decision JSON.
+
+    Each row corresponds to an actual pruning boundary. Scores are PRE-drop
+    at that boundary, decisions are POST-drop. Previously removed anchors have
+    no scores and are gray in the attention panel, not filled with stale heat.
+    """
+    if not stages or not (save_prune or save_attention):
+        raise ValueError("ViCo visualization requires captured stages and an enabled image type")
+    comparisons, attentions, decisions = [], [], []
+    previous_keep = None
+    for stage in stages:
+        mask = stage["mask"]
+        prepared = prepare_image_masks(original.size, pro_data, mask, base_grid, patch_size)
+        keep = np.asarray(mask["keep"], dtype=bool)
+        if previous_keep is not None and np.any(keep & ~previous_keep):
+            raise ValueError("ViCo visualization cannot restore previously pruned tokens")
+        previous_keep = keep
+        title = (f"ViCo - after layer {stage['after_layer']} | visual tokens: "
+                 f"{stage['image_tokens_before']} -> {stage['image_tokens_after']} | "
+                 f"removed now: {stage['removed_this_stage']} | "
+                 f"cumulative removed: {stage['cumulative_prune_rate']:.2f}%")
+        if save_prune:
+            width, height = original.size
+            panel_width = min(640, width)
+            panel_height = max(1, round(height * panel_width / width))
+            row = Image.new("RGB", (panel_width * 3, panel_height + 26), "white")
+            draw = ImageDraw.Draw(row)
+            panels = (original, _blackout(original, prepared["views"][0]["pruned"]),
+                      _blackout(original, prepared["combined_pruned"]))
+            captions = ("Original", "Global: pruned = black", "Combined: any kept view visible")
+            for index, (panel, caption) in enumerate(zip(panels, captions)):
+                draw.text((index * panel_width + 4, 4), caption, fill="black")
+                row.paste(panel.resize((panel_width, panel_height)), (index * panel_width, 26))
+            comparisons.append((title + "\nCumulative decisions; spatial anchors, not exact pixel information removal.", row))
+        if save_attention:
+            if "attention" not in stage:
+                raise ValueError("ViCo attention images require captured independent ranking scores")
+            row = build_attention_overlay(original, stage["attention"], mask, prepared)
+            attentions.append((title + "\nPRE-drop ranking attention; gray = removed BEFORE this stage; scale normalized per stage.", row))
+        decisions.append({**stage, "views": [view["metadata"] for view in prepared["views"]]})
+    # Validate and build all panels before creating any output files.
+    comparison = _stack_stage_panels(comparisons) if save_prune else None
+    attention = _stack_stage_panels(attentions) if save_attention else None
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", str(sample_id or "sample"))[:64] or "sample"
+    base_dir = Path(output_dir) / f"sample_{slug}"
+    call_dir, suffix = base_dir, 2
+    while True:
+        try:
+            call_dir.mkdir(parents=True, exist_ok=False)
+            break
+        except FileExistsError:
+            call_dir = base_dir.with_name(f"{base_dir.name}_{suffix}")
+            suffix += 1
+    directory = call_dir / "image_0"
+    directory.mkdir()
+    if comparison is not None:
+        comparison.save(directory / "comparison.png")
+    if attention is not None:
+        attention.save(directory / "attention_overlay.png")
+    metadata = {"sample_id": str(sample_id), "method": "vico", "stages": decisions,
+                "layers": layer_stats, "original_size": list(original.size),
+                "attention_semantics": "independent pre-drop scores; gray means absent, not zero attention",
+                "rate_semantics": "final cumulative target, rounded up to whole retained tokens",
+                "token_scope": "packed image span including structural newline tokens",
+                "coordinate_convention": "original packed image indices; half-open xyxy spatial anchors"}
+    (directory / "decisions.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    return [{"image_index": 0, "directory": str(directory.resolve()),
+             "comparison": str((directory / "comparison.png").resolve()) if save_prune else None,
+             "attention_overlay": str((directory / "attention_overlay.png").resolve()) if save_attention else None}]
