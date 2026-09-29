@@ -30,6 +30,7 @@ from transformers.generation.utils import GenerateOutput
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
 from .fastv_attention import last_prompt_attention
+from .pruning_timing import measure_pruning
 from .vico import ViCoMixin
 
 # from .qwen.modeling_qwen import QWenLMHeadModel, QWenModel
@@ -366,15 +367,17 @@ class LlavaQwenModel(ViCoMixin, LlavaMetaModel, Qwen2Model):
                 all_hidden_states += (hidden_states,)
 
             if fastv_prefill and layer_index == self.fastv_layer - 1:
-                scores = last_prompt_attention(
-                    decoder_layer, hidden_states, position_embeddings, attention_mask,
-                )
-                self._build_fastv_keep_mask(scores)
+                with measure_pruning(self, hidden_states.device):
+                    scores = last_prompt_attention(
+                        decoder_layer, hidden_states, position_embeddings, attention_mask,
+                    )
+                    self._build_fastv_keep_mask(scores)
             layer_causal_mask = causal_mask
             if fastv_active and layer_index >= self.fastv_layer:
-                layer_causal_mask = self._apply_fastv_mask(
-                    causal_mask, past_seen_tokens + inputs_embeds.shape[1],
-                )
+                with measure_pruning(self, hidden_states.device):
+                    layer_causal_mask = self._apply_fastv_mask(
+                        causal_mask, past_seen_tokens + inputs_embeds.shape[1],
+                    )
 
             layer_outputs = decoder_layer(
                 hidden_states,

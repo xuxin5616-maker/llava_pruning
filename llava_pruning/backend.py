@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import time
 from pathlib import Path
@@ -15,6 +16,51 @@ from .roi import choose_roi, load_mask
 
 
 VENDOR = Path(__file__).resolve().parents[1] / "vendor" / "llava"
+
+
+def _generate_with_timing(model, generation_options, *, include_pruning_time=True):
+    """Time one generate call; optional subtraction is a profiled diagnostic.
+
+    Synchronized pruning sections cover explicit ranking/selection/masking/drop
+    routines, not all downstream cache/position handling or Python dispatch.
+    Extra synchronization changes scheduling, so adjusted time is not a claim
+    about uninstrumented end-to-end speed. Default timing adds no inner syncs.
+    """
+    import torch
+    if type(include_pruning_time) is not bool:
+        raise ValueError("include_pruning_time must be a boolean")
+    core = model.get_model()
+    timer = None
+    if not include_pruning_time:
+        devices = {parameter.device for layer in getattr(core, "layers", ())
+                   for parameter in layer.parameters()}
+        if len(devices) > 1:
+            raise ValueError("Exclude-pruning timing requires decoder weights on one device; "
+                             "use one visible GPU without decoder offloading")
+        from llava.model.language_model.pruning_timing import PruningTimer
+        timer = PruningTimer()
+    previous_timer = getattr(core, "_pruning_timer", None)
+    core._pruning_timer = timer
+    try:
+        with torch.inference_mode():
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            generated = model.generate(**generation_options)
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - start
+    finally:
+        # A failed sample or a later default-mode run must not inherit a timer.
+        core._pruning_timer = previous_timer
+    if not math.isfinite(elapsed) or elapsed < 0:
+        raise RuntimeError("Invalid synchronized generation duration")
+    timing = {"generation_seconds": elapsed}
+    if timer is not None:
+        pruning = timer.seconds
+        if not math.isfinite(pruning) or not 0 <= pruning <= elapsed:
+            raise RuntimeError("Measured pruning duration is inconsistent with generation duration")
+        timing.update(generation_seconds=elapsed - pruning,
+                      generation_with_pruning_seconds=elapsed, pruning_seconds=pruning)
+    return generated, timing
 
 
 class LlavaBackend:
@@ -92,7 +138,8 @@ class LlavaBackend:
     def generate(self, sample: Sample, prompt: str, method: PruningMethod,
                  rate: int, roi_mode: str, *, capture_visualization: bool,
                  capture_attention: bool,
-                 random_seed: int, do_sample: bool = False) -> dict:
+                 random_seed: int, do_sample: bool = False,
+                 include_pruning_time: bool = True) -> dict:
         import torch
         from llava.constants import (DEFAULT_IMAGE_TOKEN, DEFAULT_IM_END_TOKEN,
                                      DEFAULT_IM_START_TOKEN, IMAGE_TOKEN_INDEX)
@@ -150,32 +197,24 @@ class LlavaBackend:
         )
         if max_new_tokens < 1:
             raise ValueError("Prompt exceeds the original LLaVA context budget")
-        with torch.inference_mode():
-            torch.cuda.synchronize()
-            start = time.perf_counter()
-            generation_options = {
-                "do_sample": do_sample,
-                "temperature": 0.2,
-                "top_p": 0.7,
-                "max_new_tokens": max_new_tokens,
-                "use_cache": True,
-            }
-            generated = self.model.generate(
-                inputs=tokens, images=pixels, image_sizes=[image.size],
-                **generation_options,
-            )
-            torch.cuda.synchronize()
-            elapsed = time.perf_counter() - start
+        generation_options = {
+            "inputs": tokens, "images": pixels, "image_sizes": [image.size],
+            "do_sample": do_sample,
+            "temperature": 0.2,
+            "top_p": 0.7,
+            "max_new_tokens": max_new_tokens,
+            "use_cache": True,
+        }
+        generated, timing = _generate_with_timing(
+            self.model, generation_options, include_pruning_time=include_pruning_time)
         answer = self.tokenizer.batch_decode(generated, skip_special_tokens=True)[0].strip()
         core = self.model.get_model()
         result = {
             "answer": answer,
-            "generation_seconds": elapsed,
+            **timing,
             "roi_source": roi_source,
             "roi_boxes": crop_metadata[0].get("roi_boxes", []),
             "stats": method.stats(core, rate),
-            "input_token_ids": tokens[0].detach().cpu().tolist(),
-            "generated_token_ids": generated[0].detach().cpu().tolist(),
             "max_new_tokens": max_new_tokens,
         }
         if capture_visualization:

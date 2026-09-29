@@ -29,6 +29,12 @@ def build_parser():
     decoding.add_argument("--sample", dest="no_sample", action="store_false",
                           help="Opt into sampling; not an exact greedy baseline comparison")
     parser.set_defaults(no_sample=True)
+    timing = parser.add_mutually_exclusive_group()
+    timing.add_argument("--include-pruning-time", dest="include_pruning_time", action="store_true",
+                        help="Include pruning in generation_seconds (default; normal timing)")
+    timing.add_argument("--exclude-pruning-time", dest="include_pruning_time", action="store_false",
+                        help="Subtract separately timed pruning blocks; diagnostic timing, pruning still runs")
+    parser.set_defaults(include_pruning_time=True)
     parser.add_argument("--output-dir", type=Path, default=PROJECT / "outputs" / "run")
     parser.add_argument("--seed", type=int, default=None,
                         help="Fixed seed for a repeatable run; default generates a new seed")
@@ -44,7 +50,7 @@ def main():
         method_name=args.method, method_config=args.method_config,
         roi_mode=args.roi_mode, save_prune_vis=args.save_prune_vis,
         save_attention_vis=args.save_attention_vis, output_dir=args.output_dir,
-        seed=args.seed, no_sample=args.no_sample,
+        seed=args.seed, no_sample=args.no_sample, include_pruning_time=args.include_pruning_time,
     )
     print(f"Saved results to {output}")
     try:

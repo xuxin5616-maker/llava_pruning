@@ -1,4 +1,4 @@
-"""Project FastV decisions onto the source image for SigLip image packing.
+"""Project pruning decisions onto the source image for SigLip image packing.
 
 This module needs only Pillow and NumPy. Its randomroi and pure-anyres layouts
 mirror the corresponding llava_arch.py branches. Patch coordinates describe
@@ -184,6 +184,9 @@ def prepare_image_masks(original_size, pro_data, image_mask, base_grid, patch_si
                               start + int(indices[-1]) + 1],
             "kept_local_indices": np.flatnonzero(view_keep).tolist(),
             "pruned_local_indices": np.flatnonzero(~view_keep).tolist(),
+            "kept_patch_tokens": int(view_keep.sum()),
+            "pruned_patch_tokens": int((~view_keep).sum()),
+            "prune_rate_percent": 100.0 * int((~view_keep).sum()) / view_keep.size,
         })
         if layout.get("projection") == "anyres":
             rows, cols = layout["grid_shape"]
@@ -197,6 +200,9 @@ def prepare_image_masks(original_size, pro_data, image_mask, base_grid, patch_si
         "patch_tokens": patch_count,
         "sequence_tokens": sequence_tokens,
         "pruned_patch_tokens": pruned_patches,
+        "pruned_sequence_tokens": int((~keep).sum()),
+        "newline_tokens": sequence_tokens - patch_count,
+        "pruned_newline_tokens": int((~keep).sum()) - pruned_patches,
         "image_newline_kept": bool(keep[-1]) if final_newline else None,
     }
 
@@ -267,11 +273,70 @@ def _blackout(image, pruned):
     return Image.fromarray(pixels)
 
 
+def _view_count_summaries(prepared):
+    """Persist scalar results only; keep spatial masks/indices in memory for drawing."""
+    fields = ("name", "token_count", "kept_patch_tokens", "pruned_patch_tokens", "prune_rate_percent")
+    return [{key: view["metadata"][key] for key in fields} for view in prepared["views"]]
+
+
+def build_anyres_comparison(original, prepared):
+    """Show both independent views before their overlapping-coverage union.
+
+    Counts use the original spatial token masks, not the rasterized black area.
+    Structural newline tokens have no spatial anchors and are reported separately.
+    """
+    global_view, anyres_view = prepared["views"]
+    if (global_view["metadata"].get("projection") != "global"
+            or anyres_view["metadata"].get("projection") != "anyres"):
+        raise ValueError("Separate anyres comparison requires global and anyres views")
+
+    def view_caption(name, view):
+        info = view["metadata"]
+        return (f"{name}\n"
+                f"Pruned: {info['pruned_patch_tokens']}/{info['token_count']} "
+                f"({info['prune_rate_percent']:.2f}%)\n"
+                "Spatial tokens only; black = pruned")
+
+    captions = (
+        "Original\nUnmodified source",
+        view_caption("Global view", global_view),
+        view_caption("High-resolution (anyres)", anyres_view),
+        "Combined (overlap)\nBlack only if ALL views prune\nNot the token pruning rate",
+    )
+    masks = (None, global_view["pruned"], anyres_view["pruned"],
+             prepared["combined_pruned"])
+    width, height = original.size
+    # Keep labels legible even for small test/input images; never upscale source pixels.
+    panel_width = max(280, min(480, width))
+    image_width = min(width, panel_width)
+    image_height = max(1, round(height * image_width / width))
+    header_height, footer_height = 62, 46
+    canvas = Image.new("RGB", (panel_width * 4, header_height + image_height + footer_height), "white")
+    draw = ImageDraw.Draw(canvas)
+    source = original.convert("RGB").resize((image_width, image_height), Image.Resampling.BILINEAR)
+    for index, (caption, mask) in enumerate(zip(captions, masks)):
+        draw.multiline_text((index * panel_width + 6, 6), caption, fill="black", spacing=4)
+        panel = source
+        if mask is not None:
+            # Resize the binary mask separately so interpolation cannot blur removed cells.
+            display_mask = Image.fromarray(mask.astype(np.uint8) * 255).resize(
+                source.size, Image.Resampling.NEAREST)
+            panel = _blackout(source, np.asarray(display_mask) != 0)
+        canvas.paste(panel, (index * panel_width + (panel_width - image_width) // 2, header_height))
+    removed, total = prepared["pruned_sequence_tokens"], prepared["sequence_tokens"]
+    footer = (f"Token totals: pruned {removed}/{total} ({100.0 * removed / total:.2f}%); "
+              f"spatial {prepared['pruned_patch_tokens']}/{prepared['patch_tokens']}; "
+              f"newlines {prepared['pruned_newline_tokens']}/{prepared['newline_tokens']} (not drawn).\n"
+              "Per-view rates use each view's spatial tokens. Combined black area is NOT the token pruning rate.")
+    draw.multiline_text((6, header_height + image_height + 6), footer, fill="black", spacing=4)
+    return canvas
+
+
 def save_fastv_visualizations(original_images, pro_datas, image_masks, *,
                               base_grid, patch_size, output_dir, sample_id,
                               fastv_layer, keep_ratio, image_attentions=None,
                               save_prune=True, save_attention=False):
-    """Save only comparison/attention PNGs and auditable decision metadata.
+    """Save only comparison/attention PNGs and compact pruning-count summaries.
 
     Repeated samples/QA rounds receive numbered directories, so earlier results
     are preserved. Return paths for the existing stats JSONL.
@@ -310,7 +375,14 @@ def save_fastv_visualizations(original_images, pro_datas, image_masks, *,
         directory = call_dir / f"image_{image_index}"
         directory.mkdir(parents=True, exist_ok=False)
         original = image.convert("RGB")
-        if save_prune:
+        if save_prune and pro_datas[image_index].get("mode") == "anyres_max_9":
+            comparison = _stack_stage_panels([
+                (f"FastV layer index={fastv_layer}, keep_ratio={keep_ratio}\n"
+                 "Spatial token anchors, not exact pixel information removal.",
+                 build_anyres_comparison(original, masks))
+            ])
+            comparison.save(directory / "comparison.png")
+        elif save_prune:
             combined = _blackout(original, masks["combined_pruned"])
             global_blackout = _blackout(original, masks["views"][0]["pruned"])
             width, height = original.size
@@ -334,19 +406,16 @@ def save_fastv_visualizations(original_images, pro_datas, image_masks, *,
         metadata = {
             "sample_id": None if sample_id is None else str(sample_id),
             "image_index": image_index,
-            "original_size": list(original.size),
+            "method": "fastv",
             "fastv_layer": fastv_layer,
             "keep_ratio": keep_ratio,
-            "image_span": image_mask["span"],
             "patch_tokens": masks["patch_tokens"],
             "pruned_patch_tokens": masks["pruned_patch_tokens"],
-            "image_newline_kept": masks["image_newline_kept"],
-            "combined_rule": "black iff covered by a patch anchor and no covering view kept it",
-            "uncovered_pixels": "unchanged; not classified as FastV pruning",
-            "coordinate_convention": "half-open xyxy in original pixels; row-major token grids; pixel-center rasterization",
-            "interpretation": "spatial token anchors, not exact pixel information removal or receptive fields",
-            "attention_overlay": "ranking layer; last valid prompt token to image keys; shared scale across views; source above 60/40 JET overlay" if overlays is not None else None,
-            "views": [view["metadata"] for view in masks["views"]],
+            "sequence_tokens": masks["sequence_tokens"],
+            "pruned_sequence_tokens": masks["pruned_sequence_tokens"],
+            "newline_tokens": masks["newline_tokens"],
+            "pruned_newline_tokens": masks["pruned_newline_tokens"],
+            "views": _view_count_summaries(masks),
         }
         with (directory / "decisions.json").open("w", encoding="utf-8") as stream:
             json.dump(metadata, stream, ensure_ascii=False, indent=2)
@@ -383,7 +452,7 @@ def _stack_stage_panels(panels, *, max_width=1920):
 def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
                              base_grid, patch_size, output_dir, sample_id,
                              save_prune=True, save_attention=False):
-    """Two multi-stage PNGs in original token coordinates, plus decision JSON.
+    """Two multi-stage PNGs in original token coordinates, plus compact counts.
 
     Each row corresponds to an actual pruning boundary. Scores are PRE-drop
     at that boundary, decisions are POST-drop. Previously removed anchors have
@@ -399,12 +468,17 @@ def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
         keep = np.asarray(mask["keep"], dtype=bool)
         if previous_keep is not None and np.any(keep & ~previous_keep):
             raise ValueError("ViCo visualization cannot restore previously pruned tokens")
+        if int(keep.sum()) != stage["image_tokens_after"]:
+            raise ValueError("ViCo stage token count disagrees with its cumulative mask")
         previous_keep = keep
         title = (f"ViCo - after layer {stage['after_layer']} | visual tokens: "
                  f"{stage['image_tokens_before']} -> {stage['image_tokens_after']} | "
                  f"removed now: {stage['removed_this_stage']} | "
                  f"cumulative removed: {stage['cumulative_prune_rate']:.2f}%")
-        if save_prune:
+        if save_prune and pro_data.get("mode") == "anyres_max_9":
+            row = build_anyres_comparison(original, prepared)
+            comparisons.append((title + "\nCumulative decisions; spatial anchors, not exact pixel information removal.", row))
+        elif save_prune:
             width, height = original.size
             panel_width = min(640, width)
             panel_height = max(1, round(height * panel_width / width))
@@ -422,7 +496,15 @@ def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
                 raise ValueError("ViCo attention images require captured independent ranking scores")
             row = build_attention_overlay(original, stage["attention"], mask, prepared)
             attentions.append((title + "\nPRE-drop ranking attention; gray = removed BEFORE this stage; scale normalized per stage.", row))
-        decisions.append({**stage, "views": [view["metadata"] for view in prepared["views"]]})
+        # Whitelist scalar settings/results; never serialize stage masks or scores.
+        stage_fields = ("after_layer", "scoring_layer", "target_keep_ratio", "image_tokens_before",
+                        "image_tokens_after", "removed_this_stage", "cumulative_prune_rate")
+        summary = {key: stage[key] for key in stage_fields if key in stage}
+        summary.update({key: prepared[key] for key in (
+            "sequence_tokens", "pruned_sequence_tokens", "patch_tokens", "pruned_patch_tokens",
+            "newline_tokens", "pruned_newline_tokens")})
+        summary["views"] = _view_count_summaries(prepared)
+        decisions.append(summary)
     # Validate and build all panels before creating any output files.
     comparison = _stack_stage_panels(comparisons) if save_prune else None
     attention = _stack_stage_panels(attentions) if save_attention else None
@@ -442,12 +524,7 @@ def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
         comparison.save(directory / "comparison.png")
     if attention is not None:
         attention.save(directory / "attention_overlay.png")
-    metadata = {"sample_id": str(sample_id), "method": "vico", "stages": decisions,
-                "layers": layer_stats, "original_size": list(original.size),
-                "attention_semantics": "independent pre-drop scores; gray means absent, not zero attention",
-                "rate_semantics": "final cumulative target, rounded up to whole retained tokens",
-                "token_scope": "packed image span including structural newline tokens",
-                "coordinate_convention": "original packed image indices; half-open xyxy spatial anchors"}
+    metadata = {"sample_id": str(sample_id), "method": "vico", "stages": decisions}
     (directory / "decisions.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return [{"image_index": 0, "directory": str(directory.resolve()),
              "comparison": str((directory / "comparison.png").resolve()) if save_prune else None,

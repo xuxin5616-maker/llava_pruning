@@ -1,11 +1,13 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image
 
+from llava_pruning.metrics import METRIC_RULE
 from llava_pruning.runner import run
 
 
@@ -20,14 +22,20 @@ class FakeBackend:
 
     def generate(self, sample, prompt, method, rate, roi_mode, *,
                  capture_visualization, capture_attention, random_seed,
-                 do_sample=False):
+                 do_sample=False, include_pruning_time=True):
         self.calls.append((rate, random_seed, do_sample))
         result = {
             "answer": "A", "generation_seconds": 0.1,
+            "max_new_tokens": 192,
+            "input_token_ids": list(range(100)), "generated_token_ids": [65],
             "roi_source": "anyres" if roi_mode == "anyres_max_9" else "mask",
             "roi_boxes": [],
             "stats": {"fastv_layer": method.layer, "keep_ratio": 1 - rate / 100},
         }
+        if not include_pruning_time:
+            pruning = 0.0 if rate == 0 else 0.02
+            result.update(generation_with_pruning_seconds=0.1, pruning_seconds=pruning,
+                          generation_seconds=0.1 - pruning)
         if capture_visualization:
             if roi_mode == "anyres_max_9":
                 result.update({
@@ -81,21 +89,37 @@ class RunnerTests(unittest.TestCase):
                                  .read_text(encoding="utf-8"))
                 metrics = json.loads((output / f"prune_{rate:02d}" / "metrics.json")
                                      .read_text(encoding="utf-8"))
-                self.assertEqual(row["question_id"], "000000108")
-                self.assertEqual(row["prune_rate"], rate)
+                self.assertEqual(row, {
+                    "question_id": "000000108",
+                    "image": str((root / "imgs" / "000000108.png").resolve()),
+                    "origin_path": "screw/test/thread_top/005.png", "gt": 1,
+                    "answer": "A", "prune_rate": rate, "method": "fastv",
+                    "generation_seconds": 0.1, "max_new_tokens": 192,
+                })
                 self.assertTrue(metrics["complete"])
+                self.assertEqual(metrics["expected_samples"], 1)
+                self.assertEqual(metrics["evaluated_samples"], 1)
                 self.assertEqual(metrics["correct"], 1)
                 self.assertEqual(metrics["accuracy"], 1.0)
+                self.assertEqual(metrics["precision"], 1.0)
+                self.assertEqual(metrics["recall"], 1.0)
+                self.assertIsNone(metrics["tnr"])
+                self.assertNotIn("rule", metrics)
+                vis_dir = output / f"prune_{rate:02d}" / "visualizations"
                 if rate % 20 == 10:
-                    paths, = row["visualizations"]
-                    self.assertTrue(Path(paths["comparison"]).is_file())
-                    self.assertTrue(Path(paths["attention_overlay"]).is_file())
+                    image_dir = vis_dir / "sample_000000108" / "image_0"
+                    self.assertTrue((image_dir / "comparison.png").is_file())
+                    self.assertTrue((image_dir / "attention_overlay.png").is_file())
                 else:
-                    self.assertIsNone(row["visualizations"])
+                    self.assertFalse(vis_dir.exists())
             self.assertEqual(len((output / "summary.csv").read_text(encoding="utf-8").splitlines()), 11)
             metadata = json.loads((output / "run.json").read_text(encoding="utf-8"))
             self.assertFalse(metadata["do_sample"])
             self.assertEqual(metadata["seed"], 42)
+            self.assertIsNotNone(datetime.fromisoformat(metadata["created_utc"]).tzinfo)
+            self.assertEqual(metadata["method_config"], json.loads(config.read_text(encoding="utf-8")))
+            self.assertEqual(metadata["metric_rule"], METRIC_RULE)
+            self.assertEqual(metadata["roi_mode"], "randomroi")
             self.assertEqual(FakeBackend.calls[0], (0, 42, False))
 
     def test_anyres_mode_writes_visualizations_and_accuracy(self):
@@ -118,9 +142,13 @@ class RunnerTests(unittest.TestCase):
                     roi_mode="anyres_max_9", save_prune_vis=True,
                     save_attention_vis=True, output_dir=output, seed=42)
             row = json.loads((output / "prune_10" / "predictions.jsonl").read_text(encoding="utf-8"))
-            paths, = row["visualizations"]
-            self.assertEqual(row["roi_source"], "anyres")
-            self.assertTrue(Path(paths["attention_overlay"]).is_file())
+            self.assertNotIn("roi_source", row)
+            self.assertNotIn("visualizations", row)
+            image_dir = output / "prune_10" / "visualizations" / "sample_one" / "image_0"
+            self.assertTrue((image_dir / "comparison.png").is_file())
+            self.assertTrue((image_dir / "attention_overlay.png").is_file())
+            metadata = json.loads((output / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["roi_mode"], "anyres_max_9")
             self.assertEqual(json.loads((output / "prune_10" / "metrics.json").read_text(encoding="utf-8"))["accuracy"], 1.0)
 
     def test_no_sample_and_generated_run_seed(self):

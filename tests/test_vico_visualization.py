@@ -1,3 +1,4 @@
+import copy
 import json
 import tempfile
 import unittest
@@ -36,6 +37,7 @@ class ViCoVisualizationTests(unittest.TestCase):
             for save_prune, save_attention in ((True, True), (True, False), (False, True)):
                 with self.subTest(size=size, prune=save_prune, attention=save_attention), tempfile.TemporaryDirectory() as directory:
                     stages = sample_stages(count)
+                    original_stages = copy.deepcopy(stages)
                     paths = save_vico_visualizations(
                         Image.new("RGB", size, "white"), metadata, stages, layer_stats=[{"layer": 1}],
                         base_grid=2, patch_size=4, output_dir=directory, sample_id="000000108",
@@ -45,7 +47,17 @@ class ViCoVisualizationTests(unittest.TestCase):
                     self.assertEqual({p.name for p in folder.glob("*.png")}, expected)
                     saved = json.loads((folder / "decisions.json").read_text(encoding="utf-8"))
                     self.assertEqual([s["after_layer"] for s in saved["stages"]], [8, 16, 24])
-                    self.assertEqual(saved["layers"], [{"layer": 1}])
+                    self.assertEqual(set(saved), {"sample_id", "method", "stages"})
+                    self.assertEqual(stages, original_stages)
+                    for summary, stage in zip(saved["stages"], stages):
+                        self.assertNotIn("mask", summary)
+                        self.assertNotIn("attention", summary)
+                        self.assertEqual(summary["image_tokens_after"], stage["image_tokens_after"])
+                        self.assertTrue(all(isinstance(value, (int, float)) for key, value in summary.items()
+                                            if key != "views"))
+                        for view in summary["views"]:
+                            self.assertEqual(set(view), {"name", "token_count", "kept_patch_tokens",
+                                                         "pruned_patch_tokens", "prune_rate_percent"})
                     if save_attention:
                         with Image.open(folder / "attention_overlay.png") as image:
                             self.assertGreater(image.height, 3 * 52)

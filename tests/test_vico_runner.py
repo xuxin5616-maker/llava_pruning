@@ -26,7 +26,7 @@ class TinyViCoBackend:
                                              "config": type("Config", (), {"patch_size": 4})()})()
 
     def generate(self, sample, prompt, method, rate, roi_mode, *, capture_visualization,
-                 capture_attention, random_seed, do_sample=False):
+                 capture_attention, random_seed, do_sample=False, include_pruning_time=True):
         method.configure(self.core, rate, capture_visualization=capture_visualization,
                          capture_attention=capture_attention)
         self.core.set_vico_image_spans([[(1, 15)]], 17)
@@ -65,17 +65,29 @@ class ViCoRunnerTests(unittest.TestCase):
                 self.assertEqual(len(rows), 28)
                 self.assertTrue(all(row["question_id"] == "0001" and row["method"] == "vico" for row in rows))
                 record = json.loads((folder / "predictions.jsonl").read_text(encoding="utf-8"))
-                self.assertEqual(record["method"], "vico")
+                self.assertEqual(record, {
+                    "question_id": "0001", "image": str((root / "image.png").resolve()),
+                    "origin_path": "screw/test/bad.png", "gt": 1,
+                    "answer": "A", "prune_rate": rate, "method": "vico",
+                    "generation_seconds": 0.1, "max_new_tokens": None,
+                })
+                metrics = json.loads((folder / "metrics.json").read_text(encoding="utf-8"))
+                self.assertTrue(metrics["complete"])
+                self.assertEqual(metrics["accuracy"], 1.0)
+                self.assertNotIn("rule", metrics)
                 if rate == 0:
                     self.assertTrue(all(row["image_tokens_in"] == row["image_tokens_out"] == "14" for row in rows))
-                    self.assertEqual(record["pruning_stats"]["mode"], "disabled_baseline")
+                    self.assertTrue(all(int(row["removed_after_layer"]) == 0 for row in rows))
                     self.assertFalse((folder / "visualizations").exists())
                 else:
                     self.assertEqual([int(row["layer"]) for row in rows if int(row["removed_after_layer"])], [8, 16, 24])
                     self.assertEqual([int(rows[i]["image_tokens_in"]) for i in (0, 8, 16, 24)], [14, 7, 4, 2])
                     self.assertEqual(int(rows[-1]["sequence_tokens_out"]), 5)
                     self.assertEqual({p.name for p in folder.rglob("*.png")}, {"comparison.png", "attention_overlay.png"})
-                    self.assertEqual(len(record["pruning_stats"]["stages"]), 3)
+            with (output / "summary.csv").open(encoding="utf-8") as stream:
+                summary = list(csv.DictReader(stream))
+            self.assertEqual([row["prune_rate"] for row in summary], ["0", "90"])
+            self.assertTrue(all(row["accuracy"] == "1.0" and row["correct"] == "1" for row in summary))
             metadata = json.loads((output / "run.json").read_text(encoding="utf-8"))
             self.assertEqual(metadata["method"], "vico")
             self.assertFalse(metadata["do_sample"])

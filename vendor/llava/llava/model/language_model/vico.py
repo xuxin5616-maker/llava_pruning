@@ -13,6 +13,7 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from .fastv_attention import last_prompt_attention
+from .pruning_timing import measure_pruning
 
 
 class ViCoMixin:
@@ -191,31 +192,32 @@ class ViCoMixin:
                 continue
             before, seq_before = active.numel(), hidden.shape[1]
             if index + 1 in self.vico_layers:
-                stage_index = self.vico_layers.index(index + 1)
-                ratio = self.vico_keep_ratios[stage_index]
-                # Cumulative targets are based on the ORIGINAL packed image span
-                # (including structural newlines), never the already reduced span.
-                keep_count = min(before, max(self.vico_min_tokens, math.ceil(original * ratio - 1e-10)))
-                # Official pdrop_rank_drop uses the NEXT layer's norm and Q/K
-                # projections on the output of this completed boundary layer.
-                scores = last_prompt_attention(self.layers[index + 1], hidden, rotary)
-                visual_scores = scores[0, start:start + before]
-                selected = visual_scores.topk(keep_count, sorted=False).indices.sort().values
-                kept_original = active[selected]
-                stage_stats = {"after_layer": index + 1, "scoring_layer": index + 2,
-                               "target_keep_ratio": ratio, "image_tokens_before": before,
-                               "image_tokens_after": keep_count, "removed_this_stage": before - keep_count,
-                               "cumulative_prune_rate": 100.0 * (1 - keep_count / original)}
-                self._vico_stats["stages"].append(stage_stats)
-                if self.vico_capture_visualization:
-                    item = {"stats": stage_stats, "kept_original_indices": kept_original}
-                    if self.vico_capture_attention:
-                        item.update(active_original_indices=active, scores=visual_scores)
-                    self._vico_stages.append(item)
-                selection = torch.cat((torch.arange(start, device=hidden.device), start + selected,
-                                       torch.arange(start + before, hidden.shape[1], device=hidden.device)))
-                hidden = hidden.index_select(1, selection)
-                active = kept_original
+                with measure_pruning(self, hidden.device):
+                    stage_index = self.vico_layers.index(index + 1)
+                    ratio = self.vico_keep_ratios[stage_index]
+                    # Cumulative targets are based on the ORIGINAL packed image span
+                    # (including structural newlines), never the already reduced span.
+                    keep_count = min(before, max(self.vico_min_tokens, math.ceil(original * ratio - 1e-10)))
+                    # Official pdrop_rank_drop uses the NEXT layer's norm and Q/K
+                    # projections on the output of this completed boundary layer.
+                    scores = last_prompt_attention(self.layers[index + 1], hidden, rotary)
+                    visual_scores = scores[0, start:start + before]
+                    selected = visual_scores.topk(keep_count, sorted=False).indices.sort().values
+                    kept_original = active[selected]
+                    stage_stats = {"after_layer": index + 1, "scoring_layer": index + 2,
+                                   "target_keep_ratio": ratio, "image_tokens_before": before,
+                                   "image_tokens_after": keep_count, "removed_this_stage": before - keep_count,
+                                   "cumulative_prune_rate": 100.0 * (1 - keep_count / original)}
+                    self._vico_stats["stages"].append(stage_stats)
+                    if self.vico_capture_visualization:
+                        item = {"stats": stage_stats, "kept_original_indices": kept_original}
+                        if self.vico_capture_attention:
+                            item.update(active_original_indices=active, scores=visual_scores)
+                        self._vico_stages.append(item)
+                    selection = torch.cat((torch.arange(start, device=hidden.device), start + selected,
+                                           torch.arange(start + before, hidden.shape[1], device=hidden.device)))
+                    hidden = hidden.index_select(1, selection)
+                    active = kept_original
                 # Reindexing on the next iteration follows the author's policy.
                 rotary_key = None
             self._vico_stats["layers"].append(self._vico_layer_record(

@@ -22,7 +22,7 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
 
 ViCo defaults to pruning **after layers 8, 16 and 24**. The sweep's 0/10/.../90 values mean **final cumulative pruning percentages**, distributed geometrically over the three boundaries. For a final 90% target, stage retention is approximately 46.42%, 21.54%, 10% of the original packed image span. The author example `[0.5,0.25,0.125]` instead corresponds to a final 87.5% pruning rate. The adapter physically shortens hidden-state sequences and uses stage-specific KV-cache lengths, while retaining FP16 + FlashAttention2 and independently computed ranking scores. It is an inference adaptation, not a claim of reproducing the author's accuracy/speed numbers.
 
-When enabled, sample visualizations are saved for 10/30/50/70/90 only. Each sample still has only `comparison.png` and `attention_overlay.png`, now with one labelled row per ViCo pruning boundary. Previously removed tokens are gray in later attention rows, not assigned fabricated scores. All 28 layers' counts (including unchanged layers and rate 0) are stored in `prune_XX/layer_tokens.csv` and prediction metadata. `run.py` still draws ACC/PRE/Recall/TNR curves with a 50%–100% y-axis after the sweep. See [the ViCo adapter specification](docs/vico.md) for token-count scope, rounding, position conventions, limitations and tests.
+When enabled, sample visualizations are saved for 10/30/50/70/90 only. Each sample still has only `comparison.png` and `attention_overlay.png`, now with one labelled row per ViCo pruning boundary. Previously removed tokens are gray in later attention rows, not assigned fabricated scores. All 28 layers' counts (including unchanged layers and rate 0) are stored in `prune_XX/layer_tokens.csv`, without duplicating those rows in prediction JSON. `run.py` still draws ACC/PRE/Recall/TNR curves with a 50%–100% y-axis after the sweep. See [the ViCo adapter specification](docs/vico.md) for token-count scope, rounding, position conventions, limitations and tests.
 
 For a baseline-only ViCo run, copy `configs/vico.json`, set `prune_rates` to `[0]` and `visualize_rates` to `[]`, and pass that file. `configs/baseline.json` is a **FastV** configuration.
 
@@ -36,7 +36,7 @@ The CLI accepts a JSON list (`.json`) or one object per line (`.jsonl`). For exa
 
 `--data-root` is the root for relative paths. A bare `image` filename is searched first at `<data-root>/<filename>` and then at `<data-root>/imgs/<filename>`; `mask` is resolved at `<data-root>/<mask>` and may be a grayscale image, `.npy`, or `.npz` with an `anomaly_map` array. `origin_path` determines the MVTec category (`screw` here). `musc_scores` and other extra fields are ignored, not treated as pruning scores. IDs stay strings, preserving leading zeroes. `bbox` may be supplied later as `[[x_min,y_min,x_max,y_max], ...]`, following the legacy crop helper's inclusive coordinates; when both mask and bbox are present, mask takes precedence in this scaffold.
 
-For known MVTec categories, `--prompt-version v0|v1|v2|v3` selects the original LLaVA MVTec templates; the record's `text` is a fallback only for unknown categories. This deliberately matches the old `config:vN` experiment path, and means the example's `text` is **not** the model prompt for `screw`. The resolved prompt is stored with each prediction.
+For known MVTec categories, `--prompt-version v0|v1|v2|v3` selects the original LLaVA MVTec templates; the record's `text` is a fallback only for unknown categories. This deliberately matches the old `config:vN` experiment path, and means the example's `text` is **not** the model prompt for `screw`. The selected prompt version is recorded once in `run.json`; resolved prompts are not repeated in prediction JSON.
 
 ## Run
 
@@ -58,15 +58,29 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
   --output-dir outputs/experiment_01
 ```
 
-`--roi-mode randomroi` uses `mask`, then `bbox`, then random crops if neither exists. `--roi-mode randompatch` ignores both annotations and always chooses random crops. Both modes use the LLaVA `randomroi` image packing; they differ only in crop selection. `--roi-mode anyres_max_9` ignores masks/boxes and, like original LLaVA's `--overwrite_image_aspect_ratio`, changes the aspect-ratio setting **without overwriting the checkpoint's merge type**. For the pure-anyres checkpoint discussed here this is `spatial_unpad`; it is not the `anyres_max_9_randomroi` hybrid. The actual ROI source and boxes are recorded per prediction.
+`--roi-mode randomroi` uses `mask`, then `bbox`, then random crops if neither exists. `--roi-mode randompatch` ignores both annotations and always chooses random crops. Both modes use the LLaVA `randomroi` image packing; they differ only in crop selection. `--roi-mode anyres_max_9` ignores masks/boxes and, like original LLaVA's `--overwrite_image_aspect_ratio`, changes the aspect-ratio setting **without overwriting the checkpoint's merge type**. For the pure-anyres checkpoint discussed here this is `spatial_unpad`; it is not the `anyres_max_9_randomroi` hybrid. The ROI mode and seed are recorded once in `run.json`; per-sample crop coordinates are no longer exported.
 
 Decoding is now **greedy by default**, matching the user's current LLaVA `do_sample=False`. Existing `--no-sample` commands remain valid; use `--sample` only to opt back into sampling (temperature 0.2, top-p 0.7). Unless `--seed` is specified, each run generates a new seed; the actual seed and decoding mode are recorded in `run.json`. In `randompatch` mode the seed controls crop selection; greedy decoding does not disable random crops.
+
+### Include or exclude pruning in the reported time
+
+`--include-pruning-time` is the default: `generation_seconds` is the synchronized wall time of `model.generate()`, including vision encoding, LLM generation and pruning. Omit both timing flags to keep this behavior.
+
+Add **`--exclude-pruning-time`** to subtract separately measured pruning blocks from the reported value. Pruning still runs, with unchanged decisions, precision and attention backend. All decoder weights must be on one device (use one visible GPU, without decoder offloading). `run.json` records `include_pruning_time: false`; each prediction adds only two scalar timing fields:
+
+```text
+generation_seconds = generation_with_pruning_seconds - pruning_seconds
+```
+
+`generation_with_pruning_seconds` is the full generation time of that **instrumented** call, and `pruning_seconds` is the sum of synchronized wall-time intervals around independent scoring, top-k selection and mask construction/application (FastV), or scoring, selection and sequence gathering (ViCo). Rate 0 has no pruning blocks and subtracts zero. Normal downstream position/cache handling and decoder attention kernels remain included; this is not an estimate of every possible cost caused by pruning.
+
+**Exclusion is a profiling diagnostic, not actual end-to-end speedup.** Synchronizing each measured block changes CPU/GPU overlap and adds overhead, especially with FastV masks on many layers/decode steps. Do not equate the adjusted value to an uninstrumented run's latency. Report default include-mode time for real speed comparisons. Keep `--save-prune-vis` and `--save-attention-vis` off for timing experiments; capture/bookkeeping within a measured pruning routine is part of that routine's interval. Both modes still exclude checkpoint loading, input image preprocessing/tokenization, output decoding, drawing and file writes. `ex.py` remains unchanged and uses include mode.
 
 ## Independent attention scoring and baseline check
 
 At nonzero pruning rates the main decoder **stays on FlashAttention2 in every layer**. FastV does not request `output_attentions=True` and does not read returned Transformer attention matrices. A read-only side calculation uses the ranking layer's input normalization and Q/K projections, RoPE and GQA head mapping to recompute only the last valid prompt query against all prompt keys. Projection/RoPE follow the model dtype; QK, softmax and head averaging use FP32 for score stability. These scores do not change the decoder's hidden states or KV cache. This extra computation is not claimed to be bitwise identical to the old eager FP16 attention scores.
 
-At **0%**, the side calculation and pruning mask are bypassed entirely and the decoder directly calls the original `Qwen2Model.forward`. Generation also preserves original LLaVA's mask/position-ID handling and wrapper behavior. Anyres preprocessing is unchanged except for collecting visualization metadata. Input and generated token IDs are saved in `predictions.jsonl` for diagnosis.
+At **0%**, the side calculation and pruning mask are bypassed entirely and the decoder directly calls the original `Qwen2Model.forward`. Generation also preserves original LLaVA's mask/position-ID handling and wrapper behavior. Anyres preprocessing is unchanged except for collecting visualization metadata. Prediction JSON keeps the full decoded answer, but no longer exports input/generated token ID arrays.
 
 First run only the baseline (replace paths with your own):
 
@@ -94,6 +108,17 @@ Run `python -m unittest discover -s tests -v` in the pinned environment (Python 
 `configs/fastv.json` owns FastV-only settings: `layer`, `prune_rates`, `visualize_rates`, `min_tokens`, and newline handling. By default it sweeps 0, 10, 20, ..., 90%; `prune_00` disables FastV completely. Only 10, 30, 50, 70, 90% generate images, when a visualization switch is enabled. `--save-prune-vis` and `--save-attention-vis` are independent. Visualizations include original/crop-level FastV decisions and a 60/40 JET attention overlay from the ranking layer. The folder layout is `outputs/experiment_01/prune_10/{predictions.jsonl,metrics.json,visualizations/sample_<id>/image_0/...}`. Output directories must be empty to prevent accidental overwrite; choose a new directory for each experiment.
 
 Each image directory now saves only `comparison.png` (`--save-prune-vis`) and `attention_overlay.png` (`--save-attention-vis`). When both switches are enabled there are exactly two PNGs, for anyres, randomroi and randompatch alike. Originals, individual crops, blackouts and binary masks are no longer saved separately. `decisions.json`, predictions and accuracy statistics are retained; previously generated files are not deleted.
+
+For `anyres_max_9`, both FastV and ViCo comparison rows show **Original / Global / High-resolution (anyres) / Combined**. Global and high-resolution panels use their own cumulative spatial-token masks and report their own pruned counts and percentages. The combined panel turns black only where no covering view kept a token: its black area is **not** the overall pruning rate. A footer reports total, spatial and structural-newline token removals separately; newlines are not drawn as pixels. These counts are also saved in `decisions.json`. ViCo repeats the four panels at each pruning boundary. Attention output and ROI-mode layouts are unchanged; existing saved figures are not automatically redrawn.
+
+JSON output is compact by default, with no extra switch:
+
+- `run.json`: creation time and shared run/model/method/decoding settings, seed, input paths and metric definitions.
+- `predictions.jsonl`: `question_id`, `image`, `origin_path`, `gt`, `answer`, `prune_rate`, `method`, `generation_seconds` and the effective `max_new_tokens`. Exclude-pruning timing adds only `generation_with_pruning_seconds` and `pruning_seconds`. `generation_seconds` follows the selected timing mode, excludes drawing/file writes, and is not total run wall time.
+- `metrics.json`: progress, sample counts and evaluation results; the metric rule is recorded once in `run.json`.
+- `decisions.json`: method/stage settings and short scalar token-count summaries only. No attention arrays, patch masks, coordinate/index lists, or duplicate full-layer records are saved.
+
+Images are still drawn from full data in memory before those arrays are discarded. ViCo per-layer details remain in `layer_tokens.csv`. Compact JSON alone cannot reconstruct individual patch masks or attention maps offline. Existing outputs are not modified or deleted; these changes apply to new runs only. `ex.py` and its resource reports are unchanged.
 
 Each completed rate prints image-level accuracy and appends a row to `summary.csv`. Each `prune_XX/metrics.json` also tracks partial progress while running (`complete: false` until the rate finishes). Accuracy uses the first answer option only: `A` means defect (`gt=1`), `B` means no defect (`gt=0`); unparsed labeled answers count as incorrect. Records without `gt` are excluded. This is binary classification accuracy, not segmentation accuracy or AUROC. The `accuracy` field is a fraction, e.g. `0.9` means 90%.
 

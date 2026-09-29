@@ -13,9 +13,17 @@ from .metrics import Accuracy, METRIC_RULE
 from .prompts import resolve_prompt
 
 
+def _write_metrics(path, metrics):
+    # The rule is shared by every rate and is already recorded in run.json.
+    results = {key: value for key, value in metrics.items() if key != "rule"}
+    path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def run(*, model_path, input_json, data_root, prompt_version, method_name,
         method_config, roi_mode, save_prune_vis, save_attention_vis,
-        output_dir, seed=None, no_sample=True):
+        output_dir, seed=None, no_sample=True, include_pruning_time=True):
+    if type(include_pruning_time) is not bool:
+        raise ValueError("include_pruning_time must be a boolean")
     samples = load_samples(input_json, data_root)
     if not samples:
         raise ValueError("Input JSON has no samples")
@@ -48,6 +56,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         "seed": seed,
         "seed_origin": "generated" if generated_seed else "explicit",
         "do_sample": not no_sample,
+        "include_pruning_time": include_pruning_time,
         "samples": len(samples),
         "decoding": ("sampling, temperature=0.2, top_p=0.7, max_new_tokens<=512"
                      if not no_sample else "greedy, max_new_tokens<=512 (LLaVA context budget)"),
@@ -55,6 +64,10 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         "metric_rule": METRIC_RULE,
     }
     (output / "run.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    if not include_pruning_time:
+        print("Timing diagnostic: generation_seconds = generation_with_pruning_seconds - pruning_seconds. "
+              "Pruning still runs; extra synchronization affects timing. This is not end-to-end speedup.",
+              flush=True)
     summary_path = output / "summary.csv"
     summary_fields = ("prune_rate", "complete", "expected_samples", "evaluated_samples",
                       "labeled_samples", "correct", "incorrect", "unparsed", "accuracy",
@@ -72,7 +85,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                         "image_tokens_out", "sequence_tokens_in", "sequence_tokens_out",
                         "removed_after_layer", "cumulative_prune_rate")
         with records_path.open("w", encoding="utf-8") as stream:
-            for index, (sample, (prompt, prompt_source)) in enumerate(zip(samples, prompts)):
+            for index, (sample, (prompt, _)) in enumerate(zip(samples, prompts)):
                 visualize = rate in method.visualize_rates and (save_prune_vis or save_attention_vis)
                 result = backend.generate(
                     sample, prompt, method, rate, roi_mode,
@@ -80,10 +93,10 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                     capture_attention=visualize and save_attention_vis,
                     random_seed=seed + index,
                     do_sample=not no_sample,
+                    include_pruning_time=include_pruning_time,
                 )
-                paths = None
                 if visualize:
-                    paths = method.visualize(
+                    method.visualize(
                         result=result, vision_tower=backend.vision_tower,
                         output_dir=rate_dir / "visualizations",
                         sample_id=sample.sample_id,
@@ -94,23 +107,16 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                     "question_id": sample.sample_id,
                     "image": str(sample.image),
                     "origin_path": sample.origin_path,
-                    "mask": str(sample.mask) if sample.mask else None,
                     "gt": sample.gt,
-                    "prompt": prompt,
-                    "prompt_source": prompt_source,
                     "answer": result["answer"],
                     "prune_rate": rate,
                     "method": method.name,
-                    "roi_mode": roi_mode,
-                    "roi_source": result["roi_source"],
-                    "roi_boxes": result["roi_boxes"],
                     "generation_seconds": result["generation_seconds"],
-                    "pruning_stats": result["stats"],
-                    "input_token_ids": result.get("input_token_ids"),
-                    "generated_token_ids": result.get("generated_token_ids"),
                     "max_new_tokens": result.get("max_new_tokens"),
-                    "visualizations": paths,
                 }
+                if not include_pruning_time:
+                    record.update({key: result[key] for key in (
+                        "generation_with_pruning_seconds", "pruning_seconds")})
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
                 stream.flush()
                 if result["stats"].get("layers"):
@@ -123,13 +129,10 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                             writer.writerow({"question_id": sample.sample_id, "method": method.name,
                                              "prune_rate": rate, **layer_row})
                 accuracy.add(sample.gt, result["answer"])
-                metrics_path.write_text(
-                    json.dumps(accuracy.result(rate, complete=False), ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+                _write_metrics(metrics_path, accuracy.result(rate, complete=False))
                 print(f"rate={rate:02d} sample={index + 1}/{len(samples)} id={sample.sample_id}", flush=True)
         metrics = accuracy.result(rate, complete=True)
-        metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_metrics(metrics_path, metrics)
         with summary_path.open("a", encoding="utf-8", newline="") as summary_file:
             csv.writer(summary_file).writerow(metrics[field] for field in summary_fields)
         score = "N/A" if metrics["accuracy"] is None else f"{metrics['accuracy']:.2%}"
