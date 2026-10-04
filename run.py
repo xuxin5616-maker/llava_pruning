@@ -21,6 +21,9 @@ def build_parser():
     parser.add_argument("--method-config", type=Path, default=None,
                         help="Defaults to configs/<method>.json")
     parser.add_argument("--roi-mode", choices=("randomroi", "randompatch", "anyres_max_9"), default="randomroi")
+    parser.add_argument("--image-token-order", choices=("base_first", "anyres_first"),
+                        default="base_first",
+                        help="Anyres view order; anyres_first keeps the final newline at the end")
     parser.add_argument("--save-prune-vis", action="store_true")
     parser.add_argument("--save-attention-vis", action="store_true")
     decoding = parser.add_mutually_exclusive_group()
@@ -49,6 +52,7 @@ def main():
         data_root=args.data_root, prompt_version=args.prompt_version,
         method_name=args.method, method_config=args.method_config,
         roi_mode=args.roi_mode, save_prune_vis=args.save_prune_vis,
+        image_token_order=args.image_token_order,
         save_attention_vis=args.save_attention_vis, output_dir=args.output_dir,
         seed=args.seed, no_sample=args.no_sample, include_pruning_time=args.include_pruning_time,
     )

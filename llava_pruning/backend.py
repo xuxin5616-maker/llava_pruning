@@ -18,6 +18,16 @@ from .roi import choose_roi, load_mask
 VENDOR = Path(__file__).resolve().parents[1] / "vendor" / "llava"
 
 
+def validate_image_token_order(order, roi_mode, merge_type=None):
+    if order not in {"base_first", "anyres_first"}:
+        raise ValueError(f"Unknown image token order: {order}")
+    if order == "anyres_first":
+        if roi_mode != "anyres_max_9":
+            raise ValueError("anyres_first requires --roi-mode anyres_max_9")
+        if merge_type is not None and merge_type not in {"spatial_unpad", "spatial_unpad_add_newl"}:
+            raise ValueError("anyres_first requires spatial_unpad or spatial_unpad_add_newl packing")
+
+
 def _generate_with_timing(model, generation_options, *, include_pruning_time=True):
     """Time one generate call; optional subtraction is a profiled diagnostic.
 
@@ -64,7 +74,9 @@ def _generate_with_timing(model, generation_options, *, include_pruning_time=Tru
 
 
 class LlavaBackend:
-    def __init__(self, model_path: str | Path, roi_mode: str = "randomroi"):
+    def __init__(self, model_path: str | Path, roi_mode: str = "randomroi",
+                 image_token_order: str = "base_first"):
+        validate_image_token_order(image_token_order, roi_mode)
         # Delay heavy imports so JSON/configuration checks run without a GPU stack.
         if str(VENDOR) not in sys.path:
             sys.path.insert(0, str(VENDOR))
@@ -87,6 +99,8 @@ class LlavaBackend:
         config.image_aspect_ratio = "anyres_max_9" if roi_mode == "anyres_max_9" else "randomroi"
         if roi_mode != "anyres_max_9":
             config.mm_patch_merge_type = "spatial_avgpool_auto_unpad_add_newl"
+        validate_image_token_order(image_token_order, roi_mode, config.mm_patch_merge_type)
+        config.image_token_order = image_token_order
         # Like reference LLaVA's --overwrite_image_aspect_ratio, anyres leaves the
         # checkpoint's merge type intact (normally spatial_unpad).
         self.tokenizer = AutoTokenizer.from_pretrained(path)
@@ -113,6 +127,7 @@ class LlavaBackend:
             "cudnn_tf32": torch.backends.cudnn.allow_tf32,
             "image_aspect_ratio": self.model.config.image_aspect_ratio,
             "mm_patch_merge_type": self.model.config.mm_patch_merge_type,
+            "image_token_order": image_token_order,
             "attention_source": "independent_qk_at_nonzero_rates_only",
             "score_dtype": "float32",
             "torch": torch.__version__,
@@ -131,7 +146,8 @@ class LlavaBackend:
             f"matmul_tf32={torch.backends.cuda.matmul.allow_tf32}, "
             f"cudnn_tf32={torch.backends.cudnn.allow_tf32}, "
             f"image_aspect_ratio={self.model.config.image_aspect_ratio}, "
-            f"mm_patch_merge_type={self.model.config.mm_patch_merge_type}",
+            f"mm_patch_merge_type={self.model.config.mm_patch_merge_type}, "
+            f"image_token_order={image_token_order}",
             flush=True,
         )
 

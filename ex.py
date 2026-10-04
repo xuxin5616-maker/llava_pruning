@@ -36,6 +36,8 @@ def build_parser():
     parser.add_argument("--model-path", default="/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/")
     parser.add_argument("--input-json", default="/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl")
     parser.add_argument("--data-root", default="/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/")
+    parser.add_argument("--image-token-order", choices=("base_first", "anyres_first"),
+                        default="base_first", help="Visual token block order (default: base_first)")
     parser.add_argument("--output-dir", type=Path,
                         help="New/empty experiment directory; default output/ex_YYYYMMDD_HHMMSS")
     parser.add_argument("--seed", type=int, default=None,
@@ -100,6 +102,7 @@ def prepare_jobs(args, output):
             "resource_report": str(output / f"{name}_resources.json"),
             "log": str(output / f"{name}.log"),
             "seed": seed,
+            "image_token_order": args.image_token_order,
         }
         spec_path = output / f"{name}_job.json"
         write_json(spec_path, job)
@@ -121,6 +124,7 @@ def run_worker(spec_path):
     report = {
         "gpu": job["gpu"], "prune_rate": job["prune_rate"], "pid": os.getpid(),
         "selected_samples": job["selected_samples"],
+        "image_token_order": job.get("image_token_order", "base_first"),
         "status": "failed", "peak_allocated_bytes": None, "peak_reserved_bytes": None,
         "peak_allocated_gib": None, "peak_reserved_gib": None,
         "memory_scope": "PyTorch allocator on logical cuda:0; includes model load; excludes non-PyTorch allocations",
@@ -146,6 +150,7 @@ def run_worker(spec_path):
             method_config=job["method_config"], roi_mode="anyres_max_9",
             save_prune_vis=False, save_attention_vis=False,
             output_dir=job["output_dir"], seed=job["seed"], no_sample=True,
+            image_token_order=job.get("image_token_order", "base_first"),
         )
         torch.cuda.synchronize(0)
         report["status"] = "success"
@@ -257,6 +262,7 @@ def launch_jobs(jobs, output):
             report = {"status": "failed", "error": f"Cannot read worker resource report: {error}"}
         report.update({"gpu": job["gpu"], "prune_rate": job["prune_rate"],
                        "selected_samples": job["selected_samples"],
+                       "image_token_order": job.get("image_token_order", "base_first"),
                        "output_dir": job["output_dir"], "log": job["log"],
                        "exit_code": item["process"].returncode if item else None,
                        "total_seconds": item["total_seconds"] if item else None})
@@ -277,6 +283,7 @@ def launch_jobs(jobs, output):
         "generation_time_scope": "sum of existing per-image synchronized generate() durations, excludes preprocessing/model loading/result saving; includes pruning-score computation; no warmup exclusion",
         "memory_scope": "PyTorch peak allocated/reserved; GiB=1024^3 bytes, not whole-board usage",
         "settings": {"prompt_version": "v0", "roi_mode": "anyres_max_9", "do_sample": False,
+                     "image_token_order": jobs[0].get("image_token_order", "base_first"),
                      "save_prune_vis": False, "save_attention_vis": False,
                      "model_path": jobs[0]["model_path"], "input_json": jobs[0]["input_json"],
                      "source_input_json": jobs[0]["source_input_json"],

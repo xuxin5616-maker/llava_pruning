@@ -224,6 +224,21 @@ class LlavaMetaForCausalLM(ABC):
         if isinstance(modalities, str):
             modalities = [modalities]
 
+        image_token_order = getattr(self.config, "image_token_order", "base_first")
+        if image_token_order not in ("base_first", "anyres_first"):
+            raise ValueError(f"Unknown image_token_order: {image_token_order}")
+        if image_token_order == "anyres_first":
+            if (getattr(self.config, "image_aspect_ratio", "square") != "anyres_max_9"
+                    or getattr(self.config, "mm_patch_merge_type", "flat") not in
+                    {"spatial_unpad", "spatial_unpad_add_newl"}
+                    or any(modality != "image" for modality in modalities)):
+                raise ValueError(
+                    "image_token_order=anyres_first requires image inputs with "
+                    "anyres_max_9 and spatial_unpad or spatial_unpad_add_newl"
+                )
+            if not (type(images) is list or images.ndim == 5):
+                raise ValueError("image_token_order=anyres_first requires a base view and anyres views")
+
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
@@ -241,6 +256,8 @@ class LlavaMetaForCausalLM(ABC):
                     images_list.append(image)
                 else:
                     images_list.append(image.unsqueeze(0))
+            if image_token_order == "anyres_first" and any(image.shape[0] < 2 for image in images_list):
+                raise ValueError("image_token_order=anyres_first requires a base view and anyres views")
 
             # import pdb;pdb.set_trace()
             concat_images = torch.cat([image for image in images_list], dim=0)
@@ -421,6 +438,15 @@ class LlavaMetaForCausalLM(ABC):
                             image_feature = image_feature.flatten(0, 3)
                         if "nobase" in mm_patch_merge_type:
                             pass
+                        elif image_token_order == "anyres_first":
+                            if mm_patch_merge_type == "spatial_unpad":
+                                # Keep the original final row-newline at the end
+                                # so FastV's existing tail-token protection is unchanged.
+                                image_feature = torch.cat((image_feature[:-1], base_image_feature,
+                                                           image_feature[-1:]), dim=0)
+                            else:
+                                # The existing add_newl branch appends a final newline.
+                                image_feature = torch.cat((image_feature, base_image_feature), dim=0)
                         else:
                             image_feature = torch.cat((base_image_feature, image_feature), dim=0)
                         ####################### Modified #########################

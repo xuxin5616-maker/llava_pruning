@@ -13,6 +13,41 @@ from llava_pruning import visualization
 class AnyresComparisonTests(unittest.TestCase):
     """Check the distinction between per-view token decisions and overlap."""
 
+    def test_both_orders_map_identical_token_identities_to_identical_images(self):
+        base = [True, False, False, True]
+        anyres = [True, False, True, False, True, False, True, False, True, False]
+        for final_newline in (False, True):
+            with self.subTest(final_newline=final_newline):
+                metadata = {**self.metadata, "final_newline": final_newline}
+                keep = np.array(base + anyres + ([True] if final_newline else []))
+                scores = np.arange(1, keep.size + 1, dtype=float) / 100
+                span = [3, 3 + keep.size]
+                baseline_mask = {"span": span, "keep": keep.tolist()}
+                baseline = visualization.prepare_image_masks(self.image.size, metadata, baseline_mask, 2, 4)
+                # Explicit base_first must match legacy metadata with no order field.
+                explicit = visualization.prepare_image_masks(
+                    self.image.size, {**metadata, "image_token_order": "base_first"}, baseline_mask, 2, 4)
+                self.assertEqual([v["metadata"] for v in baseline["views"]],
+                                 [v["metadata"] for v in explicit["views"]])
+                permutation = (list(range(4, 14)) + list(range(4)) + [14] if final_newline
+                               else list(range(4, 13)) + list(range(4)) + [13])
+                swapped_mask = {"span": span, "keep": keep[permutation].tolist()}
+                swapped = visualization.prepare_image_masks(
+                    self.image.size, {**metadata, "image_token_order": "anyres_first"}, swapped_mask, 2, 4)
+                self.assertEqual(swapped["views"][0]["metadata"]["token_offset"], 10 if final_newline else 9)
+                self.assertEqual(swapped["views"][1]["metadata"]["token_offset"], 0)
+                self.assertEqual(swapped["views"][1]["metadata"]["row_newline_kept"], [True, False])
+                for before, after in zip(baseline["views"], swapped["views"]):
+                    np.testing.assert_array_equal(before["pruned"], after["pruned"])
+                    self.assertEqual(before["metadata"]["pruned_patch_tokens"], after["metadata"]["pruned_patch_tokens"])
+                np.testing.assert_array_equal(baseline["combined_pruned"], swapped["combined_pruned"])
+                self.assertEqual(baseline["pruned_newline_tokens"], swapped["pruned_newline_tokens"])
+                old_overlay = visualization.build_attention_overlay(
+                    self.image, {"span": span, "scores": scores.tolist()}, baseline_mask, baseline)
+                new_overlay = visualization.build_attention_overlay(
+                    self.image, {"span": span, "scores": scores[permutation].tolist()}, swapped_mask, swapped)
+                np.testing.assert_array_equal(np.asarray(old_overlay), np.asarray(new_overlay))
+
     def setUp(self):
         self.image = Image.new("RGB", (16, 8), (80, 120, 200))
         self.metadata = {

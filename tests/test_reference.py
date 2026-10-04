@@ -127,6 +127,37 @@ class ReferenceTests(unittest.TestCase):
                     else:
                         self.assertTrue(torch.equal(actual_item, expected_item))
 
+    def test_anyres_first_only_moves_visual_blocks_and_keeps_original_tail(self):
+        original = load_reference("llava.model._llava_reference_arch", "llava/model/llava_arch.py")
+        for dtype in (torch.float16, torch.float32):
+            for final_newline in (False, True):
+                toy = ToyPacking(dtype)
+                toy.config.image_token_order = "anyres_first"
+                if final_newline:
+                    toy.config.mm_patch_merge_type += "_add_newl"
+                for dimensions, views in (((8, 8), 2), ((16, 8), 3)):
+                    with self.subTest(dtype=dtype, final_newline=final_newline,
+                                      dimensions=dimensions):
+                        images = torch.zeros(1, views, 3, 8, 8, dtype=dtype)
+                        tokens = torch.tensor([[1, IMAGE_TOKEN_INDEX, 2, 3]])
+                        args = (tokens, torch.arange(4)[None], torch.ones_like(tokens),
+                                None, tokens.clone(), images)
+                        expected = list(original.LlavaMetaForCausalLM.prepare_inputs_labels_for_multimodal(
+                            toy, *args, image_sizes=[dimensions]))
+                        packed = expected[4]
+                        # Keep the last structural image token and following two
+                        # text tokens fixed. Move the four base tokens behind the
+                        # remaining anyres block; nothing else may change.
+                        tail = packed.shape[1] - 3
+                        expected[4] = torch.cat((packed[:, :1], packed[:, 5:tail],
+                                                 packed[:, 1:5], packed[:, tail:]), dim=1)
+                        actual = toy.prepare_inputs_labels_for_multimodal(*args, image_sizes=[dimensions])
+                        for expected_item, actual_item in zip(expected, actual):
+                            if expected_item is None:
+                                self.assertIsNone(actual_item)
+                            else:
+                                self.assertTrue(torch.equal(actual_item, expected_item))
+
 
 if __name__ == "__main__":
     unittest.main()

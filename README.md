@@ -60,6 +60,8 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
 
 `--roi-mode randomroi` uses `mask`, then `bbox`, then random crops if neither exists. `--roi-mode randompatch` ignores both annotations and always chooses random crops. Both modes use the LLaVA `randomroi` image packing; they differ only in crop selection. `--roi-mode anyres_max_9` ignores masks/boxes and, like original LLaVA's `--overwrite_image_aspect_ratio`, changes the aspect-ratio setting **without overwriting the checkpoint's merge type**. For the pure-anyres checkpoint discussed here this is `spatial_unpad`; it is not the `anyres_max_9_randomroi` hybrid. The ROI mode and seed are recorded once in `run.json`; per-sample crop coordinates are no longer exported.
 
+For a view-order comparison, add `--image-token-order anyres_first` to an existing `--roi-mode anyres_max_9` command. The default, `--image-token-order base_first`, keeps the original order. Both `run.py` and `ex.py` accept the option; it applies at **all pruning rates, including 0%**. Swapping requires `spatial_unpad` or `spatial_unpad_add_newl`. With `spatial_unpad`, the sequence becomes `[anyres except its last newline] [base] [the original last newline]`; with `spatial_unpad_add_newl`, it becomes `[anyres including row newlines] [base] [the extra final newline]`. Keep `preserve_image_newline: true` if using the default FastV protection. Image pixels, token counts, normal position-ID generation and pruning rules are unchanged. The selected order is saved in `run.json` and visualization `decisions.json`; plot offsets and row-newline records follow the order automatically. Use separate output directories for the two runs. Returning to the original order only requires omitting the option or choosing `base_first`.
+
 Decoding is now **greedy by default**, matching the user's current LLaVA `do_sample=False`. Existing `--no-sample` commands remain valid; use `--sample` only to opt back into sampling (temperature 0.2, top-p 0.7). Unless `--seed` is specified, each run generates a new seed; the actual seed and decoding mode are recorded in `run.json`. In `randompatch` mode the seed controls crop selection; greedy decoding does not disable random crops.
 
 ### Include or exclude pruning in the reported time
@@ -109,6 +111,8 @@ Run `python -m unittest discover -s tests -v` in the pinned environment (Python 
 
 Each image directory now saves only `comparison.png` (`--save-prune-vis`) and `attention_overlay.png` (`--save-attention-vis`). When both switches are enabled there are exactly two PNGs, for anyres, randomroi and randompatch alike. Originals, individual crops, blackouts and binary masks are no longer saved separately. `decisions.json`, predictions and accuracy statistics are retained; previously generated files are not deleted.
 
+Both PNGs now have a short top label such as `GT: Normal | Pred: Abnormal`. GT comes from the input `gt` (0=Normal, 1=Abnormal); Pred uses the same A/B parser as the metrics (A=Abnormal, B=Normal). Missing GT is `Unknown`, and unparseable answers are `Unparsed`. For ViCo this label is the final answer at the current pruning rate, not a separate prediction for each layer. No new flags are needed; only newly generated images are labelled, and existing images are not modified.
+
 For `anyres_max_9`, both FastV and ViCo comparison rows show **Original / Global / High-resolution (anyres) / Combined**. Global and high-resolution panels use their own cumulative spatial-token masks and report their own pruned counts and percentages. The combined panel turns black only where no covering view kept a token: its black area is **not** the overall pruning rate. A footer reports total, spatial and structural-newline token removals separately; newlines are not drawn as pixels. These counts are also saved in `decisions.json`. ViCo repeats the four panels at each pruning boundary. Attention output and ROI-mode layouts are unchanged; existing saved figures are not automatically redrawn.
 
 JSON output is compact by default, with no extra switch:
@@ -119,6 +123,14 @@ JSON output is compact by default, with no extra switch:
 - `decisions.json`: method/stage settings and short scalar token-count summaries only. No attention arrays, patch masks, coordinate/index lists, or duplicate full-layer records are saved.
 
 Images are still drawn from full data in memory before those arrays are discarded. ViCo per-layer details remain in `layer_tokens.csv`. Compact JSON alone cannot reconstruct individual patch masks or attention maps offline. Existing outputs are not modified or deleted; these changes apply to new runs only. `ex.py` and its resource reports are unchanged.
+
+To convert an existing `summary.csv` to Excel without inference, edit `SUMMARY_CSV` at the top of the standalone `summary_to_excel.py` and run `python summary_to_excel.py`, or pass its path:
+
+```bash
+python summary_to_excel.py /path/to/summary.csv
+```
+
+Only `openpyxl` is required (`python -m pip install "openpyxl>=3.1,<4"` if missing). The script keeps the original columns, row order, incomplete rows and blank values. ACC/PRE/Recall/TNR display as percentages without changing their stored fractions. Output is `summary.xlsx` beside the CSV; repeat exports use `summary_2.xlsx`, etc. An optional `--output /path/to/new.xlsx` selects a new file and refuses overwrite. It does not invent missing timing columns or read predictions to calculate additional results.
 
 Each completed rate prints image-level accuracy and appends a row to `summary.csv`. Each `prune_XX/metrics.json` also tracks partial progress while running (`complete: false` until the rate finishes). Accuracy uses the first answer option only: `A` means defect (`gt=1`), `B` means no defect (`gt=0`); unparsed labeled answers count as incorrect. Records without `gt` are excluded. This is binary classification accuracy, not segmentation accuracy or AUROC. The `accuracy` field is a fraction, e.g. `0.9` means 90%.
 

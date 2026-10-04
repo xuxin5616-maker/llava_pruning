@@ -12,17 +12,20 @@ import ex
 
 
 class ExperimentTests(unittest.TestCase):
-    def make_jobs(self, root, count=2, gpus=(4, 5)):
+    def make_jobs(self, root, count=2, gpus=(4, 5), image_token_order=None):
         # Reverse IDs verify that selection follows file order, not ID sorting.
         records = [{"question_id": str(index), "image": f"{index}.png"}
                    for index in range(count, 0, -1)]
         (root / "questions.jsonl").write_text(
             "\n".join(json.dumps(record) for record in records), encoding="utf-8")
-        args = ex.build_parser().parse_args([
+        argv = [
             "--model-path", str(root), "--input-json", str(root / "questions.jsonl"),
             "--data-root", str(root), "--seed", "42",
             "--gpus", *map(str, gpus),
-        ])
+        ]
+        if image_token_order is not None:
+            argv.extend(["--image-token-order", image_token_order])
+        args = ex.build_parser().parse_args(argv)
         return ex.prepare_jobs(args, root)
 
     def test_jobs_split_rates_and_keep_original_settings(self):
@@ -39,9 +42,22 @@ class ExperimentTests(unittest.TestCase):
                 self.assertEqual(job["seed"], 42)
                 self.assertEqual(job["sample_limit"], 100)
                 self.assertEqual(job["selected_samples"], 2)
+                self.assertEqual(job["image_token_order"], "base_first")
             with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "5"}):
                 self.assertEqual(ex.worker_environment(4)["CUDA_VISIBLE_DEVICES"], "4")
                 self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "5")
+
+    def test_image_token_order_choices_and_job_specs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for order in ("base_first", "anyres_first"):
+                with self.subTest(order=order):
+                    jobs = self.make_jobs(Path(directory), image_token_order=order)
+                    for job in jobs:
+                        self.assertEqual(job["image_token_order"], order)
+                        spec = json.loads(Path(job["spec_path"]).read_text(encoding="utf-8"))
+                        self.assertEqual(spec["image_token_order"], order)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            ex.build_parser().parse_args(["--image-token-order", "invalid"])
 
     def test_both_jobs_use_only_first_100_in_input_order(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -78,8 +94,21 @@ class ExperimentTests(unittest.TestCase):
                     ex.read_first_samples(path)
 
     def test_worker_measures_peaks_and_selected_samples_generation_time(self):
+        self.check_worker()
+
+    def test_worker_passes_swapped_image_token_order(self):
+        self.check_worker(image_token_order="anyres_first")
+
+    def test_worker_defaults_legacy_job_to_base_first(self):
+        self.check_worker(legacy=True)
+
+    def check_worker(self, image_token_order=None, legacy=False):
         with tempfile.TemporaryDirectory() as directory:
-            job = self.make_jobs(Path(directory))[1]
+            job = self.make_jobs(Path(directory), image_token_order=image_token_order)[1]
+            if legacy:
+                del job["image_token_order"]
+                ex.write_json(job["spec_path"], job)
+            expected_order = image_token_order or "base_first"
             cuda = SimpleNamespace(
                 is_available=lambda: True, device_count=lambda: 1,
                 set_device=Mock(), reset_peak_memory_stats=Mock(),
@@ -96,6 +125,7 @@ class ExperimentTests(unittest.TestCase):
                 self.assertFalse(kwargs["save_attention_vis"])
                 self.assertEqual(kwargs["roi_mode"], "anyres_max_9")
                 self.assertEqual(kwargs["prompt_version"], "v0")
+                self.assertEqual(kwargs["image_token_order"], expected_order)
                 self.assertEqual(kwargs["input_json"], job["input_json"])
                 self.assertEqual(len(json.loads(Path(kwargs["input_json"]).read_text(encoding="utf-8"))), 2)
                 folder = Path(kwargs["output_dir"]) / "prune_10"
@@ -116,6 +146,7 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual(report["peak_reserved_gib"], 4)
             self.assertEqual(report["generation_seconds_sum"], 3.75)
             self.assertEqual(report["selected_samples"], 2)
+            self.assertEqual(report["image_token_order"], expected_order)
             self.assertEqual(report["evaluated_samples"], 2)
             self.assertGreaterEqual(report["worker_wall_seconds"], 0)
             self.assertTrue(report["complete"])
@@ -143,10 +174,13 @@ class ExperimentTests(unittest.TestCase):
                 with self.subTest(gpus=gpus), self.assertRaises(ValueError):
                     self.make_jobs(Path(directory), gpus=gpus)
 
-    def check_scheduler(self, gpus, fail_rate=None):
+    def check_scheduler(self, gpus, fail_rate=None, image_token_order=None, legacy=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            jobs = self.make_jobs(root, gpus=gpus)
+            jobs = self.make_jobs(root, gpus=gpus, image_token_order=image_token_order)
+            if legacy:
+                for job in jobs:
+                    del job["image_token_order"]
             launched = []
             running = {}
 
@@ -188,11 +222,13 @@ class ExperimentTests(unittest.TestCase):
             self.assertFalse(report["settings"]["save_attention_vis"])
             self.assertEqual(report["settings"]["sample_limit"], 100)
             self.assertEqual(report["settings"]["selected_samples"], 2)
+            self.assertEqual(report["settings"]["image_token_order"], image_token_order or "base_first")
             self.assertEqual(report["settings"]["gpus"], list(gpus))
             self.assertEqual(report["settings"]["prune_rates"], list(range(0, 100, 10)))
             self.assertGreaterEqual(report["experiment_wall_seconds"], 0)
             self.assertTrue((root / "benchmark.csv").is_file())
             for job in report["jobs"]:
+                self.assertEqual(job["image_token_order"], image_token_order or "base_first")
                 self.assertGreaterEqual(job["total_seconds"], 0)
                 self.assertEqual(job["status"], "failed" if job["prune_rate"] == fail_rate else "success")
 
@@ -201,6 +237,12 @@ class ExperimentTests(unittest.TestCase):
 
     def test_single_gpu_sweep(self):
         self.check_scheduler((5,))
+
+    def test_launcher_records_swapped_image_token_order(self):
+        self.check_scheduler((4, 5), image_token_order="anyres_first")
+
+    def test_launcher_defaults_legacy_jobs_to_base_first(self):
+        self.check_scheduler((4, 5), legacy=True)
 
     def test_failed_job_does_not_prevent_remaining_rates_or_report(self):
         self.check_scheduler((4, 5), fail_rate=20)

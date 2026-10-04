@@ -8,10 +8,42 @@ spatial anchors, not the full receptive field of contextual tokens.
 import json
 import math
 import re
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
+
+from .metrics import OPTION
+
+
+def prediction_caption(ground_truth, answer):
+    """Use the evaluation's A/B rule, never guess a class from free-form text."""
+    truth = {0: "Normal", 1: "Abnormal"}.get(ground_truth, "Unknown")
+    match = OPTION.match(answer) if isinstance(answer, str) else None
+    predicted = ("Abnormal" if match.group(1).upper() == "A" else "Normal") if match else "Unparsed"
+    return f"GT: {truth} | Pred: {predicted}"
+
+
+@lru_cache(maxsize=1)
+def _prediction_font():
+    # Pillow 10.4 ships this font; no OS-specific font path is required.
+    return ImageFont.load_default(size=24)
+
+
+def _add_prediction_header(panel, caption):
+    """Prepend a final-result label without covering or rescaling the figure."""
+    if caption is None:
+        return panel
+    font = _prediction_font()
+    left, top, right, bottom = font.getbbox(caption)
+    padding = 12
+    header_height = bottom - top + 2 * padding
+    width = max(panel.width, right - left + 2 * padding)
+    canvas = Image.new("RGB", (width, panel.height + header_height), "white")
+    canvas.paste(panel, (0, header_height))
+    ImageDraw.Draw(canvas).text((padding - left, padding - top), caption, font=font, fill="black")
+    return canvas
 
 
 def build_randomroi_layout(pro_data, base_grid, patch_size):
@@ -58,6 +90,9 @@ def build_randomroi_layout(pro_data, base_grid, patch_size):
 
 def build_anyres_layout(pro_data, base_grid, patch_size):
     """Mirror the anyres_max_9 unpad/downsample/token-order path in llava_arch."""
+    order = pro_data.get("image_token_order", "base_first")
+    if order not in {"base_first", "anyres_first"}:
+        raise ValueError(f"Unknown image token order: {order}")
     width, height = map(int, pro_data["original_size"])
     grid_width, grid_height = map(int, pro_data["grid_patches"])
     if min(width, height, grid_width, grid_height, base_grid, patch_size) <= 0:
@@ -79,13 +114,17 @@ def build_anyres_layout(pro_data, base_grid, patch_size):
     if min(rows, cols) <= 0:
         raise ValueError("Anyres downsampling produced an empty token grid")
     global_count = base_grid * base_grid
+    anyres_first = order == "anyres_first"
+    # Without an extra final newline, move the final row newline behind base.
+    moved_row_newline = anyres_first and not pro_data.get("final_newline", False)
+    global_offset = rows * (cols + 1) - int(moved_row_newline) if anyres_first else 0
     return [
         {
             "name": "global", "source_box_xyxy": [0, 0, width, height],
             "processed_size": [base_grid * patch_size, base_grid * patch_size],
             "grid_shape": [base_grid, base_grid], "pool_factor": 1,
             "cell_size_processed_pixels": patch_size,
-            "token_offset": 0, "token_count": global_count,
+            "token_offset": global_offset, "token_count": global_count,
             "token_row_stride": base_grid, "projection": "global",
         },
         {
@@ -93,7 +132,7 @@ def build_anyres_layout(pro_data, base_grid, patch_size):
             "processed_size": [cols * patch_size, rows * patch_size],
             "grid_shape": [rows, cols], "pool_factor": None,
             "cell_size_processed_pixels": patch_size,
-            "token_offset": global_count, "token_count": rows * cols,
+            "token_offset": 0 if anyres_first else global_count, "token_count": rows * cols,
             "token_row_stride": cols + 1, "projection": "anyres",
             "grid_patches": [grid_width, grid_height],
             "row_newline_count": rows,
@@ -191,6 +230,8 @@ def prepare_image_masks(original_size, pro_data, image_mask, base_grid, patch_si
         if layout.get("projection") == "anyres":
             rows, cols = layout["grid_shape"]
             newline_indices = layout["token_offset"] + np.arange(rows) * (cols + 1) + cols
+            if pro_data.get("image_token_order", "base_first") == "anyres_first" and not final_newline:
+                newline_indices[-1] = sequence_tokens - 1
             view_info["row_newline_kept"] = keep[newline_indices].tolist()
         views.append({"metadata": view_info, "pruned": pruned, "covered": covered})
     return {
@@ -335,7 +376,7 @@ def build_anyres_comparison(original, prepared):
 def save_fastv_visualizations(original_images, pro_datas, image_masks, *,
                               base_grid, patch_size, output_dir, sample_id,
                               fastv_layer, keep_ratio, image_attentions=None,
-                              save_prune=True, save_attention=False):
+                              save_prune=True, save_attention=False, prediction_label=None):
     """Save only comparison/attention PNGs and compact pruning-count summaries.
 
     Repeated samples/QA rounds receive numbered directories, so earlier results
@@ -376,12 +417,12 @@ def save_fastv_visualizations(original_images, pro_datas, image_masks, *,
         directory.mkdir(parents=True, exist_ok=False)
         original = image.convert("RGB")
         if save_prune and pro_datas[image_index].get("mode") == "anyres_max_9":
+            order_label = "; order=anyres_first" if pro_datas[image_index].get("image_token_order") == "anyres_first" else ""
             comparison = _stack_stage_panels([
-                (f"FastV layer index={fastv_layer}, keep_ratio={keep_ratio}\n"
+                (f"FastV layer index={fastv_layer}, keep_ratio={keep_ratio}{order_label}\n"
                  "Spatial token anchors, not exact pixel information removal.",
                  build_anyres_comparison(original, masks))
             ])
-            comparison.save(directory / "comparison.png")
         elif save_prune:
             combined = _blackout(original, masks["combined_pruned"])
             global_blackout = _blackout(original, masks["views"][0]["pruned"])
@@ -399,14 +440,16 @@ def save_fastv_visualizations(original_images, pro_datas, image_masks, *,
             draw.text((6, 25), f"FastV layer index={fastv_layer}, keep_ratio={keep_ratio}; "
                       f"pruned patches={masks['pruned_patch_tokens']}/{masks['patch_tokens']}", fill="black")
             draw.text((6, 43), "Uncovered margins unchanged. Black marks pruned spatial token anchors.", fill="black")
-            comparison.save(directory / "comparison.png")
+        if save_prune:
+            _add_prediction_header(comparison, prediction_label).save(directory / "comparison.png")
         if overlays is not None:
-            overlays[image_index].save(directory / "attention_overlay.png")
+            _add_prediction_header(overlays[image_index], prediction_label).save(directory / "attention_overlay.png")
 
         metadata = {
             "sample_id": None if sample_id is None else str(sample_id),
             "image_index": image_index,
             "method": "fastv",
+            "image_token_order": pro_datas[image_index].get("image_token_order", "base_first"),
             "fastv_layer": fastv_layer,
             "keep_ratio": keep_ratio,
             "patch_tokens": masks["patch_tokens"],
@@ -451,7 +494,7 @@ def _stack_stage_panels(panels, *, max_width=1920):
 
 def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
                              base_grid, patch_size, output_dir, sample_id,
-                             save_prune=True, save_attention=False):
+                             save_prune=True, save_attention=False, prediction_label=None):
     """Two multi-stage PNGs in original token coordinates, plus compact counts.
 
     Each row corresponds to an actual pruning boundary. Scores are PRE-drop
@@ -475,6 +518,8 @@ def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
                  f"{stage['image_tokens_before']} -> {stage['image_tokens_after']} | "
                  f"removed now: {stage['removed_this_stage']} | "
                  f"cumulative removed: {stage['cumulative_prune_rate']:.2f}%")
+        if pro_data.get("image_token_order") == "anyres_first":
+            title += " | order=anyres_first"
         if save_prune and pro_data.get("mode") == "anyres_max_9":
             row = build_anyres_comparison(original, prepared)
             comparisons.append((title + "\nCumulative decisions; spatial anchors, not exact pixel information removal.", row))
@@ -521,10 +566,11 @@ def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
     directory = call_dir / "image_0"
     directory.mkdir()
     if comparison is not None:
-        comparison.save(directory / "comparison.png")
+        _add_prediction_header(comparison, prediction_label).save(directory / "comparison.png")
     if attention is not None:
-        attention.save(directory / "attention_overlay.png")
-    metadata = {"sample_id": str(sample_id), "method": "vico", "stages": decisions}
+        _add_prediction_header(attention, prediction_label).save(directory / "attention_overlay.png")
+    metadata = {"sample_id": str(sample_id), "method": "vico", "stages": decisions,
+                "image_token_order": pro_data.get("image_token_order", "base_first")}
     (directory / "decisions.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return [{"image_index": 0, "directory": str(directory.resolve()),
              "comparison": str((directory / "comparison.png").resolve()) if save_prune else None,

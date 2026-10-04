@@ -47,7 +47,8 @@ class ViCoVisualizationTests(unittest.TestCase):
                     self.assertEqual({p.name for p in folder.glob("*.png")}, expected)
                     saved = json.loads((folder / "decisions.json").read_text(encoding="utf-8"))
                     self.assertEqual([s["after_layer"] for s in saved["stages"]], [8, 16, 24])
-                    self.assertEqual(set(saved), {"sample_id", "method", "stages"})
+                    self.assertEqual(set(saved), {"sample_id", "method", "stages", "image_token_order"})
+                    self.assertEqual(saved["image_token_order"], metadata.get("image_token_order", "base_first"))
                     self.assertEqual(stages, original_stages)
                     for summary, stage in zip(saved["stages"], stages):
                         self.assertNotIn("mask", summary)

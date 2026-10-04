@@ -14,7 +14,8 @@ from llava_pruning.runner import run
 class FakeBackend:
     calls = []
 
-    def __init__(self, model_path, roi_mode="randomroi"):
+    def __init__(self, model_path, roi_mode="randomroi", image_token_order="base_first"):
+        self.image_token_order = image_token_order
         self.vision_tower = type("Tower", (), {
             "num_patches_per_side": 2,
             "config": type("Config", (), {"patch_size": 4})(),
@@ -42,7 +43,8 @@ class FakeBackend:
                     "image": Image.new("RGB", (16, 8), "white"),
                     "crop_metadata": [{"mode": "anyres_max_9", "original_size": [16, 8],
                                        "roi_boxes": [], "grid_patches": [2, 1],
-                                       "final_newline": False}],
+                                       "final_newline": False,
+                                       "image_token_order": self.image_token_order}],
                     "masks": [{"span": [0, 14], "keep": [True] * 14}],
                 })
             else:
@@ -120,6 +122,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(metadata["method_config"], json.loads(config.read_text(encoding="utf-8")))
             self.assertEqual(metadata["metric_rule"], METRIC_RULE)
             self.assertEqual(metadata["roi_mode"], "randomroi")
+            self.assertEqual(metadata["image_token_order"], "base_first")
             self.assertEqual(FakeBackend.calls[0], (0, 42, False))
 
     def test_anyres_mode_writes_visualizations_and_accuracy(self):
@@ -150,6 +153,20 @@ class RunnerTests(unittest.TestCase):
             metadata = json.loads((output / "run.json").read_text(encoding="utf-8"))
             self.assertEqual(metadata["roi_mode"], "anyres_max_9")
             self.assertEqual(json.loads((output / "prune_10" / "metrics.json").read_text(encoding="utf-8"))["accuracy"], 1.0)
+
+            swapped_output = root / "swapped"
+            with patch("llava_pruning.runner.LlavaBackend", FakeBackend):
+                run(model_path=root, input_json=source, data_root=root,
+                    prompt_version="v0", method_name="fastv", method_config=config,
+                    roi_mode="anyres_max_9", image_token_order="anyres_first",
+                    save_prune_vis=True, save_attention_vis=True,
+                    output_dir=swapped_output, seed=42)
+            swapped_metadata = json.loads((swapped_output / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(swapped_metadata["image_token_order"], "anyres_first")
+            decisions = json.loads((swapped_output / "prune_10" / "visualizations" /
+                                    "sample_one" / "image_0" / "decisions.json").read_text(encoding="utf-8"))
+            self.assertEqual(decisions["image_token_order"], "anyres_first")
+            self.assertTrue((swapped_output / "prune_00" / "predictions.jsonl").is_file())
 
     def test_no_sample_and_generated_run_seed(self):
         FakeBackend.calls.clear()

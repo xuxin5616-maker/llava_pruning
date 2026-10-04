@@ -21,7 +21,8 @@ class PruningMethod(Protocol):
     def stats(self, core, prune_rate: int) -> dict: ...
 
     def visualize(self, *, result: dict, vision_tower, output_dir: Path,
-                  sample_id: str, save_prune: bool, save_attention: bool) -> list: ...
+                  sample_id: str, save_prune: bool, save_attention: bool,
+                  ground_truth: int | None = None) -> list: ...
 
 
 @dataclass(frozen=True)
@@ -85,8 +86,9 @@ class FastVMethod:
         return result
 
     def visualize(self, *, result: dict, vision_tower, output_dir: Path,
-                  sample_id: str, save_prune: bool, save_attention: bool) -> list:
-        from .visualization import save_fastv_visualizations
+                  sample_id: str, save_prune: bool, save_attention: bool,
+                  ground_truth: int | None = None) -> list:
+        from .visualization import prediction_caption, save_fastv_visualizations
 
         return save_fastv_visualizations(
             [result["image"]], result["crop_metadata"], result["masks"],
@@ -97,6 +99,7 @@ class FastVMethod:
             fastv_layer=result["stats"]["fastv_layer"],
             keep_ratio=result["stats"]["keep_ratio"],
             save_prune=save_prune, save_attention=save_attention,
+            prediction_label=prediction_caption(ground_truth, result.get("answer")),
         )
 
 
@@ -155,8 +158,9 @@ class ViCoMethod:
         return {"stages": core.get_vico_stages()}
 
     def visualize(self, *, result: dict, vision_tower, output_dir: Path,
-                  sample_id: str, save_prune: bool, save_attention: bool) -> list:
-        from .visualization import save_vico_visualizations
+                  sample_id: str, save_prune: bool, save_attention: bool,
+                  ground_truth: int | None = None) -> list:
+        from .visualization import prediction_caption, save_vico_visualizations
         return save_vico_visualizations(
             result["image"], result["crop_metadata"][0], result["stages"],
             layer_stats=result["stats"]["layers"],
@@ -164,6 +168,7 @@ class ViCoMethod:
             patch_size=int(vision_tower.config.patch_size),
             output_dir=output_dir, sample_id=sample_id,
             save_prune=save_prune, save_attention=save_attention,
+            prediction_label=prediction_caption(ground_truth, result.get("answer")),
         )
 
 

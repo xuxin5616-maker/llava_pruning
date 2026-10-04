@@ -18,7 +18,7 @@ from test_vico import LlavaQwenModel
 
 
 class TinyViCoBackend:
-    def __init__(self, model_path, roi_mode="anyres_max_9"):
+    def __init__(self, model_path, roi_mode="anyres_max_9", image_token_order="base_first"):
         config = tiny_config("sdpa")
         config.num_hidden_layers = 28
         self.core = LlavaQwenModel(config).eval()

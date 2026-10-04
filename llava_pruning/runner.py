@@ -6,7 +6,7 @@ import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .backend import LlavaBackend
+from .backend import LlavaBackend, validate_image_token_order
 from .data import load_samples
 from .methods import load_method, resolve_method_config
 from .metrics import Accuracy, METRIC_RULE
@@ -21,9 +21,11 @@ def _write_metrics(path, metrics):
 
 def run(*, model_path, input_json, data_root, prompt_version, method_name,
         method_config, roi_mode, save_prune_vis, save_attention_vis,
-        output_dir, seed=None, no_sample=True, include_pruning_time=True):
+        output_dir, seed=None, no_sample=True, include_pruning_time=True,
+        image_token_order="base_first"):
     if type(include_pruning_time) is not bool:
         raise ValueError("include_pruning_time must be a boolean")
+    validate_image_token_order(image_token_order, roi_mode)
     samples = load_samples(input_json, data_root)
     if not samples:
         raise ValueError("Input JSON has no samples")
@@ -39,7 +41,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
     output = Path(output_dir).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {output}")
-    backend = LlavaBackend(model_path, roi_mode=roi_mode)
+    backend = LlavaBackend(model_path, roi_mode=roi_mode, image_token_order=image_token_order)
     output.mkdir(parents=True, exist_ok=True)
     config = json.loads(Path(method_config).read_text(encoding="utf-8"))
     metadata = {
@@ -51,6 +53,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         "method": method.name,
         "method_config": config,
         "roi_mode": roi_mode,
+        "image_token_order": image_token_order,
         "save_prune_vis": save_prune_vis,
         "save_attention_vis": save_attention_vis,
         "seed": seed,
@@ -100,6 +103,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                         result=result, vision_tower=backend.vision_tower,
                         output_dir=rate_dir / "visualizations",
                         sample_id=sample.sample_id,
+                        ground_truth=sample.gt,
                         save_prune=save_prune_vis,
                         save_attention=save_attention_vis,
                     )

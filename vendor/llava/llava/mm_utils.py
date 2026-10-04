@@ -572,6 +572,7 @@ def process_images(images, image_processor, model_cfg, masks=None, boxes_list=No
                 )
                 pro_datas.append({
                     "mode": image_aspect_ratio,
+                    "image_token_order": getattr(model_cfg, "image_token_order", "base_first"),
                     "final_newline": "add_newl" in model_cfg.mm_patch_merge_type,
                     "original_size": list(source_size),
                     "roi_boxes": [],
