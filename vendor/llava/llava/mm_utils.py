@@ -296,6 +296,21 @@ def process_anyres_image(image, processor, grid_pinpoints):
     return torch.stack(image_patches, dim=0)
 
 
+def process_ex_base_copy_image(image, processor):
+    """Three identical Base pixels, each encoded independently (not tiled pixels).
+
+    Match process_anyres_image's global-view resize/preprocess exactly. No grid
+    selection, annotation, padding removal, pooling, or random crop is involved.
+    """
+    if isinstance(processor.size, dict):
+        shortest_edge = processor.size["shortest_edge"]
+    else:
+        shortest_edge = min(processor.size)
+    base = image.resize((shortest_edge, shortest_edge))
+    pixels = processor.preprocess(base, return_tensors="pt")["pixel_values"][0]
+    return torch.stack((pixels, pixels, pixels), dim=0)
+
+
 def load_image_from_base64(image):
     return Image.open(BytesIO(base64.b64decode(image)))
 
@@ -528,7 +543,18 @@ def process_images(images, image_processor, model_cfg, masks=None, boxes_list=No
         print(f"process image with {image_aspect_ratio} from model config")
     new_images = []
     pro_datas=[]
-    if image_aspect_ratio == "highres":
+    if image_aspect_ratio == "ex_base_copy":
+        for image in images:
+            pixels = process_ex_base_copy_image(image, image_processor)
+            new_images.append(pixels)
+            if return_pro_data:
+                pro_datas.append({
+                    "mode": "ex_base_copy", "image_token_order": "base_first",
+                    "base_view_count": 3, "final_newline": True,
+                    "original_size": list(image.size), "roi_boxes": [],
+                    "processed_view_sizes": [[pixels.shape[-1], pixels.shape[-2]] for _ in range(3)],
+                })
+    elif image_aspect_ratio == "highres":
         for image in images:
             image = process_highres_image(image, image_processor, model_cfg.image_grid_pinpoints)
             new_images.append(image)

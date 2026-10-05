@@ -227,6 +227,13 @@ class LlavaMetaForCausalLM(ABC):
         image_token_order = getattr(self.config, "image_token_order", "base_first")
         if image_token_order not in ("base_first", "anyres_first"):
             raise ValueError(f"Unknown image_token_order: {image_token_order}")
+        if getattr(self.config, "image_aspect_ratio", "square") == "ex_base_copy":
+            if (image_token_order != "base_first"
+                    or getattr(self.config, "mm_patch_merge_type", "flat") != "spatial_unpad_ex_base_copy"
+                    or any(modality != "image" for modality in modalities)
+                    or not (type(images) is list or images.ndim == 5)):
+                raise ValueError("ex_base_copy requires three image views, base_first order and "
+                                 "spatial_unpad_ex_base_copy packing")
         if image_token_order == "anyres_first":
             if (getattr(self.config, "image_aspect_ratio", "square") != "anyres_max_9"
                     or getattr(self.config, "mm_patch_merge_type", "flat") not in
@@ -258,6 +265,9 @@ class LlavaMetaForCausalLM(ABC):
                     images_list.append(image.unsqueeze(0))
             if image_token_order == "anyres_first" and any(image.shape[0] < 2 for image in images_list):
                 raise ValueError("image_token_order=anyres_first requires a base view and anyres views")
+            if (getattr(self.config, "image_aspect_ratio", "square") == "ex_base_copy"
+                    and any(image.shape[0] != 3 for image in images_list)):
+                raise ValueError("ex_base_copy requires exactly three Base views per image")
 
             # import pdb;pdb.set_trace()
             concat_images = torch.cat([image for image in images_list], dim=0)
@@ -280,7 +290,19 @@ class LlavaMetaForCausalLM(ABC):
             mm_patch_merge_type = getattr(self.config, "mm_patch_merge_type", "flat")
             image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
 
-            if mm_patch_merge_type == "flat":
+            if image_aspect_ratio == "ex_base_copy":
+                # Keep all three row-major Base sequences intact. In particular,
+                # do not treat copies 2/3 as spatial tiles, unpad, or pool them.
+                new_image_features = []
+                for image_feature in image_features:
+                    if image_feature.shape[1] != vision_tower.num_patches_per_side ** 2:
+                        raise ValueError("ex_base_copy requires a full Base patch grid per view")
+                    image_feature = image_feature.flatten(0, 1)
+                    newline = self.model.image_newline[None].to(
+                        device=image_feature.device, dtype=image_feature.dtype)
+                    new_image_features.append(torch.cat((image_feature, newline), dim=0))
+                image_features = new_image_features
+            elif mm_patch_merge_type == "flat":
                 image_features = [x.flatten(0, 1) for x in image_features]
 
             elif mm_patch_merge_type.startswith("spatial"):

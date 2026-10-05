@@ -20,7 +20,8 @@ def build_parser():
     parser.add_argument("--method", choices=tuple(METHODS), default="fastv")
     parser.add_argument("--method-config", type=Path, default=None,
                         help="Defaults to configs/<method>.json")
-    parser.add_argument("--roi-mode", choices=("randomroi", "randompatch", "anyres_max_9"), default="randomroi")
+    parser.add_argument("--roi-mode", choices=("randomroi", "randompatch", "anyres_max_9", "ex_base_copy"),
+                        default="randomroi", help="ex_base_copy encodes three identical full Base views")
     parser.add_argument("--image-token-order", choices=("base_first", "anyres_first"),
                         default="base_first",
                         help="Anyres view order; anyres_first keeps the final newline at the end")

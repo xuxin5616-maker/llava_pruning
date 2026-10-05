@@ -60,6 +60,40 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
 
 `--roi-mode randomroi` uses `mask`, then `bbox`, then random crops if neither exists. `--roi-mode randompatch` ignores both annotations and always chooses random crops. Both modes use the LLaVA `randomroi` image packing; they differ only in crop selection. `--roi-mode anyres_max_9` ignores masks/boxes and, like original LLaVA's `--overwrite_image_aspect_ratio`, changes the aspect-ratio setting **without overwriting the checkpoint's merge type**. For the pure-anyres checkpoint discussed here this is `spatial_unpad`; it is not the `anyres_max_9_randomroi` hybrid. The ROI mode and seed are recorded once in `run.json`; per-sample crop coordinates are no longer exported.
 
+### Experimental mode: three Base copies (`ex` branch)
+
+Use `--roi-mode ex_base_copy` at the same CLI level as `anyres_max_9`. The input is **three total views: the original Base plus two identical Base copies**, not an original plus three extra copies. Each is the full-image Base preprocessing used by anyres (square resize, then the unchanged vision processor). There is no anyres grid selection, ROI crop, mask/bbox-guided selection, or pixel-level panorama. Input JSON/path validation is unchanged.
+
+All three image tensors are passed through the vision encoder/projector as separate views in one batch. Their full, row-major token sequences are concatenated:
+
+```text
+[Base 1 tokens] [Base 2 tokens] [Base 3 tokens] [one final image_newline]
+```
+
+No pooling, unpadding, row-newline insertion or resizing of the feature grids is applied. With the 384px / patch14 SigLip tower, each view has 27 x 27 = 729 spatial tokens: **2187 spatial tokens + 1 structural token = 2188 image tokens**. The last structural token retains FastV's existing optional tail-token protection; it is not a fourth view. The dedicated merge name `spatial_unpad_ex_base_copy` includes `unpad` solely to load the existing learned newline parameter, not to remove patches. `run.json` records this packing and the three-view count.
+
+This mode uses the default `--image-token-order base_first`; do not combine it with `anyres_first`, which remains restricted to actual anyres inputs. Each copy occupies different LLM sequence positions, so identical pixels do **not** guarantee identical attention or pruning decisions. Ranking is over the combined visual sequence, not a separate quota for each copy. FP16, FlashAttention2, independent ranking attention, prompts, generation, timing flags and method configs are unchanged. At rate 0 the decoder still bypasses pruning, but the three-copy input is intentionally different from anyres, so its answers need not match the anyres baseline.
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python run.py \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --prompt-version v0 \
+  --roi-mode ex_base_copy \
+  --method vico \
+  --method-config configs/vico.json \
+  --no-sample \
+  --save-prune-vis --save-attention-vis \
+  --output-dir output/ex_base_copy_vico_01
+```
+
+For FastV, use `--method fastv --method-config configs/fastv.json` and a different output directory. Both methods run all records at the configured rates (default 0--90); visualization rates remain 10/30/50/70/90. No `ex.py` scheduling or 100-sample limit is added. Existing modes/defaults and both method config files are unchanged.
+
+With visualization enabled, `comparison.png` shows **Original / Base 1 / Base 2 / Base 3 / Combined**, including separate spatial-token removal counts. Combined black means all covering copies removed that area, not the overall token pruning percentage. `attention_overlay.png` shows the three Base sources and their separate attention overlays, using a shared scale within each stage. ViCo stacks the configured pruning stages in each PNG; already-removed tokens are gray in later attention rows. Both files retain the `GT: ... | Pred: ...` header. Exactly the same two PNG types and compact JSON/count outputs are saved; no extra per-copy image files are created.
+
+The Base-copy masks and overlays leave uncovered convolution margins unchanged: at 384px / patch14, the 27 x 27 anchors cover 378 x 378 processed pixels, not the last six rows/columns. Blackouts depict spatial anchors, not exact removal of pixel information from contextualized features.
+
 For a view-order comparison, add `--image-token-order anyres_first` to an existing `--roi-mode anyres_max_9` command. The default, `--image-token-order base_first`, keeps the original order. Both `run.py` and `ex.py` accept the option; it applies at **all pruning rates, including 0%**. Swapping requires `spatial_unpad` or `spatial_unpad_add_newl`. With `spatial_unpad`, the sequence becomes `[anyres except its last newline] [base] [the original last newline]`; with `spatial_unpad_add_newl`, it becomes `[anyres including row newlines] [base] [the extra final newline]`. Keep `preserve_image_newline: true` if using the default FastV protection. Image pixels, token counts, normal position-ID generation and pruning rules are unchanged. The selected order is saved in `run.json` and visualization `decisions.json`; plot offsets and row-newline records follow the order automatically. Use separate output directories for the two runs. Returning to the original order only requires omitting the option or choosing `base_first`.
 
 Decoding is now **greedy by default**, matching the user's current LLaVA `do_sample=False`. Existing `--no-sample` commands remain valid; use `--sample` only to opt back into sampling (temperature 0.2, top-p 0.7). Unless `--seed` is specified, each run generates a new seed; the actual seed and decoding mode are recorded in `run.json`. In `randompatch` mode the seed controls crop selection; greedy decoding does not disable random crops.

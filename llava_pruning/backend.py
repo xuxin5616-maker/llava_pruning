@@ -28,6 +28,26 @@ def validate_image_token_order(order, roi_mode, merge_type=None):
             raise ValueError("anyres_first requires spatial_unpad or spatial_unpad_add_newl packing")
 
 
+def configure_image_mode(config, roi_mode, image_token_order="base_first"):
+    """Configure preprocessing/packing without changing model precision or attention."""
+    if roi_mode not in {"randomroi", "randompatch", "anyres_max_9", "ex_base_copy"}:
+        raise ValueError(f"Unknown ROI mode: {roi_mode}")
+    validate_image_token_order(image_token_order, roi_mode)
+    if roi_mode == "ex_base_copy":
+        config.image_aspect_ratio = "ex_base_copy"
+        # 'unpad' ensures the checkpoint's learned image_newline is loaded.
+        # The dedicated packing branch does NOT unpad or pool the Base copies.
+        config.mm_patch_merge_type = "spatial_unpad_ex_base_copy"
+    elif roi_mode == "anyres_max_9":
+        config.image_aspect_ratio = "anyres_max_9"
+        # Preserve checkpoint packing, as in reference LLaVA.
+    else:
+        config.image_aspect_ratio = "randomroi"
+        config.mm_patch_merge_type = "spatial_avgpool_auto_unpad_add_newl"
+    validate_image_token_order(image_token_order, roi_mode, config.mm_patch_merge_type)
+    config.image_token_order = image_token_order
+
+
 def _generate_with_timing(model, generation_options, *, include_pruning_time=True):
     """Time one generate call; optional subtraction is a profiled diagnostic.
 
@@ -93,14 +113,8 @@ class LlavaBackend:
         path = Path(model_path).expanduser().resolve()
         if not path.is_dir():
             raise NotADirectoryError(f"Model checkpoint not found: {path}")
-        if roi_mode not in {"randomroi", "randompatch", "anyres_max_9"}:
-            raise ValueError(f"Unknown ROI mode: {roi_mode}")
         config = LlavaQwenConfig.from_pretrained(path)
-        config.image_aspect_ratio = "anyres_max_9" if roi_mode == "anyres_max_9" else "randomroi"
-        if roi_mode != "anyres_max_9":
-            config.mm_patch_merge_type = "spatial_avgpool_auto_unpad_add_newl"
-        validate_image_token_order(image_token_order, roi_mode, config.mm_patch_merge_type)
-        config.image_token_order = image_token_order
+        configure_image_mode(config, roi_mode, image_token_order)
         # Like reference LLaVA's --overwrite_image_aspect_ratio, anyres leaves the
         # checkpoint's merge type intact (normally spatial_unpad).
         self.tokenizer = AutoTokenizer.from_pretrained(path)
@@ -134,6 +148,9 @@ class LlavaBackend:
             "cuda": torch.version.cuda,
             "gpu": torch.cuda.get_device_name(),
         }
+        if roi_mode == "ex_base_copy":
+            self.inference_config.update(base_view_count=3,
+                                         visual_packing="base1 + base2 + base3 + one final newline")
         from importlib.metadata import version
         self.inference_config.update({
             "transformers": version("transformers"),

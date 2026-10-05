@@ -35,7 +35,12 @@ class LabelBackend:
                   "max_new_tokens": 512, "stats": {}}
         if not capture_visualization:
             return result
-        if roi_mode == "anyres_max_9":
+        if roi_mode == "ex_base_copy":
+            size, count = (16, 8), 13
+            metadata = {"mode": roi_mode, "original_size": list(size), "roi_boxes": [],
+                        "base_view_count": 3, "final_newline": True,
+                        "processed_view_sizes": [[8, 8]] * 3}
+        elif roi_mode == "anyres_max_9":
             size, count = (16, 8), 14
             metadata = {"mode": roi_mode, "original_size": list(size),
                         "roi_boxes": [], "grid_patches": [2, 1]}
@@ -113,7 +118,7 @@ class PredictionLabelTests(unittest.TestCase):
 
     def test_runner_labels_both_methods_all_roi_modes_and_save_switches(self):
         for method in ("fastv", "vico"):
-            for roi_mode in ("anyres_max_9", "randomroi", "randompatch"):
+            for roi_mode in ("anyres_max_9", "randomroi", "randompatch", "ex_base_copy"):
                 for save_prune, save_attention in ((True, True), (True, False),
                                                    (False, True), (False, False)):
                     with self.subTest(method=method, mode=roi_mode,

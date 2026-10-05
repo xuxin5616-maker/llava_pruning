@@ -1,6 +1,6 @@
 """Project pruning decisions onto the source image for SigLip image packing.
 
-This module needs only Pillow and NumPy. Its randomroi and pure-anyres layouts
+This module needs only Pillow and NumPy. Its ROI, anyres and Base-copy layouts
 mirror the corresponding llava_arch.py branches. Patch coordinates describe
 spatial anchors, not the full receptive field of contextual tokens.
 """
@@ -140,6 +140,33 @@ def build_anyres_layout(pro_data, base_grid, patch_size):
     ]
 
 
+def build_ex_base_copy_layout(pro_data, base_grid, patch_size):
+    """Three complete Base grids, followed by one structural newline."""
+    width, height = map(int, pro_data["original_size"])
+    sizes = pro_data.get("processed_view_sizes", [])
+    if (min(width, height, base_grid, patch_size) <= 0
+            or pro_data.get("base_view_count") != 3 or len(sizes) != 3
+            or pro_data.get("image_token_order", "base_first") != "base_first"
+            or pro_data.get("final_newline") is not True):
+        raise ValueError("Invalid ex_base_copy metadata; expected three Base views and one final newline")
+    if any(list(size) != list(sizes[0]) for size in sizes):
+        raise ValueError("ex_base_copy views must have identical processed sizes")
+    count = base_grid * base_grid
+    layouts = []
+    for index, (model_width, model_height) in enumerate(sizes):
+        if model_width // patch_size != base_grid or model_height // patch_size != base_grid:
+            raise ValueError("Unexpected ex_base_copy vision token grid")
+        layouts.append({
+            "name": f"Base {index + 1}", "projection": "base_copy",
+            "source_box_xyxy": [0, 0, width, height],
+            "processed_size": [model_width, model_height],
+            "grid_shape": [base_grid, base_grid], "pool_factor": 1,
+            "cell_size_processed_pixels": patch_size,
+            "token_offset": index * count, "token_count": count,
+        })
+    return layouts
+
+
 def _spatial_indices(layout):
     rows, cols = layout["grid_shape"]
     stride = layout.get("token_row_stride", cols)
@@ -191,8 +218,11 @@ def prepare_image_masks(original_size, pro_data, image_mask, base_grid, patch_si
     if list(original_size) != list(pro_data.get("original_size", [])):
         raise ValueError("Original image size disagrees with preprocessing metadata")
     anyres = pro_data.get("mode") == "anyres_max_9"
-    layouts = (build_anyres_layout(pro_data, base_grid, patch_size) if anyres
-               else build_randomroi_layout(pro_data, base_grid, patch_size))
+    if pro_data.get("mode") == "ex_base_copy":
+        layouts = build_ex_base_copy_layout(pro_data, base_grid, patch_size)
+    else:
+        layouts = (build_anyres_layout(pro_data, base_grid, patch_size) if anyres
+                   else build_randomroi_layout(pro_data, base_grid, patch_size))
     keep = np.asarray(image_mask["keep"], dtype=bool)
     start, end = image_mask["span"]
     patch_count = sum(view["token_count"] for view in layouts)
@@ -275,7 +305,13 @@ def build_attention_overlay(original, image_attention, image_mask, prepared):
         rows, cols = layout["grid_shape"]
         grid = (np.maximum(scores[indices], 0) / scale).reshape(rows, cols)
         heat = Image.fromarray(grid.astype(np.float32), mode="F")
-        heat = np.asarray(heat.resize((width, height), Image.Resampling.BILINEAR))
+        heat_width, heat_height = width, height
+        if layout.get("projection") == "base_copy":
+            # 384 / patch14 gives 27*14=378 pixels of convolution support.
+            # Do not stretch these anchors into the uncovered 6px margins.
+            cell = layout["cell_size_processed_pixels"]
+            heat_width, heat_height = cols * cell, rows * cell
+        heat = np.asarray(heat.resize((heat_width, heat_height), Image.Resampling.BILINEAR))
         heat = np.clip(heat, 0.0, 1.0)
         # JET-style map and the same 60/40 image/heat blend used by reference visualization.
         color = np.stack([
@@ -283,13 +319,16 @@ def build_attention_overlay(original, image_attention, image_mask, prepared):
             np.clip(1.5 - np.abs(4 * heat - 2), 0, 1),
             np.clip(1.5 - np.abs(4 * heat - 1), 0, 1),
         ], axis=-1) * 255
-        overlay = np.clip(0.6 * np.asarray(source) + 0.4 * color, 0, 255).astype(np.uint8)
+        overlay = np.array(source, copy=True)
+        covered_overlay = np.clip(0.6 * overlay[:heat_height, :heat_width] + 0.4 * color,
+                                  0, 255).astype(np.uint8)
         # A token deleted at an earlier stage has NO current attention score.
         # Gray it out rather than misrepresenting its missing value as low heat.
         if not valid[indices].all():
             active = Image.fromarray((valid[indices].reshape(rows, cols) * 255).astype(np.uint8))
-            active = np.asarray(active.resize((width, height), Image.Resampling.NEAREST)) > 0
-            overlay[~active] = 96
+            active = np.asarray(active.resize((heat_width, heat_height), Image.Resampling.NEAREST)) > 0
+            covered_overlay[~active] = 96
+        overlay[:heat_height, :heat_width] = covered_overlay
         columns.append((layout["name"], source, Image.fromarray(overlay)))
 
     margin = 8
@@ -330,6 +369,19 @@ def build_anyres_comparison(original, prepared):
     if (global_view["metadata"].get("projection") != "global"
             or anyres_view["metadata"].get("projection") != "anyres"):
         raise ValueError("Separate anyres comparison requires global and anyres views")
+    return _build_separate_view_comparison(original, prepared,
+                                          ("Global view", "High-resolution (anyres)"))
+
+
+def build_ex_base_copy_comparison(original, prepared):
+    """Show each copy's decisions separately, not only overlapping coverage."""
+    names = tuple(view["metadata"]["name"] for view in prepared["views"])
+    if names != ("Base 1", "Base 2", "Base 3"):
+        raise ValueError("Base-copy comparison requires exactly three Base views")
+    return _build_separate_view_comparison(original, prepared, names, max_panel_width=384)
+
+
+def _build_separate_view_comparison(original, prepared, names, *, max_panel_width=480):
 
     def view_caption(name, view):
         info = view["metadata"]
@@ -338,21 +390,17 @@ def build_anyres_comparison(original, prepared):
                 f"({info['prune_rate_percent']:.2f}%)\n"
                 "Spatial tokens only; black = pruned")
 
-    captions = (
-        "Original\nUnmodified source",
-        view_caption("Global view", global_view),
-        view_caption("High-resolution (anyres)", anyres_view),
-        "Combined (overlap)\nBlack only if ALL views prune\nNot the token pruning rate",
-    )
-    masks = (None, global_view["pruned"], anyres_view["pruned"],
-             prepared["combined_pruned"])
+    captions = ["Original\nUnmodified source"]
+    captions.extend(view_caption(name, view) for name, view in zip(names, prepared["views"]))
+    captions.append("Combined (overlap)\nBlack only if ALL views prune\nNot the token pruning rate")
+    masks = [None] + [view["pruned"] for view in prepared["views"]] + [prepared["combined_pruned"]]
     width, height = original.size
     # Keep labels legible even for small test/input images; never upscale source pixels.
-    panel_width = max(280, min(480, width))
+    panel_width = max(280, min(max_panel_width, width))
     image_width = min(width, panel_width)
     image_height = max(1, round(height * image_width / width))
     header_height, footer_height = 62, 46
-    canvas = Image.new("RGB", (panel_width * 4, header_height + image_height + footer_height), "white")
+    canvas = Image.new("RGB", (panel_width * len(captions), header_height + image_height + footer_height), "white")
     draw = ImageDraw.Draw(canvas)
     source = original.convert("RGB").resize((image_width, image_height), Image.Resampling.BILINEAR)
     for index, (caption, mask) in enumerate(zip(captions, masks)):
@@ -416,12 +464,14 @@ def save_fastv_visualizations(original_images, pro_datas, image_masks, *,
         directory = call_dir / f"image_{image_index}"
         directory.mkdir(parents=True, exist_ok=False)
         original = image.convert("RGB")
-        if save_prune and pro_datas[image_index].get("mode") == "anyres_max_9":
+        mode = pro_datas[image_index].get("mode")
+        if save_prune and mode in {"anyres_max_9", "ex_base_copy"}:
             order_label = "; order=anyres_first" if pro_datas[image_index].get("image_token_order") == "anyres_first" else ""
+            build_comparison = build_ex_base_copy_comparison if mode == "ex_base_copy" else build_anyres_comparison
             comparison = _stack_stage_panels([
                 (f"FastV layer index={fastv_layer}, keep_ratio={keep_ratio}{order_label}\n"
                  "Spatial token anchors, not exact pixel information removal.",
-                 build_anyres_comparison(original, masks))
+                 build_comparison(original, masks))
             ])
         elif save_prune:
             combined = _blackout(original, masks["combined_pruned"])
@@ -520,8 +570,10 @@ def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
                  f"cumulative removed: {stage['cumulative_prune_rate']:.2f}%")
         if pro_data.get("image_token_order") == "anyres_first":
             title += " | order=anyres_first"
-        if save_prune and pro_data.get("mode") == "anyres_max_9":
-            row = build_anyres_comparison(original, prepared)
+        mode = pro_data.get("mode")
+        if save_prune and mode in {"anyres_max_9", "ex_base_copy"}:
+            build_comparison = build_ex_base_copy_comparison if mode == "ex_base_copy" else build_anyres_comparison
+            row = build_comparison(original, prepared)
             comparisons.append((title + "\nCumulative decisions; spatial anchors, not exact pixel information removal.", row))
         elif save_prune:
             width, height = original.size
