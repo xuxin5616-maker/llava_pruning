@@ -243,7 +243,7 @@ def get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size):
     return width // patch_size, height // patch_size
 
 
-def process_anyres_image(image, processor, grid_pinpoints):
+def process_anyres_image(image, processor, grid_pinpoints, *, include_base=True):
     """
     Process an image with variable resolutions.
 
@@ -251,6 +251,7 @@ def process_anyres_image(image, processor, grid_pinpoints):
         image (PIL.Image.Image): The input image to be processed.
         processor: The image processor object.
         grid_pinpoints (str): A string representation of a list of possible resolutions.
+        include_base (bool): Prepend the global Base view (legacy default).
 
     Returns:
         torch.Tensor: A tensor containing the processed image patches.
@@ -279,6 +280,13 @@ def process_anyres_image(image, processor, grid_pinpoints):
     image_padded = resize_and_pad_image(image, best_resolution)
 
     patches = divide_to_patches(image_padded, processor.crop_size["height"])
+
+    if not include_base:
+        # No Base resize or vision preprocessing, not even a discarded extra view.
+        return torch.stack([
+            processor.preprocess(patch, return_tensors="pt")["pixel_values"][0]
+            for patch in patches
+        ], dim=0)
 
     # FIXME: this seems to be a bug that it resizes instead of pad.
     # but to keep it consistent with previous, i will keep it as it is
@@ -586,10 +594,14 @@ def process_images(images, image_processor, model_cfg, masks=None, boxes_list=No
                 new_images.append(image)
                 pro_datas.append(pro_data)
     #########################################################
-    elif image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio:
+    elif image_aspect_ratio in {"anyres", "anyres_only"} or "anyres_max" in image_aspect_ratio:
         for image in images:
             source_size = image.size
-            image = process_anyres_image(image, image_processor, model_cfg.image_grid_pinpoints)
+            if image_aspect_ratio == "anyres_only":
+                image = process_anyres_image(image, image_processor, model_cfg.image_grid_pinpoints,
+                                             include_base=False)
+            else:
+                image = process_anyres_image(image, image_processor, model_cfg.image_grid_pinpoints)
             new_images.append(image)
             if return_pro_data:
                 grid_width, grid_height = get_anyres_image_grid_shape(
@@ -609,6 +621,8 @@ def process_images(images, image_processor, model_cfg, masks=None, boxes_list=No
                          grid_height * image_processor.crop_size["height"]],
                     ],
                 })
+                if image_aspect_ratio == "anyres_only":
+                    pro_datas[-1]["processed_view_sizes"] = pro_datas[-1]["processed_view_sizes"][1:]
     elif image_aspect_ratio == "crop_split":
         for image in images:
             image = process_highres_image_crop_split(image, model_cfg, image_processor)

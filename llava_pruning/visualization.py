@@ -89,10 +89,13 @@ def build_randomroi_layout(pro_data, base_grid, patch_size):
 
 
 def build_anyres_layout(pro_data, base_grid, patch_size):
-    """Mirror the anyres_max_9 unpad/downsample/token-order path in llava_arch."""
+    """Mirror anyres packing, optionally without the Base view."""
     order = pro_data.get("image_token_order", "base_first")
     if order not in {"base_first", "anyres_first"}:
         raise ValueError(f"Unknown image token order: {order}")
+    no_base = pro_data.get("mode") == "anyres_only"
+    if no_base and order != "base_first":
+        raise ValueError("anyres_only has no Base to reorder; use default base_first")
     width, height = map(int, pro_data["original_size"])
     grid_width, grid_height = map(int, pro_data["grid_patches"])
     if min(width, height, grid_width, grid_height, base_grid, patch_size) <= 0:
@@ -113,12 +116,12 @@ def build_anyres_layout(pro_data, base_grid, patch_size):
         rows, cols = int(rows // scale), int(cols // scale)
     if min(rows, cols) <= 0:
         raise ValueError("Anyres downsampling produced an empty token grid")
-    global_count = base_grid * base_grid
+    global_count = 0 if no_base else base_grid * base_grid
     anyres_first = order == "anyres_first"
     # Without an extra final newline, move the final row newline behind base.
     moved_row_newline = anyres_first and not pro_data.get("final_newline", False)
     global_offset = rows * (cols + 1) - int(moved_row_newline) if anyres_first else 0
-    return [
+    layouts = [
         {
             "name": "global", "source_box_xyxy": [0, 0, width, height],
             "processed_size": [base_grid * patch_size, base_grid * patch_size],
@@ -138,6 +141,7 @@ def build_anyres_layout(pro_data, base_grid, patch_size):
             "row_newline_count": rows,
         },
     ]
+    return layouts[1:] if no_base else layouts
 
 
 def build_ex_base_copy_layout(pro_data, base_grid, patch_size):
@@ -217,7 +221,7 @@ def prepare_image_masks(original_size, pro_data, image_mask, base_grid, patch_si
     """Split a packed image mask and combine overlapping views explicitly."""
     if list(original_size) != list(pro_data.get("original_size", [])):
         raise ValueError("Original image size disagrees with preprocessing metadata")
-    anyres = pro_data.get("mode") == "anyres_max_9"
+    anyres = pro_data.get("mode") in {"anyres_max_9", "anyres_only"}
     if pro_data.get("mode") == "ex_base_copy":
         layouts = build_ex_base_copy_layout(pro_data, base_grid, patch_size)
     else:
@@ -227,7 +231,7 @@ def prepare_image_masks(original_size, pro_data, image_mask, base_grid, patch_si
     start, end = image_mask["span"]
     patch_count = sum(view["token_count"] for view in layouts)
     # Anyres adds one row-newline token per unpadded row; add_newl is optional.
-    row_newlines = layouts[1]["grid_shape"][0] if anyres else 0
+    row_newlines = layouts[-1]["grid_shape"][0] if anyres else 0
     final_newline = not anyres or bool(pro_data.get("final_newline", False))
     sequence_tokens = patch_count + row_newlines + int(final_newline)
     if keep.ndim != 1 or len(keep) != sequence_tokens or end - start != len(keep):
@@ -381,7 +385,16 @@ def build_ex_base_copy_comparison(original, prepared):
     return _build_separate_view_comparison(original, prepared, names, max_panel_width=384)
 
 
-def _build_separate_view_comparison(original, prepared, names, *, max_panel_width=480):
+def build_anyres_only_comparison(original, prepared):
+    """Only the actual high-resolution view exists; no fake Base or overlap panel."""
+    if len(prepared["views"]) != 1 or prepared["views"][0]["metadata"].get("projection") != "anyres":
+        raise ValueError("anyres_only comparison requires one high-resolution view without Base")
+    return _build_separate_view_comparison(original, prepared, ("High-resolution (anyres only)",),
+                                          include_combined=False)
+
+
+def _build_separate_view_comparison(original, prepared, names, *, max_panel_width=480,
+                                    include_combined=True):
 
     def view_caption(name, view):
         info = view["metadata"]
@@ -392,11 +405,13 @@ def _build_separate_view_comparison(original, prepared, names, *, max_panel_widt
 
     captions = ["Original\nUnmodified source"]
     captions.extend(view_caption(name, view) for name, view in zip(names, prepared["views"]))
-    captions.append("Combined (overlap)\nBlack only if ALL views prune\nNot the token pruning rate")
-    masks = [None] + [view["pruned"] for view in prepared["views"]] + [prepared["combined_pruned"]]
+    masks = [None] + [view["pruned"] for view in prepared["views"]]
+    if include_combined:
+        captions.append("Combined (overlap)\nBlack only if ALL views prune\nNot the token pruning rate")
+        masks.append(prepared["combined_pruned"])
     width, height = original.size
     # Keep labels legible even for small test/input images; never upscale source pixels.
-    panel_width = max(280, min(max_panel_width, width))
+    panel_width = max(280 if include_combined else 480, min(max_panel_width, width))
     image_width = min(width, panel_width)
     image_height = max(1, round(height * image_width / width))
     header_height, footer_height = 62, 46
@@ -413,10 +428,13 @@ def _build_separate_view_comparison(original, prepared, names, *, max_panel_widt
             panel = _blackout(source, np.asarray(display_mask) != 0)
         canvas.paste(panel, (index * panel_width + (panel_width - image_width) // 2, header_height))
     removed, total = prepared["pruned_sequence_tokens"], prepared["sequence_tokens"]
+    explanation = ("Per-view rates use each view's spatial tokens. Combined black area is NOT the token pruning rate."
+                   if include_combined else
+                   "No Base view. Black marks removed spatial anchors; structural newline tokens have no pixel area.")
     footer = (f"Token totals: pruned {removed}/{total} ({100.0 * removed / total:.2f}%); "
               f"spatial {prepared['pruned_patch_tokens']}/{prepared['patch_tokens']}; "
               f"newlines {prepared['pruned_newline_tokens']}/{prepared['newline_tokens']} (not drawn).\n"
-              "Per-view rates use each view's spatial tokens. Combined black area is NOT the token pruning rate.")
+              f"{explanation}")
     draw.multiline_text((6, header_height + image_height + 6), footer, fill="black", spacing=4)
     return canvas
 
@@ -465,9 +483,11 @@ def save_fastv_visualizations(original_images, pro_datas, image_masks, *,
         directory.mkdir(parents=True, exist_ok=False)
         original = image.convert("RGB")
         mode = pro_datas[image_index].get("mode")
-        if save_prune and mode in {"anyres_max_9", "ex_base_copy"}:
+        if save_prune and mode in {"anyres_max_9", "ex_base_copy", "anyres_only"}:
             order_label = "; order=anyres_first" if pro_datas[image_index].get("image_token_order") == "anyres_first" else ""
             build_comparison = build_ex_base_copy_comparison if mode == "ex_base_copy" else build_anyres_comparison
+            if mode == "anyres_only":
+                build_comparison = build_anyres_only_comparison
             comparison = _stack_stage_panels([
                 (f"FastV layer index={fastv_layer}, keep_ratio={keep_ratio}{order_label}\n"
                  "Spatial token anchors, not exact pixel information removal.",
@@ -571,8 +591,10 @@ def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
         if pro_data.get("image_token_order") == "anyres_first":
             title += " | order=anyres_first"
         mode = pro_data.get("mode")
-        if save_prune and mode in {"anyres_max_9", "ex_base_copy"}:
+        if save_prune and mode in {"anyres_max_9", "ex_base_copy", "anyres_only"}:
             build_comparison = build_ex_base_copy_comparison if mode == "ex_base_copy" else build_anyres_comparison
+            if mode == "anyres_only":
+                build_comparison = build_anyres_only_comparison
             row = build_comparison(original, prepared)
             comparisons.append((title + "\nCumulative decisions; spatial anchors, not exact pixel information removal.", row))
         elif save_prune:

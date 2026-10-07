@@ -30,7 +30,7 @@ def validate_image_token_order(order, roi_mode, merge_type=None):
 
 def configure_image_mode(config, roi_mode, image_token_order="base_first"):
     """Configure preprocessing/packing without changing model precision or attention."""
-    if roi_mode not in {"randomroi", "randompatch", "anyres_max_9", "ex_base_copy"}:
+    if roi_mode not in {"randomroi", "randompatch", "anyres_max_9", "ex_base_copy", "anyres_only"}:
         raise ValueError(f"Unknown ROI mode: {roi_mode}")
     validate_image_token_order(image_token_order, roi_mode)
     if roi_mode == "ex_base_copy":
@@ -38,8 +38,10 @@ def configure_image_mode(config, roi_mode, image_token_order="base_first"):
         # 'unpad' ensures the checkpoint's learned image_newline is loaded.
         # The dedicated packing branch does NOT unpad or pool the Base copies.
         config.mm_patch_merge_type = "spatial_unpad_ex_base_copy"
-    elif roi_mode == "anyres_max_9":
-        config.image_aspect_ratio = "anyres_max_9"
+    elif roi_mode in {"anyres_max_9", "anyres_only"}:
+        if roi_mode == "anyres_only" and config.mm_patch_merge_type not in {"spatial_unpad", "spatial_unpad_add_newl"}:
+            raise ValueError("anyres_only requires spatial_unpad or spatial_unpad_add_newl packing")
+        config.image_aspect_ratio = roi_mode
         # Preserve checkpoint packing, as in reference LLaVA.
     else:
         config.image_aspect_ratio = "randomroi"
@@ -151,6 +153,9 @@ class LlavaBackend:
         if roi_mode == "ex_base_copy":
             self.inference_config.update(base_view_count=3,
                                          visual_packing="base1 + base2 + base3 + one final newline")
+        elif roi_mode == "anyres_only":
+            self.inference_config.update(base_view_count=0, anyres_max_patches=9,
+                                         visual_packing="anyres tiles only; original unpad/downsample/newlines")
         from importlib.metadata import version
         self.inference_config.update({
             "transformers": version("transformers"),
@@ -180,7 +185,7 @@ class LlavaBackend:
 
         method.configure(self.model.get_model(), rate, capture_attention=capture_attention,
                          capture_visualization=capture_visualization)
-        if (capture_visualization and roi_mode == "anyres_max_9"
+        if (capture_visualization and roi_mode in {"anyres_max_9", "anyres_only"}
                 and self.model.config.mm_patch_merge_type not in
                 {"spatial_unpad", "spatial_unpad_add_newl"}):
             raise ValueError(

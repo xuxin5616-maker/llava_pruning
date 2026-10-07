@@ -60,6 +60,32 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
 
 `--roi-mode randomroi` uses `mask`, then `bbox`, then random crops if neither exists. `--roi-mode randompatch` ignores both annotations and always chooses random crops. Both modes use the LLaVA `randomroi` image packing; they differ only in crop selection. `--roi-mode anyres_max_9` ignores masks/boxes and, like original LLaVA's `--overwrite_image_aspect_ratio`, changes the aspect-ratio setting **without overwriting the checkpoint's merge type**. For the pure-anyres checkpoint discussed here this is `spatial_unpad`; it is not the `anyres_max_9_randomroi` hybrid. The ROI mode and seed are recorded once in `run.json`; per-sample crop coordinates are no longer exported.
 
+### Experimental mode: anyres without Base (`ex` branch)
+
+Use `--roi-mode anyres_only` to remove the global Base view while retaining the **same high-resolution tile preprocessing and packing rules as `anyres_max_9`**. Existing modes are unchanged. Base is neither resized/preprocessed nor passed through the vision encoder; every encoded view is an anyres tile, including the single-tile case. Masks/bboxes do not select crops in this mode (normal JSON/path validation still applies).
+
+The checkpoint's grid pinpoints, tile ordering, unpadding, `max_9` downsampling rule and structural row-newlines are retained. `max_9` is not a requirement to always input exactly nine tiles. Supported checkpoint merge types are `spatial_unpad` and `spatial_unpad_add_newl`; the latter retains its extra final newline. Other merge types are rejected rather than silently replaced. The resulting visual sequence is the original **anyres block only**, with no Base prefix. With fixed encoded tile features, it matches the original `base_first` packing after removing the Base block. The sequence is shorter, so subsequent text position IDs shift normally; this is not a position-preserving mask of the Base tokens.
+
+Both FastV and ViCo rank/prune the remaining packed anyres span. Existing newline handling, FP16, FlashAttention2, independent attention scoring, prompts and generation settings are unchanged. Rate 0 disables pruning but still has **no Base**, so it is a different input baseline from `anyres_max_9`. Configured pruning percentages now refer to the remaining sequence, not to the former Base+anyres total. `run.json` records `roi_mode: anyres_only`, `base_view_count: 0` and the packing description. Keep the default `--image-token-order base_first` (omit the option); `anyres_first` is not meaningful without Base and is rejected.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run.py \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --prompt-version v0 \
+  --roi-mode anyres_only \
+  --method fastv \
+  --method-config configs/fastv.json \
+  --no-sample \
+  --save-prune-vis --save-attention-vis \
+  --output-dir outputs/anyres_only_fastv_01
+```
+
+For ViCo, change both `--method vico` and `--method-config configs/vico.json`, using a new output directory. Rate sweeps (default 0--90), selected visualization rates, timing flags and whole-input evaluation remain unchanged; there is no 100-sample restriction. `ex.py` is not changed.
+
+`comparison.png` has just **Original / High-resolution (anyres only)**, with actual spatial-token and newline counts. There is no invented Base panel or duplicate Combined panel. `attention_overlay.png` contains only the high-resolution source and its attention overlay, not a Base column. ViCo still stacks pruning stages with gray for previously removed tokens; both PNGs keep the `GT: ... | Pred: ...` banner. Original source images in the figures are for reference, not extra model inputs. Saved JSON remains compact and lists only the actual anyres view.
+
 ### Experimental mode: three Base copies (`ex` branch)
 
 Use `--roi-mode ex_base_copy` at the same CLI level as `anyres_max_9`. The input is **three total views: the original Base plus two identical Base copies**, not an original plus three extra copies. Each is the full-image Base preprocessing used by anyres (square resize, then the unchanged vision processor). There is no anyres grid selection, ROI crop, mask/bbox-guided selection, or pixel-level panorama. Input JSON/path validation is unchanged.

@@ -227,6 +227,15 @@ class LlavaMetaForCausalLM(ABC):
         image_token_order = getattr(self.config, "image_token_order", "base_first")
         if image_token_order not in ("base_first", "anyres_first"):
             raise ValueError(f"Unknown image_token_order: {image_token_order}")
+        if getattr(self.config, "image_aspect_ratio", "square") == "anyres_only":
+            if (image_token_order != "base_first"
+                    or getattr(self.config, "mm_patch_merge_type", "flat") not in
+                    {"spatial_unpad", "spatial_unpad_add_newl"}
+                    or any(modality != "image" for modality in modalities)
+                    or not (type(images) is list or images.ndim == 5)
+                    or image_sizes is None or len(image_sizes) != len(images)):
+                raise ValueError("anyres_only requires tile batches with image_sizes, default base_first "
+                                 "order and spatial_unpad or spatial_unpad_add_newl packing")
         if getattr(self.config, "image_aspect_ratio", "square") == "ex_base_copy":
             if (image_token_order != "base_first"
                     or getattr(self.config, "mm_patch_merge_type", "flat") != "spatial_unpad_ex_base_copy"
@@ -290,7 +299,37 @@ class LlavaMetaForCausalLM(ABC):
             mm_patch_merge_type = getattr(self.config, "mm_patch_merge_type", "flat")
             image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
 
-            if image_aspect_ratio == "ex_base_copy":
+            if image_aspect_ratio == "anyres_only":
+                # Same high-resolution packing as anyres_max_9, but ALL encoded
+                # views are tiles: do not split off image_feature[0] as a Base.
+                new_image_features = []
+                unit = vision_tower.num_patches_per_side
+                for image_idx, image_feature in enumerate(image_features):
+                    grid_width, grid_height = get_anyres_image_grid_shape(
+                        image_sizes[image_idx], self.config.image_grid_pinpoints, vision_tower.image_size)
+                    if (image_feature.shape[0] != grid_width * grid_height
+                            or image_feature.shape[1] != unit ** 2):
+                        raise ValueError("anyres_only tile count/grid mismatch (input must exclude Base)")
+                    image_feature = image_feature.view(grid_height, grid_width, unit, unit, -1)
+                    image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
+                    image_feature = image_feature.flatten(1, 2).flatten(2, 3)
+                    image_feature = unpad_image(image_feature, image_sizes[image_idx])
+                    c, h, w = image_feature.shape
+                    if min(h, w) <= 0:
+                        raise ValueError("anyres_only unpadding produced an empty token grid")
+                    times = math.sqrt(h * w / (9 * unit**2))
+                    if times > 1.1:
+                        image_feature = nn.functional.interpolate(
+                            image_feature[None], [int(h // times), int(w // times)], mode="bilinear")[0]
+                    image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None]
+                                              .expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
+                    image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+                    if mm_patch_merge_type == "spatial_unpad_add_newl":
+                        image_feature = torch.cat((image_feature, self.model.image_newline[None]
+                                                   .to(device=image_feature.device, dtype=image_feature.dtype)), dim=0)
+                    new_image_features.append(image_feature)
+                image_features = new_image_features
+            elif image_aspect_ratio == "ex_base_copy":
                 # Keep all three row-major Base sequences intact. In particular,
                 # do not treat copies 2/3 as spatial tiles, unpad, or pool them.
                 new_image_features = []

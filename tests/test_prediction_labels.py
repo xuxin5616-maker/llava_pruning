@@ -40,8 +40,8 @@ class LabelBackend:
             metadata = {"mode": roi_mode, "original_size": list(size), "roi_boxes": [],
                         "base_view_count": 3, "final_newline": True,
                         "processed_view_sizes": [[8, 8]] * 3}
-        elif roi_mode == "anyres_max_9":
-            size, count = (16, 8), 14
+        elif roi_mode in {"anyres_max_9", "anyres_only"}:
+            size, count = (16, 8), 10 if roi_mode == "anyres_only" else 14
             metadata = {"mode": roi_mode, "original_size": list(size),
                         "roi_boxes": [], "grid_patches": [2, 1]}
         else:
@@ -118,7 +118,7 @@ class PredictionLabelTests(unittest.TestCase):
 
     def test_runner_labels_both_methods_all_roi_modes_and_save_switches(self):
         for method in ("fastv", "vico"):
-            for roi_mode in ("anyres_max_9", "randomroi", "randompatch", "ex_base_copy"):
+            for roi_mode in ("anyres_max_9", "randomroi", "randompatch", "ex_base_copy", "anyres_only"):
                 for save_prune, save_attention in ((True, True), (True, False),
                                                    (False, True), (False, False)):
                     with self.subTest(method=method, mode=roi_mode,
