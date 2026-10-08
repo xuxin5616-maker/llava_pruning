@@ -60,6 +60,74 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
 
 `--roi-mode randomroi` uses `mask`, then `bbox`, then random crops if neither exists. `--roi-mode randompatch` ignores both annotations and always chooses random crops. Both modes use the LLaVA `randomroi` image packing; they differ only in crop selection. `--roi-mode anyres_max_9` ignores masks/boxes and, like original LLaVA's `--overwrite_image_aspect_ratio`, changes the aspect-ratio setting **without overwriting the checkpoint's merge type**. For the pure-anyres checkpoint discussed here this is `spatial_unpad`; it is not the `anyres_max_9_randomroi` hybrid. The ROI mode and seed are recorded once in `run.json`; per-sample crop coordinates are no longer exported.
 
+### Feature-score visualization only (`visualize_scores.py`)
+
+This independent script does **not prune tokens, run LLM generation, or change
+`run.py`**. It uses the checkpoint's original Base + AnyRes tile preprocessing
+and observes the **1-based SigLIP block outputs 7, 14, 21, 26**, plus the actual
+MLP projector output. The existing loader removes the last of the checkpoint's
+27 SigLIP blocks, so block 26 is the actual projector input; its hidden state is
+taken **before** SigLIP's final `post_layernorm`, just like the existing tower.
+Models with a different active block count are rejected instead of relabelled.
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python visualize_scores.py \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --output-dir outputs/feature_scores_01
+```
+
+Default: **all input images**. Add `--limit 1` for an optional one-image smoke
+test; there is no fixed 100-image cap. Do not pass `--method`, `--method-config`,
+`--roi-mode`, prompt, sampling, or pruning-rate options to this script. Masks,
+bboxes and question text are unused and need not exist. Use a new/empty output
+directory and exactly one visible GPU. It reuses the current full checkpoint
+loader (including the original dtype/FlashAttention configuration), so decoder
+weights are still loaded and the same environment/VRAM capacity is required,
+but **only `encode_images()` is executed**, never the LLM decoder.
+
+At each stage, for each token `x` in an AnyRes tile:
+
+- Global score: `-cos(x, mean(all tokens of Base))`.
+- Local score: `-cos(x, mean(all tokens of that same tile))`.
+
+Means use **all encoded tokens**, including padding-context tokens; padding is
+excluded only from the displayed image. Both means are computed in that stage's
+own feature space, including projected Base/tile features for the final stage.
+Scores use detached FP32 values without modifying the original forward tensors.
+Higher values mean greater dissimilarity, **not an anomaly probability or LLM
+attention**. This is the explicitly requested direct Base-to-tile comparison,
+not the paper's interpolated Base score map and not a complete GlobalCom2 method.
+
+Each `000001_<question_id>/` contains:
+
+- `scores_overview.png`: five rows (the five stages); columns show Base,
+  original image + numbered tile boundaries, global-score overlay, local-score
+  overlay. GT is labelled; no prediction is invented.
+- `scores_tiles_01.png` (and further numbered pages if needed): five rows,
+  global/local overlays side by side for each actual tile; four tiles per page.
+- `scores.npz`: small FP32 `global_scores` / `local_scores` arrays shaped
+  `[5 stages, number of AnyRes tiles, tokens per tile]`, plus `stages`. Both tile
+  and token order are row-major. No full features/attention matrices are saved.
+- `metadata.json`: geometry, feature shapes, shared color limits and filenames.
+
+The output root's `run.json` records scoring/display definitions and loader
+configuration. These observations are **before AnyRes unpadding, `max_9` feature
+downsampling and newline insertion**: they depict actual encoder tiles, not a
+post-packing LLM image sequence. `anyres_max_9` does not mean the encoder always
+receives exactly nine tiles.
+
+All panels/pages of one image share one raw-score color scale (`--color-scale
+sample`, the default), with no per-layer/per-tile min-max normalization. For
+the same limits across different images use `--color-scale fixed` (`[-1, 1]`).
+Viridis runs from dark/low to yellow/high; overlay opacity is 0.70. Geometric
+padding, undefined cosine and pixels outside patch support are gray, not zero.
+For patch14/384, the 27x27 grid covers 378x378 pixels: the remaining six-pixel
+bottom/right strip of **each tile** is not falsely assigned a score. Token
+scores are expanded using nearest patch support, not presented as independently
+measured per-pixel scores. Original images are never modified.
+
 ### Experimental mode: anyres without Base (`ex` branch)
 
 Use `--roi-mode anyres_only` to remove the global Base view while retaining the **same high-resolution tile preprocessing and packing rules as `anyres_max_9`**. Existing modes are unchanged. Base is neither resized/preprocessed nor passed through the vision encoder; every encoded view is an anyres tile, including the single-tile case. Masks/bboxes do not select crops in this mode (normal JSON/path validation still applies).
