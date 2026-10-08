@@ -253,6 +253,7 @@ class ScoreOutputTests(unittest.TestCase):
 
     def test_tile_pages_include_every_tile_once(self):
         from unittest.mock import patch
+        from matplotlib import colormaps
         from matplotlib.figure import Figure
         geometry = ScoreGeometry.create((140, 28), (5, 1), 28, 14)
         image = Image.new("RGB", geometry.original_size, "gray")
@@ -261,6 +262,13 @@ class ScoreOutputTests(unittest.TestCase):
         titles = []
         def inspect_figure(fig, target, **kwargs):
             titles.extend(ax.get_title() for ax in fig.axes)
+            for ax in fig.axes:
+                if len(ax.images) == 2:
+                    # Fixed [-1, 1] maps this constant -0.5 score to 0.25.
+                    rgba = np.asarray(ax.images[1].get_array())
+                    np.testing.assert_allclose(rgba[..., :3],
+                                               np.broadcast_to(colormaps["jet"](0.25)[:3], rgba[..., :3].shape))
+                    np.testing.assert_allclose(rgba[..., 3], 0.70)
         with tempfile.TemporaryDirectory() as tmp, patch.object(Figure, "savefig", inspect_figure):
             saved = draw_figures(image, base, [base] * 5, scores, geometry, Path(tmp), "test", "fixed")
         self.assertEqual(saved["figures"], ["scores_overview.png", "scores_tiles_01.png", "scores_tiles_02.png"])
@@ -297,6 +305,8 @@ class ScoreOutputTests(unittest.TestCase):
                 self.assertEqual(saved["stages"], list(STAGES))
                 self.assertFalse(saved["pruning"])
                 self.assertFalse(saved["llm_generation"])
+                self.assertEqual(saved["colormap"], "jet")
+                self.assertEqual(saved["overlay_alpha"], 0.70)
                 self.assertNotIn("attention_source", saved["loader_config"])
                 with np.load(output / "000001_00001" / "scores.npz", allow_pickle=False) as arrays:
                     self.assertEqual(arrays["global_scores"].shape, (5, 2, 4))

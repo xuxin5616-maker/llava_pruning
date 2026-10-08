@@ -121,7 +121,7 @@ receives exactly nine tiles.
 All panels/pages of one image share one raw-score color scale (`--color-scale
 sample`, the default), with no per-layer/per-tile min-max normalization. For
 the same limits across different images use `--color-scale fixed` (`[-1, 1]`).
-Viridis runs from dark/low to yellow/high; overlay opacity is 0.70. Geometric
+JET runs from blue/low through cyan, green and yellow to red/high; overlay opacity is 0.70. Geometric
 padding, undefined cosine and pixels outside patch support are gray, not zero.
 For patch14/384, the 27x27 grid covers 378x378 pixels: the remaining six-pixel
 bottom/right strip of **each tile** is not falsely assigned a score. Token

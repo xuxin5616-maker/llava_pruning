@@ -24,6 +24,7 @@ STAGES = tuple(f"siglip_{layer:02d}" for layer in LAYERS) + ("projector",)
 LABELS = tuple(f"SigLIP layer {layer}" for layer in LAYERS) + ("After projector",)
 MISSING_COLOR = "#b8b8b8"
 OVERLAY_ALPHA = 0.70
+COLORMAP = "jet"
 TILES_PER_PAGE = 4
 
 
@@ -221,7 +222,7 @@ def draw_figures(image, base, tiles, scores, geometry, folder, caption, scale):
     folder = Path(folder)
     limits = color_limits(scores, geometry, scale)
     norm = Normalize(*limits)
-    cmap = colormaps["viridis"].with_extremes(bad=MISSING_COLOR)
+    cmap = colormaps[COLORMAP].with_extremes(bad=MISSING_COLOR)
     files = []
 
     def panel(ax, source, heatmap=None):
@@ -390,7 +391,7 @@ def run_score_visualization(model_path, input_json, data_root, output_dir,
               "feature_location": "block outputs before post_layernorm; actual projector output",
               "spatial_policy": "before unpad/max_9 downsample/newlines; nearest patch support; padding gray",
               "undefined_cosine": "NaN (gray); denominator <= 1e-12",
-              "color_scale": color_scale, "colormap": "viridis", "overlay_alpha": OVERLAY_ALPHA,
+              "color_scale": color_scale, "colormap": COLORMAP, "overlay_alpha": OVERLAY_ALPHA,
               "score_dtype": "float32", "projector_dtype": projection_dtype,
               "llm_generation": False, "pruning": False,
               "loader_config": {k: v for k, v in backend.inference_config.items() if k != "attention_source"}}
