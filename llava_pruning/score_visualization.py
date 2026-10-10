@@ -354,73 +354,33 @@ def load_score_samples(input_json, data_root, limit=None):
     return result
 
 
-def _display_options(display_mode, color_scale):
-    """Validate before model loading/writing; retain original token defaults."""
-    if display_mode not in {"tokens", "patch-means"}:
-        raise ValueError("display_mode must be tokens or patch-means")
-    if color_scale is None:
-        color_scale = "fixed" if display_mode == "patch-means" else "sample"
-    if color_scale not in {"sample", "fixed"}:
-        raise ValueError("Unknown color scale")
-    metadata = {"display_mode": display_mode, "color_scale": color_scale}
-    if display_mode == "patch-means":
-        # Import before loading the checkpoint so a missing companion fails early.
-        import visualize_patch_means as patch_vis
-        metadata.update(displayed_stages=patch_vis.STAGES,
-                        figure_layout=patch_vis.FIGURE_LAYOUT,
-                        tile_mean_policy=patch_vis.MEAN_POLICY,
-                        score_kind="global", score_normalization=patch_vis.SCORE_SCALING["method"],
-                        score_scaling=patch_vis.SCORE_SCALING,
-                        cross_layer_average=patch_vis.CROSS_LAYER_AVERAGE,
-                        display_values="global_score_01")
-    return color_scale, metadata
-
-
-def save_sample(image, base, tiles, scores, shapes, geometry, sample, folder, scale=None,
-                display_mode="tokens"):
-    scale, display_options = _display_options(display_mode, scale)
+def save_sample(image, base, tiles, scores, shapes, geometry, sample, folder, scale):
     folder.mkdir(parents=True, exist_ok=False)
     gt = {0: "Normal", 1: "Abnormal"}.get(sample["gt"], "Unknown")
     # The numeric arrays are small token scores, never full hidden states or attention matrices.
     np.savez_compressed(folder / "scores.npz", global_scores=scores["global"],
                         local_scores=scores["local"], stages=np.asarray(STAGES),
                         feature_normalization=np.asarray(FEATURE_NORMALIZATION))
-    if display_mode == "patch-means":
-        import visualize_patch_means as patch_vis
-        # Reuse the EXACT cache selection, averaging, scaling, and renderer used
-        # offline. No extra encode_images() call, and no token-map PNGs generated.
-        patch_geometry = patch_vis.validate_geometry({"geometry": asdict(geometry)})
-        selected = patch_vis.load_scores(folder / "scores.npz", patch_geometry,
-                                         {"score_shape": list(scores["global"].shape)})
-        means, counts = patch_vis.aggregate_scores(selected)
-        means, counts = patch_vis.build_display_means(means, counts)
-        limits = patch_vis.render_figure(image, means, patch_geometry, sample["id"], sample["gt"],
-                                         folder / "patch_means.png", scale)
-        patch_vis.write_values(folder / "patch_means.csv", means, counts, patch_geometry,
-                               selected["global"].shape[-1])
-        display = {"figures": ["patch_means.png"], "color_limits": limits,
-                   "values_file": "patch_means.csv"}
-    else:
-        display = draw_figures(image, base, tiles, scores, geometry, folder,
-                              f"ID: {sample['id']} | GT: {gt} | No LLM prediction", scale)
+    display = draw_figures(image, base, tiles, scores, geometry, folder,
+                          f"ID: {sample['id']} | GT: {gt} | No LLM prediction", scale)
     metadata = {"id": sample["id"], "image": str(sample["image"]), "gt": sample["gt"],
                 "geometry": asdict(geometry), "feature_shapes": shapes,
                 "score_shape": list(scores["global"].shape),
                 "score_axes": ["stage", "tile_row_major", "token_row_major"],
                 "feature_normalization": FEATURE_NORMALIZATION,
-                **display_options,
                 **display}
     with (folder / "metadata.json").open("x", encoding="utf-8") as stream:
         json.dump(metadata, stream, ensure_ascii=False, indent=2)
 
 
 def run_score_visualization(model_path, input_json, data_root, output_dir,
-                            limit=None, color_scale=None, display_mode="tokens"):
-    color_scale, display_options = _display_options(display_mode, color_scale)
+                            limit=None, color_scale="sample"):
     import torch
     from .backend import LlavaBackend
     # Fail on missing plotting libraries before loading the large checkpoint.
     from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: F401
+    if color_scale not in {"sample", "fixed"}:
+        raise ValueError("Unknown color scale")
     samples = load_score_samples(input_json, data_root, limit)
     output = Path(output_dir).expanduser().resolve()
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
@@ -455,7 +415,6 @@ def run_score_visualization(model_path, input_json, data_root, output_dir,
               "color_scale": color_scale, "colormap": COLORMAP, "overlay_alpha": OVERLAY_ALPHA,
               "score_dtype": "float32", "projector_dtype": projection_dtype,
               "llm_generation": False, "pruning": False,
-              **display_options,
               "loader_config": {k: v for k, v in backend.inference_config.items() if k != "attention_source"}}
     with (output / "run.json").open("x", encoding="utf-8") as stream:
         json.dump(config, stream, ensure_ascii=False, indent=2)
@@ -468,8 +427,7 @@ def run_score_visualization(model_path, input_json, data_root, output_dir,
             image, backend.processor, backend.model.config, patch_size)
         pixels = pixels.to(device=backend.model.device, dtype=torch.float16)
         scores, shapes = capture_scores(backend.model, pixels)
-        save_sample(image, base, tiles, scores, shapes, geometry, sample, folder, color_scale,
-                    display_mode=display_mode)
+        save_sample(image, base, tiles, scores, shapes, geometry, sample, folder, color_scale)
         print(f"[{index}/{len(samples)}] {sample['id']}: {geometry.tile_count} tiles, saved {folder}", flush=True)
     print(f"Saved all feature-score visualizations to {output}", flush=True)
     return output

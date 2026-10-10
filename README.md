@@ -106,8 +106,9 @@ New caches and JSON metadata record
 scores, not full token vectors, so it **cannot be converted** to this scoring
 rule offline: rerun `visualize_scores.py` into a new output directory, then
 point `visualize_patch_means.py` at those new results. Existing caches remain
-readable but retain their old scoring semantics. The pixel-entropy script
-`runVFlowOpt.py` does not extract these features and is unchanged.
+readable but retain their old scoring semantics.
+`runVFlowOpt.py` is a separate local feature-residual probe (see below); it does
+not reuse these normalized Global/Local cosine scores.
 
 Means use **all encoded tokens**, including padding-context tokens; padding is
 excluded only from the displayed image. Both means are computed in that stage's
@@ -286,94 +287,86 @@ modes show scaled tile labels/colorbar units and preserve both raw and scaled
 CSV columns. The optional palette-range adjustment does not further transform scores.
 Averaging can dilute a small hotspot; the original token scores do not change.
 
-### Offline pixel-entropy visualization (`runVFlowOpt.py`)
+### Local SigLIP feature residuals (`runVFlowOpt.py`)
 
-Version `3.0-global12-base18-two-overviews` is CPU-only. It reads saved AnyRes
-geometry and **original images**, not cached cosine scores, and never loads
-SigLIP/LLM or runs pruning. Only the analysis grid changes:
+Version `3.1-integrated-feature-residual` integrates the supplied local-residual
+script. This is a custom diagnostic, **not the original VFlowOpt method**, not
+attention, entropy, a pruning decision or an anomaly probability.
 
-- Base: **18 x 18 = 324 blocks** on the unchanged 384 x 384 Base image.
-- AnyRes: **12 x 12 = 144 blocks TOTAL** across the original stitched padded
-  mosaic, not 12 x 12 per encoder crop. This holds for all saved crop layouts.
-- Integer pixel edges are `floor(i * axis_length / grid_side)`. The Base
-  intervals are 21/22 pixels wide; all pixels are covered without an extra
-  resize or discarded border. AnyRes blocks may cross crop boundaries.
+For each **1-based SigLIP block 7 / 14 / 21 / 26**, use its output **before the
+final post-layernorm**. Base and each AnyRes crop retain their native **27 x 27**
+token grid (384-pixel input, 14-pixel patch embedding). For each center token,
+compute the mean of valid neighboring **raw feature vectors**, excluding the
+center, in a **3 x 3 / 5 x 5 / 7 x 7** window:
 
-Entropy is **recomputed from each block's pixel histogram**, not averaged
-from old token entropies: `gray = floor((R+G+B)/3)`, 256 bins,
-`H = -sum(p * ln(p))` in nats. The model's patch size remains 14, and saved
-source geometry is unchanged. This custom analysis is not the original
-VFlowOpt token grid or complete importance score.
+- Default `--metric l2`: `||center - neighbor_mean||_2`.
+- Optional `--metric cosine`: `1 - cosine(center, neighbor_mean)`.
+- **No feature L2 normalization before averaging**, no global-mean reference,
+  no Softmax. This does not modify `visualize_scores.py` or its Global score.
+- AnyRes neighborhoods cross crop boundaries in the stitched logical token
+  grid; Base uses its own separate neighborhood grid. Only fully content-covered
+  patches are valid centers/neighbors. Edges use available neighbors; no
+  reflection/zero padding. No-neighbor centers have NaN scores; zero-norm cosine
+  is NaN, while zero-vector L2 can be defined.
+- Logical crop adjacency bridges the six unencoded edge pixels. These pixels,
+  padding, partial-padding patches and undefined scores are gray in the plots.
+  Independently encoded crops have different contexts and positional resets;
+  residuals at crop boundaries are not necessarily defects.
 
-**Neighborhood entropy deviation is now the default, for BOTH Base and AnyRes.**
-For each grid, `D = abs(H - median(neighbor H))` is computed separately for
-3 x 3, 5 x 5 and 7 x 7 block neighborhoods, excluding the center. Windows
-refer to analysis blocks, not pixels; AnyRes neighbors cross old crop boundaries.
-Only full-content blocks participate, retaining the previous padding policy:
-partial/full padding or no valid neighbors gives NaN/gray, never a fabricated
-zero. Edges use available valid neighbors only (no zero/reflection padding).
-The AnyRes display unpads the map back onto the original image; padding may
-therefore reduce the number of visible/defined blocks.
+Fresh dataset input (all records by default; no implicit 100-image limit):
 
 ```bash
-python runVFlowOpt.py \
-  --results-dir outputs/feature_scores_02 \
-  --output-dir outputs/entropy_anyres12_base18 \
-  --entropy-mode local \
-  --color-scale softmax
+CUDA_VISIBLE_DEVICES=5 python runVFlowOpt.py \\
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \\
+  --input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \\
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \\
+  --metric l2 \\
+  --color-scale raw \\
+  --output-dir outputs/feature_residual_l2_01
 ```
 
-Softmax uses `softmax(score_nats / ln(2))` over **the whole Base grid and the
-whole AnyRes grid independently, and independently for each window**.
-AnyRes crops are no longer separate Softmax groups. With no padding, each
-window normalizes 324 Base or 144 AnyRes scores, each group summing to 1.
-In local mode undefined scores are excluded; an entirely undefined group
-stays NaN. Mean weights are necessarily 1/(defined block count), not a measure
-of informativeness or defect probability.
+Alternatively replace `--input-json ...` with
+`--results-dir outputs/feature_scores_02`. This reuses image paths and geometry,
+**not cached scalar scores**: SigLIP must run again because the old NPZ does not
+contain the needed feature vectors. Keep `--data-root` if images were moved.
+The checkpoint may also be taken from the saved `run.json` or the script's
+`MODEL_PATH`. `RESULTS_DIR`, `OUTPUT_DIR`, and `DATA_ROOT` can be edited at the
+script's top. Use a new/empty output directory separate from the source results.
+`--limit N` is optional. `--version` checks which script is installed.
 
-Keep `--entropy-mode plain` to visualize ordinary entropy without neighbor
-subtraction. It uses the same grids, and normalizes all raw blocks, including
-padding, independently for Base and the entire AnyRes mosaic.
-Both modes retain JET overlays. Each figure has its own labeled colorbar;
-all three windows within that figure share its limits. **Equal colors in
-the Base and AnyRes figures need not mean equal values.**
+Only SigLIP embeddings and encoder execute; **no projector, LLM forward,
+generation, training or pruning**. The existing loader still loads the LLM
+weights and needs GPU memory for them; its model precision and attention mode
+are unchanged. A single visible GPU is required. Scoring uses CPU float64
+accumulation in channel chunks and saves float32 scalar scores; GPU feature
+outputs are read, never replaced. This probe is not a speed benchmark.
 
-Optional display alternatives:
+Each sample produces **four PNGs**:
+`siglip_7_residual_l2_raw.png`, `siglip_14_residual_l2_raw.png`,
+`siglip_21_residual_l2_raw.png`, `siglip_26_residual_l2_raw.png` (suffixes follow
+the selected metric/scale). Each figure has a Base row and an AnyRes row, each
+showing its reference image and the three window sizes. JET overlays retain
+alpha 0.70. GT is shown if available; there is no LLM prediction.
 
-- `--color-scale raw`: unnormalized scores in nats.
-- `--color-scale minmax`: direct min-max, no Softmax first; constant -> 0.5.
-  Local mode pools the three windows within each view, independently for
-  Base and AnyRes. Plain mode shares a range over Base + visible AnyRes.
-- `--color-scale fixed`: Softmax with fixed [0,1] color limits.
-- `sample` / `layer`: compatibility aliases for Softmax, not min-max.
+`--color-scale raw` displays actual residual values. `minmax` optionally maps
+scores to [0,1], **jointly across Base, all AnyRes crops and all three windows
+within one image/layer**, never separately per crop; constant maps become 0.5.
+Layers/images use separate colorbar ranges, so equal colors across different
+figures do not imply equal raw values. All six heatmaps within one figure use
+the same range, including Base versus AnyRes.
 
-Each sample produces **exactly two PNGs**:
+Numeric output: `residuals.npz` (both raw metrics, validity masks, neighbor
+counts, layers and windows), `crop_summary.csv`, sample `metadata.json`, root
+`run.json`. Base scores are [4 stages, 3 windows, 729 tokens]; tile scores
+are [4 stages, 3 windows, crops, 729 tokens]. Raw scores are preserved even when
+min-max display is chosen; full feature vectors are not retained.
 
-- `base_entropy_18x18.png`: Base reference + 3x3 / 5x5 / 7x7 neighborhood maps.
-- `anyres_entropy_12x12.png`: original reference + the same three windows.
-
-Plain mode uses the same two filenames, each with reference + one ordinary
-entropy map. No standalone window, raw comparison, per-crop or crop-mean PNGs
-are generated. Numeric files remain: `entropy.npz`,
-`entropy_patch_means.csv`, sample `metadata.json`, and root `run.json`.
-
-NPZ **schema 3** replaces the old per-crop arrays with `base_*` and `anyres_*`
-whole-grid arrays. Raw `base_entropy` is [18,18], `anyres_entropy` is [12,12];
-`*_scores`, `*_softmax`, `*_display` use [window,row,col] (3 local windows,
-1 plain panel). Local mode also saves deviations, neighbor medians/counts.
-Pixel edges, validity masks and content boxes are saved for exact mapping.
-Metadata separates unchanged source `geometry` from new `analysis_grids`,
-records normalization/display limits, and marks no LLM prediction. CSV has
-one row per view/window (6 local rows or 2 plain rows), including valid counts
-and Softmax sums.
-
-Use a new/empty output directory; sources and old results are not overwritten.
-Without `--output-dir`, the sibling destination is
-`<results>_vflowopt_global12_base18_<plain|local>_<color-scale>`.
-`--limit N` is optional; by default all samples run. `RESULTS_DIR`,
-`OUTPUT_DIR` and `DATA_ROOT` may still be edited at the top of the script.
-Keep `visualize_patch_means.py` and `llava_pruning/score_visualization.py`
-alongside it for CPU helper imports.
+Deploy `runVFlowOpt.py`, `feature_residual_math.py`, and
+`feature_residual_capture.py` together, inside the existing project (the
+current preprocessing/geometry helpers are still required). The pre-integration
+pixel-entropy script is preserved as `run_pixel_entropy.py`; run its `--help`
+for its legacy CPU-only options. Old `--entropy-mode` / Softmax options do not
+apply to the new feature-residual entry point.
 
 ### Experimental mode: anyres without Base (`ex` branch)
 
