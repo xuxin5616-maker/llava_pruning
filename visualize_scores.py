@@ -19,6 +19,10 @@ def build_parser():
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--limit", type=positive_int, default=None,
                         help="Optional first N records; default: all records, no fixed limit")
+    parser.add_argument("--global-reference", choices=("center-crop", "base"), default="center-crop",
+                        help="center-crop (default): center 75%% width/height, enlarge to original "
+                             "size, then encode as the Global reference; base: original full-image reference. "
+                             "AnyRes tiles always come from the full original image")
     parser.add_argument("--display-mode", choices=("tokens", "patch-means"), default="tokens",
                         help="tokens (default): original token maps; patch-means: one 2x4 Global "
                              "tile-mean figure with layers 7/14/21/26 and first 2/3/4 layer means")

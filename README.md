@@ -63,7 +63,7 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
 ### Feature-score visualization only (`visualize_scores.py`)
 
 This independent script does **not prune tokens, run LLM generation, or change
-`run.py`**. It uses the checkpoint's original Base + AnyRes tile preprocessing
+`run.py`**. It keeps the checkpoint's original AnyRes tile preprocessing
 and observes the **1-based SigLIP block outputs 7, 14, 21, 26**, plus the actual
 MLP projector output. The existing loader removes the last of the checkpoint's
 27 SigLIP blocks, so block 26 is the actual projector input; its hidden state is
@@ -90,8 +90,24 @@ but **only `encode_images()` is executed**, never the LLM decoder.
 At each stage, **first L2-normalize every token along its channel dimension**:
 `u = x / ||x||_2`. Then compute the view means and scores:
 
-- Global score: `-cos(u, mean(all unit tokens of Base))`.
+- Global score: `-cos(u, mean(all unit tokens of the reference view))`.
 - Local score: `-cos(u, mean(all unit tokens of that same tile))`.
+
+**Global reference now defaults to `--global-reference center-crop`.** Keep the
+center 75% of the original width and height (56.25% area before pixel rounding),
+resize that crop back to the original size with bicubic interpolation, then use
+the usual square Base resize and SigLIP preprocessing. Crop dimensions are
+`max(1, floor(0.75 * dimension))`; centered offsets round down. For 1024x1024,
+the crop is `(128,128,896,896)` (768x768), then enlarged to 1024x1024.
+Only the reference view is replaced: AnyRes tiles, geometry, Local scores and
+layer averaging continue to use the **full original image**. Each stage uses
+its own newly encoded reference mean; this is not a crop of old features.
+Reference and tiles share one encoder batch; no extra encoder pass is needed.
+Use `--global-reference base` for the previous full-image reference. This option
+does not affect `run.py` or `runVFlowOpt.py`. Figures identify the cropped
+reference, and each sample's metadata records the exact crop/resize geometry.
+Old score-only caches cannot produce the new reference scores: rerun the encoder
+into a new output directory. Offline redraw retains the cache's reference mode.
 
 This is normalization **before averaging**, not just cosine normalization of
 the already-averaged vector. Token magnitude no longer weights its direction
@@ -115,12 +131,12 @@ excluded only from the displayed image. Both means are computed in that stage's
 own feature space, including projected Base/tile features for the final stage.
 Scores use detached FP32 values without modifying the original forward tensors.
 Higher values mean greater dissimilarity, **not an anomaly probability or LLM
-attention**. This is the explicitly requested direct Base-to-tile comparison,
+attention**. This is the explicitly requested direct reference-to-tile comparison,
 not the paper's interpolated Base score map and not a complete GlobalCom2 method.
 
 Each `000001_<question_id>/` contains:
 
-- `scores_overview.png`: five rows (the five stages); columns show Base,
+- `scores_overview.png`: five rows (the five stages); columns show the reference view,
   original image + numbered tile boundaries, global-score overlay, local-score
   overlay. GT is labelled; no prediction is invented.
 - `scores_tiles_01.png` (and further numbered pages if needed): five rows,
@@ -158,7 +174,8 @@ CUDA_VISIBLE_DEVICES=5 python visualize_scores.py \
   --input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \
   --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
   --display-mode patch-means \
-  --output-dir outputs/feature_scores_l2_means_01
+  --global-reference center-crop \
+  --output-dir outputs/feature_scores_center75_means_01
 ```
 
 This mode writes only `patch_means.png` per sample (top: layers 7/14/21/26;

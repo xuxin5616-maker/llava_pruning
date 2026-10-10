@@ -1,8 +1,10 @@
 """Read-only feature probes and spatially aligned AnyRes score figures.
 
 Each token is L2-normalized along channels BEFORE computing view means.
-Global = -cos(unit tile token, mean(unit Base tokens)); local = -cos(unit tile
+Global = -cos(unit tile token, mean(unit reference tokens)); local = -cos(unit tile
 token, mean(unit tokens of that tile)). Neither score is a defect probability.
+The CLI defaults to a center-75%-width/height reference, enlarged to original
+size before Base preprocessing. AnyRes tiles still use the full original image.
 All view means include every encoded token, including padding-context tokens.
 Only the display excludes geometric image padding. Scores are computed before
 AnyRes unpadding, max_9 feature downsampling, and structural newline insertion.
@@ -30,6 +32,33 @@ TILES_PER_PAGE = 4
 FEATURE_NORMALIZATION = "l2_per_token_before_mean"
 
 
+def global_reference_info(original_size, mode):
+    """Record integer crop geometry; right/bottom coordinates are exclusive."""
+    if mode not in {"base", "center-crop"}:
+        raise ValueError("Unknown global reference; use center-crop or base")
+    width, height = original_size
+    if min(width, height) < 1:
+        raise ValueError("Invalid reference image size")
+    crop_w, crop_h = ((max(1, width * 3 // 4), max(1, height * 3 // 4))
+                      if mode == "center-crop" else (width, height))
+    left, top = (width - crop_w) // 2, (height - crop_h) // 2
+    return {"mode": mode, "retained_width_height_fraction": 0.75 if mode == "center-crop" else 1.0,
+            "crop_box_xyxy": [left, top, left + crop_w, top + crop_h],
+            "crop_rounding": ("floor(0.75 * dimension), at least 1 pixel; centered with floor offset"
+                              if mode == "center-crop" else "none; full original image"),
+            "resize_back_to": list(original_size),
+            "resize_back_resampling": "bicubic" if mode == "center-crop" else None,
+            "anyres_source": "full original image, unchanged"}
+
+
+def reference_image(image, mode):
+    """Crop RGB source pixels, enlarge, THEN use the normal Base processor."""
+    info = global_reference_info(image.size, mode)
+    if mode == "base":
+        return image
+    return image.crop(info["crop_box_xyxy"]).resize(image.size, Image.Resampling.BICUBIC)
+
+
 def _unit_token_features(values):
     """Unit vectors along channels; zero vectors stay zero, inputs untouched.
 
@@ -43,7 +72,7 @@ def _unit_token_features(values):
 
 
 def score_tokens(features):
-    """Score [Base + tiles, spatial tokens, channels] in detached FP32.
+    """Score [reference (Base slot) + tiles, spatial tokens, channels] in detached FP32.
 
     Normalize each token along channels, THEN average over spatial tokens.
     Original forward features are never modified. Zero vectors remain zero in
@@ -157,8 +186,13 @@ class ScoreGeometry:
         return clip(left), clip(top), clip(left + width), clip(top + height)
 
 
-def prepare_views(image, processor, config, patch_size):
-    """Reuse actual AnyRes pixels, reconstruct only their display geometry."""
+def prepare_views(image, processor, config, patch_size, global_reference="base"):
+    """Keep AnyRes pixels unchanged; optionally replace only the reference view.
+
+    Shared callers (e.g. runVFlowOpt.py) retain the original Base by default.
+    visualize_scores.py explicitly selects its requested Global reference.
+    """
+    global_reference_info(image.size, global_reference)  # Validate before processing.
     from llava.mm_utils import (get_anyres_image_grid_shape, process_anyres_image,
                                 resize_and_pad_image, divide_to_patches)
     tile_size = processor.crop_size["height"]
@@ -171,8 +205,12 @@ def prepare_views(image, processor, config, patch_size):
         raise ValueError("Processor resize differs from the tile geometry")
     padded = resize_and_pad_image(image, (grid[0] * tile_size, grid[1] * tile_size))
     tiles = divide_to_patches(padded, tile_size)
-    # The global input is the original, square-resized image, not the padded mosaic.
-    base = image.resize((tile_size, tile_size))
+    base = reference_image(image, global_reference).resize((tile_size, tile_size))
+    if global_reference == "center-crop":
+        # Only slot 0 changes. Reference + untouched tiles are encoded together;
+        # there is no second encoder pass and no cross-image attention in SigLIP.
+        pixels = pixels.clone()
+        pixels[0] = processor.preprocess(base, return_tensors="pt")["pixel_values"][0]
     return pixels, base, tiles, geometry
 
 
@@ -227,7 +265,8 @@ def color_limits(scores, geometry, scale):
     return low, high
 
 
-def draw_figures(image, base, tiles, scores, geometry, folder, caption, scale):
+def draw_figures(image, base, tiles, scores, geometry, folder, caption, scale,
+                 global_reference="base"):
     """Five-layer overview + bounded-width pages of individual tile overlays."""
     from matplotlib import colormaps, rc_context
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -301,8 +340,10 @@ def draw_figures(image, base, tiles, scores, geometry, folder, caption, scale):
                 panel(axes[row, col], image, stitch_score_map(scores[kind][row], geometry))
                 boundaries(axes[row, col])
             axes[row, 0].set_ylabel(label, fontsize=11)
-        for ax, title in zip(axes[0], ("Base reference", "Original + tile IDs",
-                                       "Global: Base mean", "Local: each tile mean")):
+        reference_title = "Center 75% W/H reference" if global_reference == "center-crop" else "Base reference"
+        global_title = "Global: center-crop mean" if global_reference == "center-crop" else "Global: Base mean"
+        for ax, title in zip(axes[0], (reference_title, "Original + tile IDs",
+                                       global_title, "Local: each tile mean")):
             ax.set_title(title)
         finish(fig, axes, "scores_overview.png")
 
@@ -354,33 +395,65 @@ def load_score_samples(input_json, data_root, limit=None):
     return result
 
 
-def save_sample(image, base, tiles, scores, shapes, geometry, sample, folder, scale):
+def _display_options(display_mode, color_scale):
+    if display_mode not in {"tokens", "patch-means"}:
+        raise ValueError("Unknown display mode")
+    scale = color_scale if color_scale is not None else ("fixed" if display_mode == "patch-means" else "sample")
+    if scale not in {"sample", "fixed"}:
+        raise ValueError("Unknown color scale")
+    details = {"display_mode": display_mode, "color_scale": scale}
+    if display_mode == "patch-means":
+        import visualize_patch_means as offline
+        details.update(displayed_stages=list(offline.STAGES), figure_layout=offline.FIGURE_LAYOUT,
+                       score_scaling=offline.SCORE_SCALING, cross_layer_average=offline.CROSS_LAYER_AVERAGE)
+    return scale, details
+
+
+def save_sample(image, base, tiles, scores, shapes, geometry, sample, folder, scale=None,
+                display_mode="tokens", global_reference="base"):
+    scale, details = _display_options(display_mode, scale)
+    reference = global_reference_info(image.size, global_reference)
     folder.mkdir(parents=True, exist_ok=False)
     gt = {0: "Normal", 1: "Abnormal"}.get(sample["gt"], "Unknown")
     # The numeric arrays are small token scores, never full hidden states or attention matrices.
     np.savez_compressed(folder / "scores.npz", global_scores=scores["global"],
                         local_scores=scores["local"], stages=np.asarray(STAGES),
-                        feature_normalization=np.asarray(FEATURE_NORMALIZATION))
-    display = draw_figures(image, base, tiles, scores, geometry, folder,
-                          f"ID: {sample['id']} | GT: {gt} | No LLM prediction", scale)
+                        feature_normalization=np.asarray(FEATURE_NORMALIZATION),
+                        global_reference=np.asarray(global_reference))
+    if display_mode == "patch-means":
+        import visualize_patch_means as offline
+        selected = {"global": np.asarray(scores["global"][:len(LAYERS)], dtype=np.float64)}
+        means, counts = offline.aggregate_scores(selected)
+        means, counts = offline.build_display_means(means, counts)
+        limits = offline.render_figure(image, means, asdict(geometry), sample["id"], sample["gt"],
+                                       folder / "patch_means.png", scale, global_reference=global_reference)
+        offline.write_values(folder / "patch_means.csv", means, counts, asdict(geometry),
+                             selected["global"].shape[-1])
+        display = {"color_limits": limits, "figures": ["patch_means.png"]}
+    else:
+        display = draw_figures(image, base, tiles, scores, geometry, folder,
+                              f"ID: {sample['id']} | GT: {gt} | No LLM prediction", scale,
+                              global_reference=global_reference)
     metadata = {"id": sample["id"], "image": str(sample["image"]), "gt": sample["gt"],
                 "geometry": asdict(geometry), "feature_shapes": shapes,
                 "score_shape": list(scores["global"].shape),
                 "score_axes": ["stage", "tile_row_major", "token_row_major"],
                 "feature_normalization": FEATURE_NORMALIZATION,
-                **display}
+                "global_reference": global_reference, "global_reference_transform": reference,
+                **details, **display}
     with (folder / "metadata.json").open("x", encoding="utf-8") as stream:
         json.dump(metadata, stream, ensure_ascii=False, indent=2)
 
 
 def run_score_visualization(model_path, input_json, data_root, output_dir,
-                            limit=None, color_scale="sample"):
+                            limit=None, color_scale=None, display_mode="tokens",
+                            global_reference="center-crop"):
+    color_scale, display_details = _display_options(display_mode, color_scale)
+    global_reference_info((1, 1), global_reference)  # Fail before loading/writing.
     import torch
     from .backend import LlavaBackend
     # Fail on missing plotting libraries before loading the large checkpoint.
     from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: F401
-    if color_scale not in {"sample", "fixed"}:
-        raise ValueError("Unknown color scale")
     samples = load_score_samples(input_json, data_root, limit)
     output = Path(output_dir).expanduser().resolve()
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
@@ -388,6 +461,7 @@ def run_score_visualization(model_path, input_json, data_root, output_dir,
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("Use exactly one visible CUDA GPU, e.g. CUDA_VISIBLE_DEVICES=5 python visualize_scores.py ...")
     print(f"Loading checkpoint once for {len(samples)} images; no pruning or LLM generation.", flush=True)
+    print(f"Global reference: {global_reference}; AnyRes tiles use the full original image.", flush=True)
     # Reuse the original loader so dtype/weights are unchanged. Decoder weights
     # are loaded, but only model.encode_images() is ever executed by this script.
     backend = LlavaBackend(model_path, roi_mode="anyres_max_9")
@@ -404,7 +478,12 @@ def run_score_visualization(model_path, input_json, data_root, output_dir,
               "input_json": str(Path(input_json).expanduser().resolve()),
               "data_root": str(Path(data_root).expanduser().resolve()),
               "sample_count": len(samples), "limit": limit, "stages": list(STAGES),
-              "global_score": "-cos(unit_tile_token, mean(all unit Base tokens))",
+              "global_score": "-cos(unit_tile_token, mean(all unit reference tokens))",
+              "global_reference": global_reference,
+              "global_reference_pipeline": ("center 75% width/height -> bicubic resize to original size -> "
+                                             "Base preprocessing -> encoder; separate reference mean at each stage"
+                                             if global_reference == "center-crop" else
+                                             "full original image -> Base preprocessing -> encoder"),
               "local_score": "-cos(unit_tile_token, mean(all unit tokens of the same tile))",
               "feature_normalization": FEATURE_NORMALIZATION,
               "mean_policy": "L2-normalize each token along channels, then average all encoded tokens, including padding-context tokens",
@@ -414,7 +493,7 @@ def run_score_visualization(model_path, input_json, data_root, output_dir,
               "undefined_cosine": "NaN (gray); denominator <= 1e-12",
               "color_scale": color_scale, "colormap": COLORMAP, "overlay_alpha": OVERLAY_ALPHA,
               "score_dtype": "float32", "projector_dtype": projection_dtype,
-              "llm_generation": False, "pruning": False,
+              "llm_generation": False, "pruning": False, **display_details,
               "loader_config": {k: v for k, v in backend.inference_config.items() if k != "attention_source"}}
     with (output / "run.json").open("x", encoding="utf-8") as stream:
         json.dump(config, stream, ensure_ascii=False, indent=2)
@@ -424,10 +503,11 @@ def run_score_visualization(model_path, input_json, data_root, output_dir,
         with Image.open(sample["image"]) as source:
             image = source.convert("RGB")
         pixels, base, tiles, geometry = prepare_views(
-            image, backend.processor, backend.model.config, patch_size)
+            image, backend.processor, backend.model.config, patch_size, global_reference=global_reference)
         pixels = pixels.to(device=backend.model.device, dtype=torch.float16)
         scores, shapes = capture_scores(backend.model, pixels)
-        save_sample(image, base, tiles, scores, shapes, geometry, sample, folder, color_scale)
+        save_sample(image, base, tiles, scores, shapes, geometry, sample, folder, color_scale,
+                    display_mode=display_mode, global_reference=global_reference)
         print(f"[{index}/{len(samples)}] {sample['id']}: {geometry.tile_count} tiles, saved {folder}", flush=True)
     print(f"Saved all feature-score visualizations to {output}", flush=True)
     return output

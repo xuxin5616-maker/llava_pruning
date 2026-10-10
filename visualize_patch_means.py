@@ -290,7 +290,8 @@ def resolve_image(metadata, source_run, data_root=None):
     raise FileNotFoundError(f"Cannot relocate {raw} under {root}; retain the original directory structure")
 
 
-def render_figure(image, means, geometry, sample_id, gt, destination, scale="fixed"):
+def render_figure(image, means, geometry, sample_id, gt, destination, scale="fixed",
+                  global_reference="base"):
     from matplotlib import colormaps, rc_context
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.colors import Normalize
@@ -336,8 +337,10 @@ def render_figure(image, means, geometry, sample_id, gt, destination, scale="fix
             ax.set_aspect(image.height / image.width)
             ax.set_title("Original" if score_row is None else LABELS[score_row], fontsize=11)
         ground_truth = {0: "Normal", 1: "Abnormal"}.get(gt, "Unknown")
+        reference_label = (" | Reference: center 75% W/H, enlarged"
+                           if global_reference == "center-crop" else "")
         fig.suptitle(f"ID: {sample_id} | GT: {ground_truth}\n"
-                     "Global tile means: (raw score + 1) / 2 | Cached scores only", fontsize=11)
+                     "Global tile means: (raw score + 1) / 2 | No LLM prediction" + reference_label, fontsize=11)
         colorbar_label = "Global score [0, 1]: (raw mean -cos score + 1) / 2"
         fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=axes, orientation="horizontal",
                      fraction=0.04, pad=0.025, shrink=0.75, aspect=50, label=colorbar_label)
@@ -409,12 +412,15 @@ def run(results_dir, output_dir=None, data_root=None, color_scale="fixed"):
         with Image.open(image_path) as original:
             image = original.convert("RGB")
         limits = render_figure(image, means, geometry, metadata.get("id", folder.name), metadata.get("gt"),
-                               target / "patch_means.png", color_scale)
+                               target / "patch_means.png", color_scale,
+                               global_reference=metadata.get("global_reference", "base"))
         write_values(target / "patch_means.csv", means, counts, geometry, scores["global"].shape[-1])
         saved = {"id": metadata.get("id", folder.name), "source_scores": str(source),
                  "source_metadata": str(folder / "metadata.json"), "image": str(image_path),
                  "gt": metadata.get("gt"), "geometry": geometry, "color_limits": limits,
                  "script_version": SCRIPT_VERSION, "color_scale": color_scale,
+                 "global_reference": metadata.get("global_reference", "base"),
+                 "global_reference_transform": metadata.get("global_reference_transform"),
                  "figure_layout": FIGURE_LAYOUT,
                  "score_kind": "global", "score_normalization": SCORE_SCALING["method"],
                  "score_scaling": SCORE_SCALING,
