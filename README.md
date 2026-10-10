@@ -128,6 +128,210 @@ bottom/right strip of **each tile** is not falsely assigned a score. Token
 scores are expanded using nearest patch support, not presented as independently
 measured per-pixel scores. Original images are never modified.
 
+### Offline AnyRes tile-mean visualization (`visualize_patch_means.py`)
+
+Reuse the previous feature-score results **without loading or running any model**.
+This standalone file needs only NumPy, Pillow and Matplotlib: no Torch,
+Transformers, FlashAttention, CUDA, model checkpoint or input-question JSON.
+It computes an arithmetic mean of the saved **Global token scores** in each
+AnyRes tile at SigLIP layers 7/14/21/26. **Local and projector are excluded**.
+Three extra rows average the **raw tile means** of the first 2, 3 and 4 selected
+layers. All seven score panels are then scaled with **`(raw_score + 1) / 2`**, mapping
+the theoretical cosine-score range **[-1, 1] to [0, 1]**. This is the same fixed
+linear transform for every image/layer/tile, not per-layer min-max normalization.
+It does not average hidden features or recompute cosine similarity.
+
+To check the **actual uploaded script**, run
+`python visualize_patch_means.py --version`: it must print `4.2-global-horizontal`.
+`--help` must list `{fixed,sample}`. The former `layer` normalization mode was
+removed. Runs also print/save the script version
+and selected color scale, so a previous copy can be distinguished immediately.
+
+```bash
+python visualize_patch_means.py \
+  --results-dir outputs/feature_scores_02 \
+  --color-scale fixed \
+  --output-dir outputs/feature_scores_02_patch_means_horizontal
+```
+
+Alternatively, edit `RESULTS_DIR` at the top of the file and run
+`python visualize_patch_means.py`. If `OUTPUT_DIR` is empty, output defaults to
+a sibling directory named `<results directory name>_patch_means`. All available
+sample folders are processed, or `--results-dir` can name one sample folder.
+Use a new/empty output directory outside the source result tree. Existing
+score contents/images/metadata are never overwritten. The only source change is
+restoring a score archive's filename by removing an appended `.log` (see below).
+
+Each sample needs its original `metadata.json` and `scores.npz`. A filename with
+an appended `.log` is **automatically renamed after the archive is validated**:
+`scores.npz.log` becomes `scores.npz` in the same sample folder. No data is
+rewritten, and each rename is printed in the terminal. Discovery accepts
+`.npz`, `.npz.log`, `.npy` and `.npy.log`; the reader checks binary content, not
+the extension. The contents must still be the original archive containing
+`global_scores` and `stages`; `local_scores` is no longer required or read.
+An arbitrary single NPY array or a
+text log is not that archive and is rejected rather than guessing its layout.
+Both the original five-stage archive (with projector) and a four-stage archive
+containing only SigLIP 7/14/21/26 are accepted. Layers are matched by their saved
+names rather than blindly slicing the first entries. Projector is excluded from
+all calculations and output rows. Neither Local nor projector is deleted from
+the cache; this change only affects the offline redraw script.
+Two candidate archives in one sample folder are rejected as ambiguous. An
+existing destination file is never intentionally replaced; a name conflict
+stops processing. A normal `.npz` filename is left unchanged on subsequent runs.
+
+Original images are read from the saved paths for the overlay. If the images
+have moved, keep the old result-root `run.json` and add `--data-root /new/data/root`
+(or edit `DATA_ROOT` at the top); the original relative directory structure is
+preserved, including `imgs/`. No vision encoder preprocessing is rerun.
+
+Each new sample folder contains:
+
+- `patch_means.png`: a compact **two-row, four-column** layout (2400 x 1350 px).
+  The top row shows **SigLIP 7 / 14 / 21 / 26**; the bottom row shows **Original /
+  mean of first 2 / mean of first 3 / mean of first 4**. The three mean panels are
+  side by side, not additional rows. Original appears once, with tile boundaries
+  but **no patch numbers**. Each heatmap retains tile IDs and **scaled mean scores
+  (0..1)**, with one JET color per visible tile at 70% opacity over the image.
+  All heatmaps share a horizontal colorbar.
+  These are tile-level
+  aggregates, not new per-pixel measurements; unobserved six-pixel token borders
+  receive the same **tile-level** color, not invented individual token scores.
+- `patch_means.csv`: raw `global_mean`, scaled `global_score_01`, row/column, visible flag,
+  `source_layers`, `layer_count`, and valid/total token counts. For composite rows,
+  these counts sum token observations across the selected layers; they are **not
+  weights** for averaging layer scores. No Local columns are saved. The raw column
+  remains unchanged for audit; `global_score_01` matches the displayed values.
+- `metadata.json`: source-file paths, image, geometry, display mode/color limits,
+  layer-group definitions, version, `figure_layout`, and explicit `score_scaling` formula/ranges.
+
+The root `run.json` records aggregation/display settings and completion. Means
+include all finite saved token scores in each tile, **including padding-context
+tokens**. NaN is excluded and counts are reported; entirely undefined means are
+gray and blank in CSV, not zero. Infinite/out-of-range values fail validation.
+Image padding is cropped out of the overview; entirely invisible tiles remain
+in CSV but do not set the optional sample-wide color limits.
+
+Score/CSV order remains unchanged ("first" refers to the selected layers, not blocks 1..4):
+
+1. SigLIP 7
+2. SigLIP 14
+3. SigLIP 21
+4. SigLIP 26
+5. `mean_first_2`: `(score_7 + score_14) / 2`
+6. `mean_first_3`: `(score_7 + score_14 + score_21) / 3`
+7. `mean_first_4`: `(score_7 + score_14 + score_21 + score_26) / 4`
+
+Each `score` above is a **raw per-tile mean**, before the fixed linear transform.
+Layers have equal weight. If any constituent layer has no valid tile mean, that
+composite tile is undefined (gray / blank CSV), not silently averaged over fewer
+layers. Partial NaNs within a layer still use the original finite-token mean.
+
+Default `--color-scale fixed` uses the scaled **[0, 1]** color range for all panels
+and all images: raw -1 -> 0, raw 0 -> 0.5, raw 1 -> 1. The same raw score has the
+same heatmap color. This relabels the previous [-1, 1] display; it does **not**
+increase color contrast or independently stretch each layer's observed range.
+These scores are not probabilities. Raw overshoot up to 1e-6 (roundoff tolerance)
+is clipped to the endpoints only after averaging/scaling; larger errors fail.
+
+Optional `--color-scale sample` sets shared color limits to the finite, visible
+scaled Global means across all seven score panels **of one image**. It can improve contrast,
+but colors are then not directly comparable across different images. Both
+modes show scaled tile labels/colorbar units and preserve both raw and scaled
+CSV columns. The optional palette-range adjustment does not further transform scores.
+Averaging can dilute a small hotspot; the original token scores do not change.
+
+### Offline pixel-entropy visualization (`runVFlowOpt.py`)
+
+Version `2.1-plain-local-coarse-grids` is CPU-only. It reads saved AnyRes geometry
+and **original images**, not cached cosine scores, and never loads SigLIP/LLM or
+runs pruning. Input pixels are still the same resized/padded 384 x 384 views.
+Only the entropy analysis grid changes; model tokens and cached geometry stay intact:
+
+- Base: 6 x 6 blocks, 64 x 64 pixels each, 36 scores.
+- Each AnyRes crop: 2 x 2 blocks, 192 x 192 pixels each, 4 scores.
+- A 3 x 3 crop layout gives a stitched 6 x 6 analysis grid. Other layouts retain
+  their original crop count/aspect ratio; padding is cropped out when mapping
+  back to the image, so some edge blocks may be only partly visible.
+
+Entropy is **recomputed from the large block's pixel histogram**, not averaged
+from old 14 x 14 entropies: `gray = floor((R+G+B)/3)`, 256 bins,
+`H = -sum(p * ln(p))` in nats. The 64/192 pixel blocks cover all 384 pixels;
+there is no discarded six-pixel convolution margin in these analysis maps.
+This is a custom coarse-grid analysis, not the original VFlowOpt token grid or
+complete importance score. Raw uint8/floor preprocessing is retained.
+
+Choose the score with `--entropy-mode`:
+
+- **`plain` (default):** ordinary block entropy, no neighborhood subtraction.
+  Base Softmax uses all 36 blocks. Each AnyRes crop separately normalizes all
+  4 blocks, including padding; the nine crops are NOT one Softmax group.
+- **`local`:** retain `D = abs(H - median(neighbor H))` for 3 x 3, 5 x 5 and
+  7 x 7 neighborhoods, now on the coarse stitched grid. Neighbors cross crop
+  boundaries; the center is excluded. Near image edges, only available valid
+  neighbors are used. Windows refer to entropy blocks, not pixels.
+  Only full-content blocks participate, as in version 2.0; partial/full padding
+  or missing neighbors produce NaN/gray, not invented zero scores. Each window
+  and crop independently normalizes its defined deviations. Base remains
+  ordinary 6 x 6 entropy in both modes, not Base neighborhood deviation.
+
+Ordinary entropy:
+
+```bash
+python runVFlowOpt.py \
+  --results-dir outputs/feature_scores_02 \
+  --output-dir outputs/feature_scores_02_entropy_6x6 \
+  --entropy-mode plain \
+  --color-scale softmax
+```
+
+Neighborhood entropy deviation:
+
+```bash
+python runVFlowOpt.py \
+  --results-dir outputs/feature_scores_02 \
+  --output-dir outputs/feature_scores_02_local_entropy_6x6 \
+  --entropy-mode local \
+  --color-scale softmax
+```
+
+`--color-scale softmax` uses `softmax(score_nats / ln(2))`, separately per view
+(and window in local mode), with JET overlays. Base and stitched AnyRes have
+separate labeled colorbars; all AnyRes crops/windows share one AnyRes scale.
+**Equal colors across separate colorbars are not equal values.** The mean
+Softmax weight is necessarily 1/36 for Base and 1/4 for a complete four-block
+crop, not a measure of how informative the crop is. Scores are not defect probabilities.
+
+Use `--color-scale raw` for unnormalized nats, or `--color-scale minmax`
+for direct min-max scaling (no Softmax first, constant range -> 0.5).
+Plain min-max shares one range over Base + visible AnyRes blocks. Local min-max
+keeps Base separate from deviations, pooling all AnyRes crops/windows into
+one range. `fixed` uses Softmax with fixed [0,1] color limits;
+`sample` and `layer` remain compatibility aliases for Softmax.
+
+Plain mode writes only `entropy_overview.png` per sample (Base reference /
+Base heatmap / original + crop IDs / AnyRes heatmap). Local mode preserves
+version 2.0's six images: `entropy_overview.png`, `entropy_raw_overview.png`,
+`base_entropy_6x6.png`, and `anyres_deviation_3x3.png`, `5x5.png`, `7x7.png`
+(the last two also have the `anyres_deviation_` prefix).
+Both modes write `entropy.npz`, `entropy_patch_means.csv`, sample
+`metadata.json`, and root `run.json`. Plain mode skips neighborhood calculation.
+
+NPZ preserves raw `base_entropy` [36], `tile_entropy` [crop,4], and their
+`base_softmax` / `tile_entropy_softmax` arrays. Local mode additionally saves
+deviations, neighbor medians/counts, validity masks and weights [3,crop,4].
+`patch_size=192` describes AnyRes entropy blocks;
+`source_model_patch_size=14` describes the unchanged source encoder.
+Metadata distinguishes original `geometry` from `entropy_geometry` and records
+mode, score axes, normalization, block sizes, missing values and display limits.
+
+Use a new/empty output directory; no source or old result is overwritten.
+Without `--output-dir`, the destination is the sibling
+`<results>_vflowopt_<plain|local>_<color-scale>`. `--limit N` is optional;
+by default all samples run. `RESULTS_DIR`, `OUTPUT_DIR` and `DATA_ROOT` may
+still be edited at the top of the script. Keep `visualize_patch_means.py` and
+`llava_pruning/score_visualization.py` alongside it for CPU helper imports.
+
 ### Experimental mode: anyres without Base (`ex` branch)
 
 Use `--roi-mode anyres_only` to remove the global Base view while retaining the **same high-resolution tile preprocessing and packing rules as `anyres_max_9`**. Existing modes are unchanged. Base is neither resized/preprocessed nor passed through the vision encoder; every encoded view is an anyres tile, including the single-tile case. Masks/bboxes do not select crops in this mode (normal JSON/path validation still applies).
