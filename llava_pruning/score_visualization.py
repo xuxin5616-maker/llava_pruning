@@ -1,7 +1,8 @@
 """Read-only feature probes and spatially aligned AnyRes score figures.
 
-Global = -cos(tile token, mean(Base tokens)); local = -cos(tile token,
-mean(tokens of that tile)). Neither score is an attention or defect probability.
+Each token is L2-normalized along channels BEFORE computing view means.
+Global = -cos(unit tile token, mean(unit Base tokens)); local = -cos(unit tile
+token, mean(unit tokens of that tile)). Neither score is a defect probability.
 All view means include every encoded token, including padding-context tokens.
 Only the display excludes geometric image padding. Scores are computed before
 AnyRes unpadding, max_9 feature downsampling, and structural newline insertion.
@@ -26,13 +27,28 @@ MISSING_COLOR = "#b8b8b8"
 OVERLAY_ALPHA = 0.70
 COLORMAP = "jet"
 TILES_PER_PAGE = 4
+FEATURE_NORMALIZATION = "l2_per_token_before_mean"
+
+
+def _unit_token_features(values):
+    """Unit vectors along channels; zero vectors stay zero, inputs untouched.
+
+    The caller validates finite FP32 features. Scaling by the largest component
+    first avoids overflow/underflow in the norm without changing direction.
+    """
+    scale = values.abs().amax(dim=-1, keepdim=True)
+    scaled = values / scale.masked_fill(scale == 0, 1.)
+    length = scaled.norm(dim=-1, keepdim=True)
+    return scaled / length.masked_fill(length == 0, 1.)
 
 
 def score_tokens(features):
     """Score [Base + tiles, spatial tokens, channels] in detached FP32.
 
-    Original features are never modified. Zero-norm tokens/references give NaN
-    (undefined cosine), not invented low/high scores. Nonfinite features fail.
+    Normalize each token along channels, THEN average over spatial tokens.
+    Original forward features are never modified. Zero vectors remain zero in
+    means; zero-norm tokens/references give NaN (undefined cosine), not invented
+    low/high scores. Nonfinite features fail.
     """
     import torch
     if features.ndim != 3 or features.shape[0] < 2 or min(features.shape[1:]) < 1:
@@ -40,6 +56,7 @@ def score_tokens(features):
     values = features.detach().float()
     if not torch.isfinite(values).all():
         raise ValueError("Nonfinite visual features; cannot produce trustworthy scores")
+    values = _unit_token_features(values)
     means = values.mean(dim=1)
     tokens = values[1:]
     token_norms = tokens.norm(dim=-1)
@@ -337,31 +354,73 @@ def load_score_samples(input_json, data_root, limit=None):
     return result
 
 
-def save_sample(image, base, tiles, scores, shapes, geometry, sample, folder, scale):
+def _display_options(display_mode, color_scale):
+    """Validate before model loading/writing; retain original token defaults."""
+    if display_mode not in {"tokens", "patch-means"}:
+        raise ValueError("display_mode must be tokens or patch-means")
+    if color_scale is None:
+        color_scale = "fixed" if display_mode == "patch-means" else "sample"
+    if color_scale not in {"sample", "fixed"}:
+        raise ValueError("Unknown color scale")
+    metadata = {"display_mode": display_mode, "color_scale": color_scale}
+    if display_mode == "patch-means":
+        # Import before loading the checkpoint so a missing companion fails early.
+        import visualize_patch_means as patch_vis
+        metadata.update(displayed_stages=patch_vis.STAGES,
+                        figure_layout=patch_vis.FIGURE_LAYOUT,
+                        tile_mean_policy=patch_vis.MEAN_POLICY,
+                        score_kind="global", score_normalization=patch_vis.SCORE_SCALING["method"],
+                        score_scaling=patch_vis.SCORE_SCALING,
+                        cross_layer_average=patch_vis.CROSS_LAYER_AVERAGE,
+                        display_values="global_score_01")
+    return color_scale, metadata
+
+
+def save_sample(image, base, tiles, scores, shapes, geometry, sample, folder, scale=None,
+                display_mode="tokens"):
+    scale, display_options = _display_options(display_mode, scale)
     folder.mkdir(parents=True, exist_ok=False)
     gt = {0: "Normal", 1: "Abnormal"}.get(sample["gt"], "Unknown")
     # The numeric arrays are small token scores, never full hidden states or attention matrices.
     np.savez_compressed(folder / "scores.npz", global_scores=scores["global"],
-                        local_scores=scores["local"], stages=np.asarray(STAGES))
-    display = draw_figures(image, base, tiles, scores, geometry, folder,
-                          f"ID: {sample['id']} | GT: {gt} | No LLM prediction", scale)
+                        local_scores=scores["local"], stages=np.asarray(STAGES),
+                        feature_normalization=np.asarray(FEATURE_NORMALIZATION))
+    if display_mode == "patch-means":
+        import visualize_patch_means as patch_vis
+        # Reuse the EXACT cache selection, averaging, scaling, and renderer used
+        # offline. No extra encode_images() call, and no token-map PNGs generated.
+        patch_geometry = patch_vis.validate_geometry({"geometry": asdict(geometry)})
+        selected = patch_vis.load_scores(folder / "scores.npz", patch_geometry,
+                                         {"score_shape": list(scores["global"].shape)})
+        means, counts = patch_vis.aggregate_scores(selected)
+        means, counts = patch_vis.build_display_means(means, counts)
+        limits = patch_vis.render_figure(image, means, patch_geometry, sample["id"], sample["gt"],
+                                         folder / "patch_means.png", scale)
+        patch_vis.write_values(folder / "patch_means.csv", means, counts, patch_geometry,
+                               selected["global"].shape[-1])
+        display = {"figures": ["patch_means.png"], "color_limits": limits,
+                   "values_file": "patch_means.csv"}
+    else:
+        display = draw_figures(image, base, tiles, scores, geometry, folder,
+                              f"ID: {sample['id']} | GT: {gt} | No LLM prediction", scale)
     metadata = {"id": sample["id"], "image": str(sample["image"]), "gt": sample["gt"],
                 "geometry": asdict(geometry), "feature_shapes": shapes,
                 "score_shape": list(scores["global"].shape),
                 "score_axes": ["stage", "tile_row_major", "token_row_major"],
+                "feature_normalization": FEATURE_NORMALIZATION,
+                **display_options,
                 **display}
     with (folder / "metadata.json").open("x", encoding="utf-8") as stream:
         json.dump(metadata, stream, ensure_ascii=False, indent=2)
 
 
 def run_score_visualization(model_path, input_json, data_root, output_dir,
-                            limit=None, color_scale="sample"):
+                            limit=None, color_scale=None, display_mode="tokens"):
+    color_scale, display_options = _display_options(display_mode, color_scale)
     import torch
     from .backend import LlavaBackend
     # Fail on missing plotting libraries before loading the large checkpoint.
     from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: F401
-    if color_scale not in {"sample", "fixed"}:
-        raise ValueError("Unknown color scale")
     samples = load_score_samples(input_json, data_root, limit)
     output = Path(output_dir).expanduser().resolve()
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
@@ -385,15 +444,18 @@ def run_score_visualization(model_path, input_json, data_root, output_dir,
               "input_json": str(Path(input_json).expanduser().resolve()),
               "data_root": str(Path(data_root).expanduser().resolve()),
               "sample_count": len(samples), "limit": limit, "stages": list(STAGES),
-              "global_score": "-cos(tile_token, mean(all Base tokens))",
-              "local_score": "-cos(tile_token, mean(all tokens of the same tile))",
-              "mean_policy": "all encoded tokens, including padding-context tokens",
+              "global_score": "-cos(unit_tile_token, mean(all unit Base tokens))",
+              "local_score": "-cos(unit_tile_token, mean(all unit tokens of the same tile))",
+              "feature_normalization": FEATURE_NORMALIZATION,
+              "mean_policy": "L2-normalize each token along channels, then average all encoded tokens, including padding-context tokens",
+              "zero_norm_policy": "zero vectors remain zero in means; their cosine scores are NaN",
               "feature_location": "block outputs before post_layernorm; actual projector output",
               "spatial_policy": "before unpad/max_9 downsample/newlines; nearest patch support; padding gray",
               "undefined_cosine": "NaN (gray); denominator <= 1e-12",
               "color_scale": color_scale, "colormap": COLORMAP, "overlay_alpha": OVERLAY_ALPHA,
               "score_dtype": "float32", "projector_dtype": projection_dtype,
               "llm_generation": False, "pruning": False,
+              **display_options,
               "loader_config": {k: v for k, v in backend.inference_config.items() if k != "attention_source"}}
     with (output / "run.json").open("x", encoding="utf-8") as stream:
         json.dump(config, stream, ensure_ascii=False, indent=2)
@@ -406,7 +468,8 @@ def run_score_visualization(model_path, input_json, data_root, output_dir,
             image, backend.processor, backend.model.config, patch_size)
         pixels = pixels.to(device=backend.model.device, dtype=torch.float16)
         scores, shapes = capture_scores(backend.model, pixels)
-        save_sample(image, base, tiles, scores, shapes, geometry, sample, folder, color_scale)
+        save_sample(image, base, tiles, scores, shapes, geometry, sample, folder, color_scale,
+                    display_mode=display_mode)
         print(f"[{index}/{len(samples)}] {sample['id']}: {geometry.tile_count} tiles, saved {folder}", flush=True)
     print(f"Saved all feature-score visualizations to {output}", flush=True)
     return output

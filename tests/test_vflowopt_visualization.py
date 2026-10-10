@@ -1,4 +1,4 @@
-"""CPU-only regression tests for coarse plain entropy / local deviation modes."""
+"""CPU-only regression tests for whole AnyRes 12x12 / Base 18x18 entropy grids."""
 
 import builtins
 import csv
@@ -72,216 +72,270 @@ class EntropyTests(unittest.TestCase):
                 vis.entropy_softmax(invalid)
 
 
-class GridTests(unittest.TestCase):
-    def test_model_geometry_unchanged_and_last_pixel_covered(self):
-        source = vis.ScoreGeometry.create((384, 384), (3, 3), 384, 14)
-        coarse = vis.entropy_geometry(source)
-        self.assertEqual(source.patch_size, 14)
-        self.assertEqual((coarse.patch_size, coarse.token_side), (192, 2))
-        self.assertEqual(coarse.resized_size, source.resized_size)
-        for block, count in ((64, 36), (192, 4)):
-            pixels = np.zeros((384, 384, 3), dtype=np.uint8)
-            pixels[-1, -1] = 255
-            values = vis.patch_entropy(pixels, block)
-            self.assertEqual(values.shape, (count,))
-            self.assertGreater(values[-1], 0)
-            self.assertEqual(np.count_nonzero(values), 1)
-        heat = vis.base_score_map(np.arange(36), coarse)
-        self.assertEqual(heat.shape, (384, 384))
-        self.assertEqual((heat[-1, -1], heat[63, 63], heat[64, 64]), (35, 0, 7))
-
-    def test_nine_crops_form_6x6_in_correct_order_without_gaps(self):
-        g = vis.entropy_geometry(vis.ScoreGeometry.create((384, 384), (3, 3), 384, 14))
-        values = np.arange(36).reshape(9, 4)
-        expected = np.block([[values[r * 3 + c].reshape(2, 2) for c in range(3)] for r in range(3)])
-        np.testing.assert_array_equal(vis.assemble_patch_grid(values, g), expected)
-        np.testing.assert_array_equal(vis.split_patch_grid(expected, g), values)
-        np.testing.assert_array_equal(vis.stitch_score_map(values, g), expected.repeat(192, 0).repeat(192, 1))
-
-    def test_other_crop_layouts_are_preserved(self):
-        g = vis.entropy_geometry(vis.ScoreGeometry.create((56, 28), (2, 1), 384, 14))
-        self.assertEqual(vis.assemble_patch_grid(np.arange(8).reshape(2, 4), g).shape, (2, 4))
-        self.assertEqual(vis.stitch_score_map(np.arange(8).reshape(2, 4), g).shape, (384, 768))
-
-    def test_recomputed_histogram_not_averaged_old_entropy(self):
+class GlobalGridTests(unittest.TestCase):
+    def test_18_grid_covers_every_base_pixel_in_21_22_intervals(self):
         pixels = np.zeros((384, 384, 3), dtype=np.uint8)
-        pixels[96:192, :192] = 255
-        self.assertAlmostEqual(float(vis.patch_entropy(pixels, 192)[0]), math.log(2), places=6)
-        self.assertEqual(float(vis.patch_entropy(pixels[:192, :192], 96).mean()), 0.)
+        pixels[-1, -1] = 255
+        h, x, y = vis.global_grid_entropy(pixels, 18)
+        self.assertEqual(h.shape, (18, 18))
+        self.assertEqual(set(np.diff(x)), {21, 22})
+        self.assertEqual((x[0], x[-1], y[0], y[-1]), (0, 384, 0, 384))
+        self.assertGreater(h[-1, -1], 0.)
+        self.assertEqual(np.count_nonzero(h), 1)
+        heat = vis.global_grid_score_map(h, x, y)
+        self.assertEqual(heat.shape, (384, 384))
+        self.assertEqual(heat[-1, -1], h[-1, -1])
+        # A nonuniform block is normalized by its actual 22*22 pixel count.
+        counts = np.bincount(pixels[-22:, -22:, 0].ravel(), minlength=256)
+        p = counts[counts > 0] / 484
+        self.assertAlmostEqual(float(h[-1, -1]), float(-(p * np.log(p)).sum()), places=7)
+
+    def test_anyres_always_12_total_including_nondivisible_crop_layout(self):
+        for grid in ((3, 3), (2, 1), (5, 2)):
+            with self.subTest(grid=grid):
+                g = vis.ScoreGeometry.create((56, 28), grid, 384, 14)
+                image = Image.new("RGB", (56, 28), (10, 20, 30))
+                _, tiles = vis.prepare_entropy_views(image, g)
+                mosaic = vis.reconstruct_mosaic(tiles, g)
+                self.assertEqual(mosaic.shape, (grid[1] * 384, grid[0] * 384, 3))
+                h, x, y = vis.global_grid_entropy(mosaic, 12)
+                self.assertEqual(h.shape, (12, 12))
+                self.assertEqual(g.patch_size, 14)
+                left, top = g.paste_xy
+                width, height = g.resized_size
+                heat = vis.global_grid_score_map(np.arange(144).reshape(12, 12), x, y,
+                                                 (left, top, left + width, top + height))
+                self.assertEqual(heat.shape, (height, width))
+                np.testing.assert_array_equal(
+                    vis.global_grid_score_map(h, x, y),
+                    h.repeat(np.diff(y), 0).repeat(np.diff(x), 1))
+
+    def test_mosaic_crop_order_and_global_histogram_not_average(self):
+        g = vis.ScoreGeometry.create((384, 384), (3, 3), 384, 14)
+        tiles = [Image.new("RGB", (384, 384), (i, i, i)) for i in range(9)]
+        mosaic = vis.reconstruct_mosaic(tiles, g)
+        for i in range(9):
+            r, c = divmod(i, 3)
+            np.testing.assert_array_equal(mosaic[r * 384, c * 384], [i] * 3)
+        pixels = np.zeros((384, 384, 3), dtype=np.uint8)
+        pixels[16:32, :32] = 255
+        h, _, _ = vis.global_grid_entropy(pixels, 12)
+        self.assertAlmostEqual(float(h[0, 0]), math.log(2), places=6)
+        self.assertEqual(float(vis.patch_entropy(pixels[:32, :32], 16).mean()), 0.)
+
+    def test_geometric_masks_distinguish_partial_and_full_padding(self):
+        edges = np.array([0, 10, 20, 30])
+        visible, full = vis.global_grid_masks(edges, edges, (5, 5, 25, 25))
+        self.assertTrue(visible.all())
+        self.assertEqual(full.sum(), 1)
+        self.assertTrue(full[1, 1])
+        for args in ((10, 0), (10, 11), (0, 1), (10, 1.5), (True, 1)):
+            with self.assertRaises(ValueError):
+                vis.equal_grid_edges(*args)
 
 
 class LocalTests(unittest.TestCase):
-    def test_local_median_matches_scalar_reference_cross_crop_boundaries(self):
-        g = vis.entropy_geometry(vis.ScoreGeometry.create((384, 384), (3, 3), 384, 14))
-        grid = np.arange(36, dtype=float).reshape(6, 6) / 10
-        grid[2, 2] = 5.5
-        d, medians, counts, valid = vis.local_entropy_deviation(vis.split_patch_grid(grid, g), g)
-        self.assertEqual(d.shape, (3, 9, 4))
-        self.assertTrue(valid.all())
-        for wi, window in enumerate((3, 5, 7)):
-            radius = window // 2
-            dg, mg, ng = (vis.assemble_patch_grid(array[wi], g) for array in (d, medians, counts))
-            for y in range(6):
-                for x in range(6):
-                    neighbors = [grid[j, i] for j in range(max(0, y-radius), min(6, y+radius+1))
-                                 for i in range(max(0, x-radius), min(6, x+radius+1)) if (j, i) != (y, x)]
-                    self.assertAlmostEqual(float(mg[y, x]), np.median(neighbors), places=6)
-                    self.assertAlmostEqual(float(dg[y, x]), abs(grid[y, x] - np.median(neighbors)), places=6)
-                    self.assertEqual(ng[y, x], len(neighbors))
-        self.assertEqual(vis.assemble_patch_grid(counts[0], g)[1, 1], 8)
+    def test_same_neighbor_rule_for_12_and_18_matches_scalar_reference(self):
+        for side in (12, 18):
+            grid = np.arange(side * side, dtype=float).reshape(side, side) / (side * side)
+            grid[2, 2] = 4.
+            d, medians, counts = vis.global_grid_deviation(grid)
+            self.assertEqual(d.shape, (3, side, side))
+            for wi, window in enumerate((3, 5, 7)):
+                radius = window // 2
+                for y, x in ((0, 0), (2, 2), (3, 3), (side-1, side-1)):
+                    neighbors = [grid[j, i] for j in range(max(0, y-radius), min(side, y+radius+1))
+                                 for i in range(max(0, x-radius), min(side, x+radius+1)) if (j, i) != (y, x)]
+                    self.assertAlmostEqual(float(medians[wi, y, x]), float(np.median(neighbors)), places=6)
+                    self.assertAlmostEqual(float(d[wi, y, x]), abs(grid[y, x] - np.median(neighbors)), places=6)
+                    self.assertEqual(counts[wi, y, x], len(neighbors))
+            self.assertEqual(counts[0, 3, 3], 8)  # crosses former 3x3 crop boundaries
 
-    def test_partial_padding_and_no_neighbors_are_nan_not_zero(self):
-        g = vis.entropy_geometry(vis.ScoreGeometry.create((56, 1), (2, 4), 384, 14))
-        self.assertTrue(vis.visible_blocks(g).any())
-        self.assertFalse(vis.full_content_tokens(g).any())
-        d, medians, counts, _ = vis.local_entropy_deviation(np.zeros((8, 4)), g)
+    def test_padding_and_isolated_center_are_undefined_not_zero(self):
+        h = np.ones((12, 12))
+        valid = np.zeros((12, 12), dtype=bool)
+        valid[4, 4] = True
+        d, medians, counts = vis.global_grid_deviation(h, valid)
         self.assertTrue(np.isnan(d).all())
         self.assertTrue(np.isnan(medians).all())
         self.assertFalse(counts.any())
-        self.assertTrue(np.isnan(vis.deviation_softmax(d)).all())
+        self.assertTrue(np.isnan(vis.whole_grid_softmax(d)).all())
+        view = vis.analyze_view(np.zeros((384, 768, 3), dtype=np.uint8), 12, (0, 190, 768, 194), "local")
+        self.assertTrue(np.isnan(view["scores"]).all())
 
-    def test_defined_softmax_independent_per_window_and_crop(self):
-        values = np.array([[[0., 1., np.nan, 2.], [np.nan] * 4], [[1., 2., 3., 4.], [0.] * 4]])
-        weights = vis.deviation_softmax(values)
-        np.testing.assert_allclose(weights[0, 0, [0, 1, 3]], vis.entropy_softmax([0, 1, 2]))
-        self.assertTrue(np.isnan(weights[0, 1]).all())
-        np.testing.assert_allclose(weights[1].sum(axis=-1), 1., atol=1e-7)
-        np.testing.assert_allclose(weights[1, 1], .25)
+    def test_base_is_deviation_not_raw_entropy(self):
+        y, x = np.indices((384, 384))
+        pixels = np.repeat(((x + y) % 256).astype(np.uint8)[..., None], 3, -1)
+        view = vis.analyze_view(pixels, 18, (0, 0, 384, 384), "local")
+        expected, median, count = vis.global_grid_deviation(view["entropy"])
+        np.testing.assert_array_equal(view["scores"], expected)
+        np.testing.assert_array_equal(view["neighbor_median"], median)
+        self.assertFalse(np.allclose(view["scores"][0], view["entropy"]))
+        self.assertEqual(view["scores"].shape, (3, 18, 18))
 
 
-class DisplayTests(unittest.TestCase):
-    def test_plain_padding_remains_in_softmax_denominator(self):
-        g = vis.entropy_geometry(vis.ScoreGeometry.create((56, 1), (2, 4), 384, 14))
-        raw, valid = np.zeros((8, 4)), vis.visible_blocks(g)
-        raw[valid] = 2.
-        _, display, _ = vis.plain_score_display(np.zeros(36), raw, g, "softmax")
-        np.testing.assert_allclose(display[valid], vis.entropy_softmax(raw)[valid])
-        self.assertTrue(np.isnan(display[~valid]).all())
-        for i in range(8):
-            if valid[i].any():
-                self.assertLess(float(np.nansum(display[i])), 1.)
+class NormalizationTests(unittest.TestCase):
+    def test_whole_grid_softmax_not_per_row_crop_or_joined_window(self):
+        raw = np.zeros((3, 12, 12))
+        raw[0, 0, 0] = 3.
+        weights = vis.whole_grid_softmax(raw)
+        np.testing.assert_allclose(weights.sum(axis=(1, 2)), 1., atol=1e-7)
+        expected = vis.entropy_softmax(raw[0].ravel()).reshape(12, 12)
+        np.testing.assert_array_equal(weights[0], expected)
+        self.assertLess(float(weights[0, :4, :4].sum()), 1.)  # one old crop isn't a group
+        np.testing.assert_allclose(weights[1:], 1 / 144)
+        np.testing.assert_allclose(vis.whole_grid_softmax(np.zeros((3, 18, 18))), 1 / 324)
+        changed = raw.copy()
+        changed[1, 1, 1] = 5
+        np.testing.assert_array_equal(vis.whole_grid_softmax(changed)[0], weights[0])
 
-    def test_plain_minmax_shared_and_constant(self):
-        g = vis.entropy_geometry(vis.ScoreGeometry.create((56, 28), (2, 1), 384, 14))
-        base, tiles = np.linspace(1, 3, 36), np.array([[2., 3., 4., 5.], [1., 2., 3., 4.]])
-        b, t, spec = vis.plain_score_display(base, tiles, g, "minmax")
-        np.testing.assert_allclose(b, (base - 1) / 4)
-        np.testing.assert_allclose(t, (tiles - 1) / 4)
-        self.assertEqual(spec["shared_reference_nats"], (1., 5.))
-        b, t, _ = vis.plain_score_display(np.zeros(36), np.zeros((2, 4)), g, "minmax")
-        np.testing.assert_array_equal(b, np.full(36, .5))
-        np.testing.assert_array_equal(t, np.full((2, 4), .5))
+    def test_whole_grid_nan_support_and_invalids(self):
+        scores = np.full((3, 12, 12), np.nan)
+        scores[0, 0, :2] = [0., 1.]
+        weights = vis.whole_grid_softmax(scores)
+        np.testing.assert_allclose(weights[0, 0, :2], vis.entropy_softmax([0., 1.]))
+        self.assertTrue(np.isnan(weights[1:]).all())
+        for invalid in ([], [1, 2], [[-1.]], [[np.inf]], np.zeros((1, 1, 1, 1))):
+            with self.assertRaises(ValueError):
+                vis.whole_grid_softmax(invalid)
 
-    def test_local_minmax_separate_base_and_joint_windows(self):
-        base = np.linspace(1, 3, 36)
-        d = np.array([[[2., 3., 4., np.nan]], [[3., 4., 5., 6.]], [[1., 2., 3., 4.]]])
-        b, t, spec = vis.score_display(base, d, "minmax")
-        np.testing.assert_allclose(b, (base - 1) / 2)
-        np.testing.assert_allclose(t, (d - 1) / 5, atol=1e-7)
-        self.assertEqual(spec["anyres_reference_nats"], (1., 6.))
+    def test_display_minmax_raw_softmax_and_constant_unchanged(self):
+        b = vis.analyze_view(np.zeros((384, 384, 3), dtype=np.uint8), 18, (0, 0, 384, 384), "local")
+        a = vis.analyze_view(np.zeros((384, 384, 3), dtype=np.uint8), 12, (0, 0, 384, 384), "local")
+        views = {"base": b, "anyres": a}
+        for name, side in (("base", 18), ("anyres", 12)):
+            views[name]["scores"][:] = np.linspace(1, 5 if name == "base" else 3, 3 * side * side).reshape(3, side, side)
+            views[name]["softmax"] = vis.whole_grid_softmax(views[name]["scores"])
+        original = {k: v["scores"].copy() for k, v in views.items()}
+        vis.display_scores(views, "minmax", "local")
+        np.testing.assert_allclose(b["display"], (b["scores"] - 1) / 4, atol=1e-7)
+        np.testing.assert_allclose(a["display"], (a["scores"] - 1) / 2, atol=1e-7)
+        vis.display_scores(views, "raw", "local")
+        for k, v in views.items():
+            np.testing.assert_array_equal(v["display"], original[k])
+        setup = vis.display_scores(views, "softmax", "local")
+        for k, v in views.items():
+            np.testing.assert_array_equal(v["display"], v["softmax"])
+            np.testing.assert_array_equal(v["scores"], original[k])
+        self.assertNotEqual(setup["base"]["limits"], setup["anyres"]["limits"])
 
-    def test_plain_rendered_pixels_labels_and_separate_ranges(self):
+    def test_plain_skips_neighbors_and_keeps_padding_in_denominator(self):
+        pixels = np.zeros((384, 384, 3), dtype=np.uint8)
+        with patch.object(vis, "global_grid_deviation", side_effect=AssertionError("Plain computed neighbors")):
+            a = vis.analyze_view(pixels, 12, (0, 128, 384, 256), "plain")
+        b = vis.analyze_view(pixels, 18, (0, 0, 384, 384), "plain")
+        views = {"base": b, "anyres": a}
+        np.testing.assert_allclose(a["softmax"], 1 / 144)
+        vis.display_scores(views, "softmax", "plain")
+        self.assertLess(float(np.nansum(a["display"])), 1)
+        vis.display_scores(views, "minmax", "plain")
+        self.assertTrue(np.all(a["display"][np.isfinite(a["display"])] == .5))
+
+
+class RenderTests(unittest.TestCase):
+    def test_exactly_two_global_pngs_with_3_windows_and_correct_pixels(self):
         from matplotlib import colormaps
         from matplotlib.colors import Normalize
         from matplotlib.figure import Figure
-        source_g = vis.ScoreGeometry.create((56, 28), (2, 1), 384, 14)
-        g = vis.entropy_geometry(source_g)
-        image = Image.new("RGB", (56, 28), "gray")
-        base, _ = vis.prepare_entropy_views(image, source_g)
-        raw_b, raw_t = np.linspace(0, 3, 36), np.array([[0., 1., 3., 5.], [2., 1., 0., 3.]])
-        b, t, setup = vis.plain_score_display(raw_b, raw_t, g, "softmax")
+        image = Image.new("RGB", (384, 384), "gray")
+        views = {name: vis.analyze_view(image, side, (0, 0, 384, 384), "local")
+                 for name, side in (("base", 18), ("anyres", 12))}
+        setups = vis.display_scores(views, "softmax", "local")
+        calls = []
         def check(fig, path, **kwargs):
-            self.assertEqual(len(fig.axes), 6)
-            self.assertIn("6x6", fig.axes[1].get_title())
-            self.assertIn("2x2 per crop", fig.axes[3].get_title())
-            self.assertIn("same color does NOT imply", fig._supxlabel.get_text())
-            for axis, name, heat in ((1, "base", vis.base_score_map(b, g)), (3, "anyres", vis.stitch_score_map(t, g))):
-                actual = np.asarray(fig.axes[axis].images[1].get_array())
-                expected = colormaps[vis.COLORMAP](Normalize(*setup[name + "_limits"])(heat))
+            name = "base" if Path(path).name.startswith("base") else "anyres"
+            calls.append(Path(path).name)
+            self.assertEqual(len(fig.axes), 5)
+            self.assertEqual([len(a.images) for a in fig.axes[:4]], [1, 2, 2, 2])
+            for i, window in enumerate((3, 5, 7)):
+                self.assertIn(f"{window}x{window} neighborhood", fig.axes[i+1].get_title())
+                v = views[name]
+                heat = vis.global_grid_score_map(v["display"][i], v["x_edges"], v["y_edges"])
+                expected = colormaps[vis.COLORMAP](Normalize(*setups[name]["limits"])(heat))
+                actual = np.asarray(fig.axes[i+1].images[1].get_array())
                 np.testing.assert_allclose(actual[..., :3], expected[..., :3])
                 np.testing.assert_allclose(actual[..., 3], vis.OVERLAY_ALPHA)
+            self.assertIn("WHOLE grid", fig._supxlabel.get_text())
+            self.assertIn("Neighborhood entropy deviation", fig._suptitle.get_text())
         with tempfile.TemporaryDirectory() as tmp, patch.object(Figure, "savefig", check):
-            result = vis.draw_figures(image, base, raw_b, raw_t, g, tmp, "Synthetic", "softmax", "plain")
-        self.assertEqual(result["figures"], ["entropy_overview.png"])
+            files = vis.draw_overviews(image, image, views, setups, tmp, "Synthetic", "local")
+        self.assertEqual(files, list(vis.FIGURES))
+        self.assertEqual(calls, list(vis.FIGURES))
 
 
 class RunTests(unittest.TestCase):
-    def test_plain_all_scales_no_model_no_neighbors_sources_untouched(self):
-        for scale in ("softmax", "raw", "minmax", "sample", "fixed", "layer"):
-            with self.subTest(scale=scale), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                results, folder, image_path, source_g = fixture(root)
-                hashes = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob("*") if p.is_file()}
-                original_import = builtins.__import__
-                def forbid_model(name, *args, **kwargs):
-                    if name.split(".")[0] in {"torch", "transformers", "accelerate", "llava"}:
-                        raise AssertionError("Unexpected model import: " + name)
-                    return original_import(name, *args, **kwargs)
-                with patch("builtins.__import__", side_effect=forbid_model), patch.object(
-                        vis, "local_entropy_deviation", side_effect=AssertionError("plain computed neighbors")):
-                    output = vis.run(results, color_scale=scale)
-                self.assertEqual(output.name, "results_vflowopt_plain_" + scale)
-                target = output / folder.name
-                self.assertEqual({p.name for p in target.iterdir()},
-                                 {"entropy_overview.png", "entropy.npz", "entropy_patch_means.csv", "metadata.json"})
-                with Image.open(target / "entropy_overview.png") as png:
-                    self.assertEqual(png.size, (2400, 750))
-                manifest = json.loads((output / "run.json").read_text(encoding="utf-8"))
-                saved = json.loads((target / "metadata.json").read_text(encoding="utf-8"))
-                self.assertTrue(manifest["complete"])
-                self.assertFalse(manifest["model_loaded"])
-                self.assertFalse(manifest["source_scores_read"])
-                self.assertEqual(saved["entropy_mode"], "plain")
-                self.assertEqual(saved["geometry"]["patch_size"], 14)
-                self.assertEqual(saved["entropy_geometry"]["patch_size"], 192)
-                self.assertEqual(saved["stitched_anyres_grid_shape"], [2, 4])
-                with Image.open(image_path) as source:
-                    base, tiles = vis.prepare_entropy_views(source.convert("RGB"), source_g)
-                with np.load(target / "entropy.npz", allow_pickle=False) as a:
-                    np.testing.assert_array_equal(a["base_entropy"], vis.patch_entropy(base, 64))
-                    np.testing.assert_array_equal(a["tile_entropy"], [vis.patch_entropy(tile, 192) for tile in tiles])
-                    self.assertEqual(a["base_entropy"].shape, (36,))
-                    self.assertEqual(a["tile_entropy"].shape, (2, 4))
-                    self.assertEqual(str(a["entropy_mode"]), "plain")
-                    self.assertNotIn("tile_deviation", a.files)
-                    np.testing.assert_allclose(a["base_softmax"].sum(), 1., atol=1e-7)
-                    np.testing.assert_allclose(a["tile_entropy_softmax"].sum(axis=-1), 1., atol=1e-7)
-                with (target / "entropy_patch_means.csv").open(encoding="utf-8-sig", newline="") as f:
-                    rows = list(csv.DictReader(f))
-                self.assertEqual([int(r["total_blocks"]) for r in rows], [36, 4, 4])
-                np.testing.assert_allclose([float(r["mean_softmax_weight"]) for r in rows], [1 / 36, .25, .25])
-                for p, digest in hashes.items():
-                    self.assertEqual(hashlib.sha256(p.read_bytes()).hexdigest(), digest)
-                with self.assertRaises(FileExistsError):
-                    vis.run(results, color_scale=scale)
+    def test_local_and_plain_all_display_modes_no_model_and_sources_untouched(self):
+        for mode in ("local", "plain"):
+            for scale in ("softmax", "raw", "minmax", "sample", "fixed", "layer"):
+                with self.subTest(mode=mode, scale=scale), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    results, folder, image_path, geometry = fixture(root, (56, 56), (3, 3))
+                    hashes = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob("*") if p.is_file()}
+                    original_import = builtins.__import__
+                    def forbid_model(name, *args, **kwargs):
+                        if name.split(".")[0] in {"torch", "transformers", "accelerate", "llava"}:
+                            raise AssertionError("Unexpected model import: " + name)
+                        return original_import(name, *args, **kwargs)
+                    with patch("builtins.__import__", side_effect=forbid_model):
+                        output = vis.run(results, color_scale=scale, entropy_mode=mode)
+                    target = output / folder.name
+                    self.assertEqual({p.name for p in target.iterdir()},
+                                     set(vis.FIGURES) | {"entropy.npz", "entropy_patch_means.csv", "metadata.json"})
+                    for file in vis.FIGURES:
+                        with Image.open(target / file) as png:
+                            self.assertEqual(png.size, (2400 if mode == "local" else 1350, 750))
+                    saved = json.loads((target / "metadata.json").read_text(encoding="utf-8"))
+                    manifest = json.loads((output / "run.json").read_text(encoding="utf-8"))
+                    self.assertEqual(saved["geometry"]["patch_size"], 14)
+                    self.assertEqual(saved["analysis_grids"]["base"]["shape"], [18, 18])
+                    self.assertEqual(saved["analysis_grids"]["anyres"]["shape"], [12, 12])
+                    self.assertTrue(manifest["complete"])
+                    self.assertEqual(manifest["figures_per_sample"], list(vis.FIGURES))
+                    self.assertFalse(manifest["source_scores_read"])
+                    self.assertFalse(manifest["model_loaded"])
+                    with np.load(target / "entropy.npz", allow_pickle=False) as a:
+                        n = 3 if mode == "local" else 1
+                        self.assertEqual(a["base_entropy"].shape, (18, 18))
+                        self.assertEqual(a["anyres_entropy"].shape, (12, 12))
+                        self.assertEqual(a["base_scores"].shape, (n, 18, 18))
+                        self.assertEqual(a["anyres_scores"].shape, (n, 12, 12))
+                        np.testing.assert_allclose(a["base_softmax"].sum(axis=(1, 2)), 1., atol=2e-7)
+                        np.testing.assert_allclose(a["anyres_softmax"].sum(axis=(1, 2)), 1., atol=2e-7)
+                        if mode == "local":
+                            # Deviation is computed before the median is rounded to FP32
+                            # for storage; allow that half-ULP rounding near zero.
+                            np.testing.assert_allclose(a["base_deviation"], np.abs(a["base_entropy"] - a["base_neighbor_median"]), atol=3e-7)
+                            np.testing.assert_allclose(a["anyres_deviation"], np.abs(a["anyres_entropy"] - a["anyres_neighbor_median"]), atol=3e-7)
+                        else:
+                            self.assertNotIn("base_deviation", a.files)
+                    with (target / "entropy_patch_means.csv").open(encoding="utf-8-sig", newline="") as f:
+                        rows = list(csv.DictReader(f))
+                    self.assertEqual(len(rows), 6 if mode == "local" else 2)
+                    for row in rows:
+                        self.assertAlmostEqual(float(row["softmax_weight_sum"]), 1., places=6)
+                        self.assertEqual(int(row["total_blocks"]), 324 if row["view"] == "base" else 144)
+                    for path, digest in hashes.items():
+                        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+                    with self.assertRaises(FileExistsError):
+                        vis.run(results, color_scale=scale, entropy_mode=mode)
 
-    def test_local_three_scales_six_figures_and_9crop_data(self):
-        for scale in ("softmax", "minmax", "raw"):
-            with self.subTest(scale=scale), tempfile.TemporaryDirectory() as tmp:
-                results, folder, _, _ = fixture(Path(tmp), (56, 56), (3, 3))
-                output = vis.run(results, color_scale=scale, entropy_mode="local")
-                target = output / folder.name
-                self.assertEqual({p.name for p in target.glob("*.png")}, {
-                    "entropy_overview.png", "entropy_raw_overview.png", "base_entropy_6x6.png",
-                    "anyres_deviation_3x3.png", "anyres_deviation_5x5.png", "anyres_deviation_7x7.png"})
-                with np.load(target / "entropy.npz", allow_pickle=False) as a:
-                    self.assertEqual(a["tile_entropy"].shape, (9, 4))
-                    self.assertEqual(a["tile_deviation"].shape, (3, 9, 4))
-                    np.testing.assert_allclose(a["tile_deviation_softmax"].sum(axis=-1), 1., atol=1e-7)
-                    self.assertEqual(int(a["patch_size"]), 192)
-                    self.assertEqual(int(a["source_model_patch_size"]), 14)
-                saved = json.loads((target / "metadata.json").read_text(encoding="utf-8"))
-                self.assertEqual(saved["stitched_anyres_grid_shape"], [6, 6])
-                self.assertEqual(saved["entropy_mode"], "local")
-                with (target / "entropy_patch_means.csv").open(encoding="utf-8-sig", newline="") as f:
-                    rows = list(csv.DictReader(f))
-                self.assertEqual(len(rows), 28)
-                self.assertEqual({r["total_blocks"] for r in rows[1:]}, {"4"})
+    def test_all_undefined_anyres_still_renders_and_reports_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            results, folder, _, _ = fixture(Path(tmp), (56, 1), (2, 4))
+            output = vis.run(results)
+            target = output / folder.name
+            with np.load(target / "entropy.npz", allow_pickle=False) as a:
+                self.assertTrue(np.isnan(a["anyres_scores"]).all())
+                self.assertTrue(np.isnan(a["anyres_softmax"]).all())
+                self.assertTrue(np.isfinite(a["base_scores"]).all())
+            saved = json.loads((target / "metadata.json").read_text(encoding="utf-8"))
+            self.assertIsNone(saved["display"]["anyres"]["observed_range"])
+            self.assertEqual(saved["display"]["anyres"]["defined_counts"], [0, 0, 0])
 
-    def test_cli_and_invalid_options_before_writes(self):
+    def test_cli_defaults_local_modes_version_and_fail_before_writing(self):
         parser = vis.build_parser()
-        self.assertEqual(parser.parse_args([]).entropy_mode, "plain")
-        self.assertEqual(parser.parse_args(["--entropy-mode", "local"]).entropy_mode, "local")
+        self.assertEqual(parser.parse_args([]).entropy_mode, "local")
+        self.assertEqual(parser.parse_args(["--entropy-mode", "plain"]).entropy_mode, "plain")
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "new"
             for kwargs in ({"entropy_mode": "wrong"}, {"color_scale": "wrong"}, {"limit": 0}):
@@ -290,11 +344,8 @@ class RunTests(unittest.TestCase):
                 self.assertFalse(target.exists())
         version = subprocess.run([sys.executable, str(Path(vis.__file__)), "--version"],
                                  capture_output=True, text=True, check=True)
-        self.assertIn("2.1-plain-local-coarse-grids", version.stdout)
-
-    def test_main_passes_mode_and_default_all_samples(self):
-        with patch.object(sys, "argv", ["runVFlowOpt.py", "--results-dir", "source", "--entropy-mode", "local"]), \
-                patch.object(vis, "run") as call:
+        self.assertIn("3.0-global12-base18-two-overviews", version.stdout)
+        with patch.object(sys, "argv", ["runVFlowOpt.py", "--results-dir", "source"]), patch.object(vis, "run") as call:
             vis.main()
         self.assertEqual(call.call_args.args[-1], "local")
         self.assertIsNone(call.call_args.args[-2])

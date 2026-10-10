@@ -1,4 +1,4 @@
-"""Visualize SigLIP/MLP feature scores without pruning or language generation."""
+"""Visualize SigLIP/MLP scores: per-token L2 before view means; no pruning or LLM."""
 
 import argparse
 from pathlib import Path
@@ -19,9 +19,13 @@ def build_parser():
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--limit", type=positive_int, default=None,
                         help="Optional first N records; default: all records, no fixed limit")
-    parser.add_argument("--color-scale", choices=("sample", "fixed"), default="sample",
-                        help="sample: one shared range for all five layers and both scores; "
-                             "fixed: [-1, 1], also comparable across images")
+    parser.add_argument("--display-mode", choices=("tokens", "patch-means"), default="tokens",
+                        help="tokens (default): original token maps; patch-means: one 2x4 Global "
+                             "tile-mean figure with layers 7/14/21/26 and first 2/3/4 layer means")
+    parser.add_argument("--color-scale", choices=("sample", "fixed"), default=None,
+                        help="Default: sample for tokens, fixed for patch-means. "
+                             "fixed: [-1,1] token scores or [0,1] scaled patch means; "
+                             "sample: one shared observed range within each image")
     return parser
 
 

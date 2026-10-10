@@ -17,7 +17,8 @@ from llava.model.multimodal_encoder.siglip_encoder import (
     SigLipVisionConfig, SigLipVisionModel, SigLipImageProcessor)
 from llava.mm_utils import process_anyres_image, resize_and_pad_image
 from llava_pruning.score_visualization import (
-    LAYERS, STAGES, ScoreGeometry, score_tokens, capture_scores, prepare_views,
+    LAYERS, STAGES, FEATURE_NORMALIZATION, _unit_token_features,
+    ScoreGeometry, score_tokens, capture_scores, prepare_views,
     tile_score_map, stitch_score_map, color_limits, load_score_samples,
     save_sample, draw_figures, run_score_visualization)
 from visualize_scores import build_parser
@@ -63,6 +64,50 @@ class TinyProbeModel(torch.nn.Module):
 
 
 class FeatureScoreTests(unittest.TestCase):
+    def test_unit_vectors_along_channels_including_extreme_magnitudes(self):
+        features = torch.tensor([[[3., 4., 0.], [0., 0., 0.]],
+                                 [[1e30, -1e30, 1e30], [1e-30, 1e-30, 0.]]])
+        before = features.clone()
+        actual = _unit_token_features(features)
+        torch.testing.assert_close(actual.norm(dim=-1), torch.tensor([[1., 0.], [1., 1.]]))
+        torch.testing.assert_close(actual[0, 0], torch.tensor([.6, .8, 0.]))
+        self.assertTrue(torch.equal(features, before))
+        self.assertTrue(torch.isfinite(actual).all())
+
+    def test_normalize_before_mean_not_after_mean(self):
+        # Unequal lengths must not make the first Base token dominate the mean.
+        features = torch.tensor([[[10., 0.], [0., 1.]], [[1., 0.], [0., 5.]]])
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                inputs = features.to(dtype).detach().requires_grad_()
+                before = inputs.detach().clone()
+                actual = score_tokens(inputs)
+                for kind in ("global", "local"):
+                    np.testing.assert_allclose(actual[kind], [[-2 ** -0.5] * 2], atol=1e-6)
+                self.assertTrue(torch.equal(inputs, before))
+                self.assertEqual(inputs.dtype, dtype)
+                self.assertIsNone(inputs.grad)
+        old_reference = features[0].mean(0)
+        old_global = -torch.nn.functional.cosine_similarity(features[1], old_reference[None], dim=-1)
+        self.assertFalse(np.allclose(actual["global"][0], old_global.numpy()))
+
+    def test_independent_positive_token_rescaling_does_not_change_scores(self):
+        generator = torch.Generator().manual_seed(36)
+        features = torch.randn(4, 6, 8, generator=generator)
+        multipliers = torch.logspace(-20, 20, 24).reshape(4, 6, 1)
+        before = features.clone()
+        expected = score_tokens(features)
+        actual = score_tokens(features * multipliers)
+        for kind in expected:
+            np.testing.assert_allclose(actual[kind], expected[kind], atol=2e-6)
+        self.assertTrue(torch.equal(features, before))
+
+    def test_opposite_unit_tokens_cancel_even_with_unequal_original_lengths(self):
+        actual = score_tokens(torch.tensor([[[2., 0.], [-1., 0.]],
+                                            [[0., 3.], [0., -1.]]]))
+        self.assertTrue(np.isnan(actual["global"]).all())
+        self.assertTrue(np.isnan(actual["local"]).all())
+
     def test_exact_global_and_local_negative_cosine(self):
         features = torch.tensor([[[1., 0.], [1., 0.]],
                                  [[1., 0.], [0., 1.]],
@@ -203,7 +248,8 @@ class ScoreOutputTests(unittest.TestCase):
         args = parser.parse_args(["--model-path", "m", "--input-json", "i", "--data-root", "d",
                                   "--output-dir", "o"])
         self.assertIsNone(args.limit)
-        self.assertEqual(args.color_scale, "sample")
+        self.assertIsNone(args.color_scale)  # resolved from display_mode at runtime
+        self.assertEqual(args.display_mode, "tokens")
         self.assertNotIn("method", vars(args))
         self.assertNotIn("prompt_version", vars(args))
 
@@ -241,8 +287,10 @@ class ScoreOutputTests(unittest.TestCase):
             with np.load(folder / "scores.npz", allow_pickle=False) as saved:
                 np.testing.assert_array_equal(saved["global_scores"], scores["global"])
                 self.assertEqual(tuple(saved["stages"]), STAGES)
+                self.assertEqual(saved["feature_normalization"].item(), FEATURE_NORMALIZATION)
             metadata = json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(metadata["score_shape"], [5, 4, 4])
+            self.assertEqual(metadata["feature_normalization"], FEATURE_NORMALIZATION)
             for name in metadata["figures"]:
                 with Image.open(folder / name) as png:
                     self.assertGreater(png.width, 1000)
@@ -307,6 +355,8 @@ class ScoreOutputTests(unittest.TestCase):
                 self.assertFalse(saved["llm_generation"])
                 self.assertEqual(saved["colormap"], "jet")
                 self.assertEqual(saved["overlay_alpha"], 0.70)
+                self.assertEqual(saved["feature_normalization"], FEATURE_NORMALIZATION)
+                self.assertIn("unit_tile_token", saved["global_score"])
                 self.assertNotIn("attention_source", saved["loader_config"])
                 with np.load(output / "000001_00001" / "scores.npz", allow_pickle=False) as arrays:
                     self.assertEqual(arrays["global_scores"].shape, (5, 2, 4))
