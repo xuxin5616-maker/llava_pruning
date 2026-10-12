@@ -424,6 +424,70 @@ For server deployment, copy the **new `runVFlowOpt_unit.py` and updated
 `feature_residual_math.py` and visualization helpers. The capture helper now
 accepts an optional `score_fn`; existing calls still use raw-vector residuals.
 
+### Base quadrant reference scores (`run_base_quadrant_scores.py`)
+
+This independent probe uses the **full Base image**, not the center-75% crop.
+At layers 7/14/21/26, normalize every token along channels, group existing Base
+tokens into four spatial quadrants and average within each quadrant. Do not
+re-encode four images or renormalize the means. **Both Base and AnyRes tokens
+compare against the corresponding BASE quadrant mean**, not AnyRes means:
+
+- Negative cosine: `-cos(unit_token, Base_quadrant_mean)` (not `1 - cos`).
+- L2 residual: `||unit_token - Base_quadrant_mean||_2` (no local windows).
+
+Base means include their member tokens, including the queried Base token; this
+is not leave-one-out scoring. Quadrants use token centers in normalized original
+image coordinates; midline ties go right/bottom. The native 27x27 grid cannot be
+quartered equally: with 384/14 inputs its counts are 196/182/182/169 in
+top-left/top-right/bottom-left/bottom-right order. AnyRes centers are mapped back
+through the actual resize and padding, so even tokens in one crop can use
+different quadrant references. Partial/pure padding patches are excluded.
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python run_base_quadrant_scores.py \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --results-dir outputs/feature_scores_02 \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --color-scale raw \
+  --output-dir outputs/base_quadrant_scores_01
+```
+
+Use `--input-json /path/to/questions.jsonl` instead of `--results-dir` for fresh
+records. All samples run by default (`--limit N` is optional). Cached paths and
+geometry can be reused, but cached scalar scores are insufficient: GPU SigLIP
+feature extraction runs again. No projector/LLM forward runs, although the
+existing loader still loads LLM weights. Existing scripts remain unchanged.
+
+Each sample has **four layer PNGs**, each with two rows (Base/AnyRes) and three
+columns (reference, negative cosine, L2). Native token cells are the heatmap
+unit; they are not averaged into coarse colored tiles. White lines mark actual
+AnyRes regions and yellow dashed lines mark the four reference quadrants.
+Nine regions are shown for a 3x3 crop grid; other actual grids are preserved.
+Both views annotate their **own signed raw score sum** per corresponding region.
+Base tokens are assigned once to regions by their centers. No padding or NaN
+scores enter sums; a region without finite scores shows `NA`, not zero.
+Sums depend on the number of tokens, so Base and AnyRes totals are not directly
+resolution-invariant. `region_sums.csv` provides sums, means and valid/finite
+counts for each layer, metric, view and region.
+
+`--color-scale raw` uses fixed ranges [-1,1] for negative cosine and [0,2] for
+unit-token residuals, shared across views/layers/images. Optional `minmax`
+shares one display transform across Base+AnyRes per layer and metric. It never
+changes numeric labels or saved raw scores. JET is retained for continuity with
+the existing figures; colors are not perceptually uniform and are not the only
+encoding (numeric annotations, colorbars and source CSV accompany them).
+
+The output root and **every sample folder contain `config.json`**, recording
+paths, scoring formulas, normalization, spatial assignment, padding exclusions,
+color scales and inference settings. Sample configs also record actual geometry,
+quadrant counts, feature shapes and display ranges. `quadrant_scores.npz` keeps
+the native raw score arrays and spatial IDs/masks; root `run.json` tracks
+completion/errors. Use a new/empty output folder.
+
+Deploy the new `run_base_quadrant_scores.py` and `base_quadrant_math.py` into the
+existing project, with the unit-residual variant and its updated capture helper
+from the previous update available. Verify with `python run_base_quadrant_scores.py --version`.
+
 ### Both Base and AnyRes at 12x12 AND 18x18 (`run_entropy_18_12.py`)
 
 This standalone **CPU-only** script is separate from the feature-residual
