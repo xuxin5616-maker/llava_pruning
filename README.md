@@ -385,6 +385,45 @@ pixel-entropy script is preserved as `run_pixel_entropy.py`; run its `--help`
 for its legacy CPU-only options. Old `--entropy-mode` / Softmax options do not
 apply to the new feature-residual entry point.
 
+### Unit-token residual variant (`runVFlowOpt_unit.py`)
+
+Version `3.2-unit-token-feature-residual` preserves the raw-vector entry point
+above. This separate variant first normalizes **each token along channels**:
+`u = f / max(||f||_2, 1e-12)`, then computes
+`||u_center - mean(u_neighbors)||_2`. The center is excluded and the neighbor
+mean is **not** renormalized. `--metric cosine` instead computes
+`1 - cosine(u_center, mean(u_neighbors))` using the same normalized-token mean.
+Zero vectors stay zero; cosine with a zero center or mean is undefined (NaN).
+This normalization applies only to detached scoring features, never the model
+forward. SigLIP layers, native token grids, masks, windows and output layout
+are the same as the raw residual probe. No entropy or Softmax is applied.
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python runVFlowOpt_unit.py \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --results-dir outputs/feature_scores_02 \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --metric l2 \
+  --color-scale raw \
+  --output-dir outputs/feature_residual_unit_01
+```
+
+Alternatively use `--input-json /path/to/questions.jsonl` instead of
+`--results-dir`; keep `--data-root` and `--output-dir`. All samples run by
+default; `--limit N` is optional. The default output for cached-metadata input
+is the sibling `<results>_feature_residual_unit`. Use a new/empty directory.
+`--color-scale raw` means **no rescaling of the final residual score**; it does
+not disable token normalization. `minmax` changes only the display range.
+
+The old NPZ scores are not raw features, so this needs a GPU SigLIP pass again.
+There is no projector or LLM forward; the existing loader still loads LLM
+weights. Each sample saves four layer PNGs, `residuals.npz`, `crop_summary.csv`,
+and `metadata.json`; the root `run.json` records the unit-token definition.
+For server deployment, copy the **new `runVFlowOpt_unit.py` and updated
+`feature_residual_capture.py`** into the existing project; keep its
+`feature_residual_math.py` and visualization helpers. The capture helper now
+accepts an optional `score_fn`; existing calls still use raw-vector residuals.
+
 ### Both Base and AnyRes at 12x12 AND 18x18 (`run_entropy_18_12.py`)
 
 This standalone **CPU-only** script is separate from the feature-residual

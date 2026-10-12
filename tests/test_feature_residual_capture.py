@@ -79,6 +79,55 @@ class CaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "26-block"):
             capture_stage_scores(tower, pixels, geometry)
 
+    def test_custom_unit_scorer_matches_states_and_preserves_forward(self):
+        from runVFlowOpt_unit import score_unit_features
+
+        torch.manual_seed(23)
+        tower = TinyTower().eval()
+        geometry = ScoreGeometry.create((56, 28), (2, 1), 28, 14)
+        pixels = torch.randn(3, 3, 28, 28)
+        with torch.inference_mode():
+            before = tower.vision_tower(pixels, output_hidden_states=True)
+        vision = tower.vision_tower.vision_model
+        with patch.object(vision.post_layernorm, "forward", side_effect=AssertionError("postnorm ran")), \
+             patch.object(vision.head, "forward", side_effect=AssertionError("head ran")):
+            actual, shapes = capture_stage_scores(tower, pixels, geometry,
+                                                  score_fn=score_unit_features)
+        for si, layer in enumerate(LAYERS):
+            expected = score_unit_features(before.hidden_states[layer].numpy(), geometry)
+            for key in expected:
+                np.testing.assert_array_equal(actual[key][si], expected[key])
+        with torch.inference_mode():
+            after = tower.vision_tower(pixels, output_hidden_states=True)
+        for left, right in zip(before.hidden_states, after.hidden_states):
+            self.assertTrue(torch.equal(left, right))
+        self.assertEqual(set(shapes), set(STAGES))
+        self.assertTrue(all(not module._forward_hooks for module in tower.modules()))
+
+    def test_custom_scorer_cannot_mutate_live_cpu_features_and_cleans_up(self):
+        tower = TinyTower().eval()
+        geometry = ScoreGeometry.create((28, 28), (1, 1), 28, 14)
+        pixels = torch.randn(2, 3, 28, 28)
+        with torch.inference_mode():
+            states = tower.vision_tower(pixels, output_hidden_states=True).hidden_states
+        seen = []
+
+        def scorer(features, geometry):
+            seen.append(features.copy())
+            result = stage_residuals(features, geometry)
+            features[:] = 0  # Must not modify the tensor used by the next block.
+            return result
+
+        capture_stage_scores(tower, pixels, geometry, score_fn=scorer)
+        for actual, layer in zip(seen, LAYERS):
+            np.testing.assert_array_equal(actual, states[layer].numpy())
+        with self.assertRaisesRegex(TypeError, "callable"):
+            capture_stage_scores(tower, pixels, geometry, score_fn=123)
+        with self.assertRaisesRegex(ValueError, "custom failure"):
+            capture_stage_scores(tower, pixels, geometry,
+                                 score_fn=unittest.mock.Mock(side_effect=ValueError("custom failure")))
+        self.assertTrue(all(not module._forward_hooks for module in tower.modules()))
+
 
 if __name__ == "__main__":
     unittest.main()

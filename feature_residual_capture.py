@@ -9,14 +9,20 @@ LAYERS = (7, 14, 21, 26)
 STAGES = tuple(f"siglip_{layer}" for layer in LAYERS)
 
 
-def capture_stage_scores(tower, pixels, geometry):
+def capture_stage_scores(tower, pixels, geometry, *, score_fn=None):
     """Capture 1-based block outputs before post_layernorm without changing them.
 
     The existing tower's weights, dtype and attention implementation are used
     unchanged. Only embeddings and the encoder execute. Hooks immediately
     reduce one layer on CPU and retain scalar scores, not full GPU features.
+    An optional score_fn(features, geometry) can score detached CPU features;
+    omitting it retains the original raw-vector residual calculation.
     """
     import torch
+
+    scorer = stage_residuals if score_fn is None else score_fn
+    if not callable(scorer):
+        raise TypeError("score_fn must be callable")
 
     if any(module.training for module in tower.modules()):
         raise ValueError("SigLIP tower must be in eval mode")
@@ -39,7 +45,9 @@ def capture_stage_scores(tower, pixels, geometry):
             # FP16/BF16 -> FP32 is exact. Preserve FP64 if a test tower uses it.
             cpu_dtype = torch.float64 if features.dtype == torch.float64 else torch.float32
             raw = features.detach().to(device="cpu", dtype=cpu_dtype).numpy()
-            captured[stage] = stage_residuals(raw, geometry)
+            # Own the CPU buffer before giving it to a custom scorer. On CPU,
+            # detach().to(...).numpy() can still alias the live forward tensor.
+            captured[stage] = scorer(raw.copy() if score_fn is not None else raw, geometry)
             # Return None: never replace the original forward output.
         return capture
 
