@@ -385,6 +385,75 @@ pixel-entropy script is preserved as `run_pixel_entropy.py`; run its `--help`
 for its legacy CPU-only options. Old `--entropy-mode` / Softmax options do not
 apply to the new feature-residual entry point.
 
+### Both Base and AnyRes at 12x12 AND 18x18 (`run_entropy_18_12.py`)
+
+This standalone **CPU-only** script is separate from the feature-residual
+`runVFlowOpt.py`; neither it nor the old `run_pixel_entropy.py` is changed.
+Copy just `run_entropy_18_12.py` into the server project. It needs NumPy,
+Pillow and Matplotlib, but no Torch, GPU, checkpoint or project-module imports.
+Version `2.0-both-views-grids12-18-neighborhood-softmax` computes **four groups**:
+Base12, Base18, AnyRes12 and AnyRes18. The script name is kept for compatibility;
+it no longer assigns only 18x18 to Base and only 12x12 to AnyRes.
+
+```bash
+python run_entropy_18_12.py \
+  --results-dir outputs/feature_scores_02 \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --output-dir outputs/entropy_both_12_18_01
+```
+
+The input is the **previous feature-score results**, containing per-sample
+`metadata.json` with source image paths and saved AnyRes geometry. It is not
+`summary.csv` or the question JSON. Original images must remain accessible;
+`--data-root` relocates them using the original `run.json` dataset root.
+No NPZ contents are read or renamed, including files with a `.log` suffix.
+All samples are processed by default; `--limit N` is optional. Top-of-file
+`RESULTS_DIR`, `OUTPUT_DIR`, and `DATA_ROOT` can be edited instead of passing
+arguments. Use a new/empty output directory separate from the source tree.
+
+Exact calculation:
+
+- Base: independently calculate **12x12 = 144 blocks** AND **18x18 = 324 blocks**
+  across its unchanged 384x384 resized image. Edges are `floor(i * 384 / side)`:
+  32 pixels for the 12-grid, and 21/22 pixels for the 18-grid, with no dropped
+  border. These are analysis blocks, not model tokens.
+- AnyRes: independently calculate **12x12 = 144 blocks TOTAL** AND
+  **18x18 = 324 blocks TOTAL** across the entire saved resize-and-pad mosaic,
+  not per crop. Neighborhoods can cross encoder crop boundaries.
+  The map is unpadded when overlaid onto the original image. Full or partial
+  padding cells are excluded, so fewer than 144/324 cells may be visible/defined.
+- Recompute each cell's grayscale histogram (`floor((R+G+B)/3)`, 256 bins),
+  then `H = -sum(p * ln(p))`. This is pixel entropy, not cross-entropy.
+- Recompute each resolution's histograms from pixels, never interpolate or
+  average one grid's entropy/Softmax map to obtain the other.
+- For **both** views, **both** grid sizes and each **3x3, 5x5, 7x7** window, compute
+  `D = abs(H_center - median(valid neighbor H))`, excluding the center.
+  Edges use available neighbors only. No valid neighbors gives NaN/gray.
+- Compute `softmax(D / ln(2))` (bit-valued entropy deviation, temperature 1)
+  over the **whole Base** and **whole AnyRes** independently for **each grid
+  size and each window**. The four groups are never joined in a Softmax.
+  Each nonempty group sums to 1; AnyRes crops are not separate Softmax groups.
+  No min-max score transformation is applied.
+
+Each sample folder contains exactly **two files**:
+
+- `base_entropy_overview.png`: Base's 12x12 row + 18x18 row.
+- `anyres_entropy_overview.png`: AnyRes's 12x12 row + 18x18 row.
+
+Each row contains the reference image and its 3x3/5x5/7x7 neighborhood maps.
+
+JET overlays retain alpha 0.70, without crop IDs or extra per-window images.
+The three windows within one **row** share a colorbar; different grid-size rows
+and Base/AnyRes figures use separate actual-weight color ranges, so equal colors
+across rows/figures need not mean equal weights. These weights are **not defect
+probabilities**. In particular, uniform weights are 1/144 versus 1/324 when all
+cells are defined, not evidence of a larger anomaly in the coarser grid.
+Numeric arrays, geometry and calculation details are embedded in PNG text
+metadata under `EntropyAnalysis` (schema 2, `grids["12"]` / `grids["18"]`, readable
+via Pillow's `image.info`), avoiding
+extra per-sample NPZ/CSV/JSON files. A small root `run.json` records configuration
+and completion status. Old data and figures are never overwritten.
+
 ### Experimental mode: anyres without Base (`ex` branch)
 
 Use `--roi-mode anyres_only` to remove the global Base view while retaining the **same high-resolution tile preprocessing and packing rules as `anyres_max_9`**. Existing modes are unchanged. Base is neither resized/preprocessed nor passed through the vision encoder; every encoded view is an anyres tile, including the single-tile case. Masks/bboxes do not select crops in this mode (normal JSON/path validation still applies).
