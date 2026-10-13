@@ -488,6 +488,77 @@ Deploy the new `run_base_quadrant_scores.py` and `base_quadrant_math.py` into th
 existing project, with the unit-residual variant and its updated capture helper
 from the previous update available. Verify with `python run_base_quadrant_scores.py --version`.
 
+### Center-weighted Base reference (`run_base_center_weighted_scores.py`)
+
+This independent entry point integrates the supplied center-weighted scorer;
+the quadrant, local-residual, entropy and pruning entry points are unchanged.
+It reuses `feature_residual_capture.py` to observe SigLIP blocks 7/14/21/26
+before final post-layernorm, without changing model weights, dtype or attention.
+Only vision embeddings and the encoder execute; neither projector nor LLM
+forward runs. The existing backend still **loads the full checkpoint**, so a
+GPU and its normal model-loading memory are required.
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python run_base_center_weighted_scores.py \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --results-dir outputs/feature_scores_02 \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --color-scale raw \
+  --output-dir outputs/base_center_weighted_scores_01
+```
+
+The results directory supplies image paths and AnyRes geometry only. Old scalar
+scores cannot reconstruct this reference: vision features are recomputed.
+No cached NPZ is read, overwritten or renamed (including `.npz.log` files).
+Alternatively use `--input-json /path/to/questions.jsonl --data-root /path/to/data`
+instead of `--results-dir`. All selected images run by default; `--limit N` is
+optional. Relative paths resolve against the project directory. Output must
+be a new/empty directory separate from the source results.
+
+Each layer independently unit-normalizes every token across its channels, then
+constructs **one shared Base reference**, not four quadrant references:
+
+```text
+r = 0.80 * mean(unit Base tokens in the central 50%-width x 50%-height rectangle)
+  + 0.20 * mean(unit Base tokens in the central 75% rectangle, excluding the inner one)
+```
+
+Fractions describe width and height, not area. With the actual 384/14 token
+centers, the inner region has 196 tokens and the ring has 245. Each group is
+averaged before weighting; token counts do not change the 80/20 group weights.
+Tokens outside the outer rectangle do not contribute to the reference but are
+still scored. Base and AnyRes both compare each token with this same reference.
+The primary score is positive cosine; negative cosine and L2 are also saved.
+L2 uses the weighted reference **without renormalizing it**; cosine divides by
+its norm as usual. Zero/tiny token cosine is NaN, and a zero/tiny reference
+raises an error. Partially/fully padded AnyRes tokens are excluded. These are
+feature similarity/distance scores, not attention or defect probabilities.
+
+Each sample saves four JET overlay figures, `siglip_7_center_weighted.png`,
+`siglip_14_center_weighted.png`, `siglip_21_center_weighted.png` and
+`siglip_26_center_weighted.png`. Each figure has a Base row and an AnyRes row,
+with the reference image, positive cosine, negative cosine and L2 columns.
+Yellow/cyan rectangles mark the inner/outer reference regions; white region
+labels on heatmaps report finite score **means**, not sums. Gray indicates
+padding, uncovered pixels or undefined cosine. GT is shown; there is no LLM
+prediction. Also saved: `center_scores.npz` (raw arrays and references),
+`region_summary.csv` (means, sums and counts), `metadata.json`, and root
+`run.json` (settings/progress). The NPZ's compatibility `*_foreground_score`
+fields are simply `(cosine + 1) / 2`, **not** foreground probabilities.
+
+`--color-scale raw` is an alias of `fixed`: cosine uses [-1, 1], L2 uses [0, 2],
+consistently across samples and layers. The supplied script's default `sample`
+uses each sample/layer/metric's joint Base+AnyRes minimum/maximum as colorbar
+limits. Neither option changes the scores, applies Softmax, nor disables
+token L2 normalization. With `sample`, colors across images/layers are not
+absolute comparisons. All reference constants and default paths remain at
+the top of the new script for editing.
+
+Copy the new script into the existing server project, keeping the current
+`feature_residual_capture.py` and visualization dependencies from the quadrant
+version. Check with `python run_base_center_weighted_scores.py --version`.
+Synthetic CPU math/rendering tests do not replace validation on the target GPU.
+
 ### Both Base and AnyRes at 12x12 AND 18x18 (`run_entropy_18_12.py`)
 
 This standalone **CPU-only** script is separate from the feature-residual
