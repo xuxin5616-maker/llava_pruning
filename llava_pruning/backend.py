@@ -177,7 +177,11 @@ class LlavaBackend:
                  rate: int, roi_mode: str, *, capture_visualization: bool,
                  capture_attention: bool,
                  random_seed: int, do_sample: bool = False,
-                 include_pruning_time: bool = True) -> dict:
+                 include_pruning_time: bool = True,
+                 benchmark_metrics: bool = False) -> dict:
+        if benchmark_metrics and (not include_pruning_time or do_sample
+                                  or capture_visualization or capture_attention):
+            raise ValueError("Benchmark requires greedy decoding, included pruning time, and no visualization")
         import torch
         from llava.constants import (DEFAULT_IMAGE_TOKEN, DEFAULT_IM_END_TOKEN,
                                      DEFAULT_IM_START_TOKEN, IMAGE_TOKEN_INDEX)
@@ -243,8 +247,12 @@ class LlavaBackend:
             "max_new_tokens": max_new_tokens,
             "use_cache": True,
         }
-        generated, timing = _generate_with_timing(
-            self.model, generation_options, include_pruning_time=include_pruning_time)
+        if benchmark_metrics:
+            from .benchmark_timing import generate_with_benchmark
+            generated, timing = generate_with_benchmark(self.model, generation_options)
+        else:
+            generated, timing = _generate_with_timing(
+                self.model, generation_options, include_pruning_time=include_pruning_time)
         answer = self.tokenizer.batch_decode(generated, skip_special_tokens=True)[0].strip()
         core = self.model.get_model()
         result = {

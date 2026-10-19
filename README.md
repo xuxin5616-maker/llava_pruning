@@ -818,6 +818,88 @@ This replaces only the derived `benchmark.csv`, plot files and workbook in that 
 
 Nonzero rates still include independent Q/K scoring overhead. The current implementation masks attention and retains the full hidden-state/KV-cache sequence; it does not guarantee a speedup even with sample visualization disabled. The two GPUs may also differ or share CPU/disk bottlenecks; these timings alone do not establish a pruning speedup. For more controlled comparisons, use the single-GPU option and repeat measurements. Run this on the inference server with the selected GPUs available; the launcher does not stop other users' jobs. Stop an old benchmark before restarting with the updated script and a new output directory; editing this file cannot change already-running workers. When updating the server, copy `ex.py`, `benchmark_report.py` and `requirements-report.txt` together.
 
+## Full-dataset ACC / PRE / Recall / TNR / Lat / Mem benchmark
+
+`benchmark_fastv.py` is separate from `ex.py` and `run.py`: it evaluates **all input
+records**, not the first 100. Four jobs run **sequentially on the same GPU**, each
+in a fresh process: LLaVA with pruning disabled, then the existing FastV **mask**
+implementation at 50%, 70% and 90%. The baseline uses the same checkpoint and
+the original no-pruning decoder path, not another checkpoint or a separate
+Triad checkout. The script does not physically drop tokens or change algorithms.
+
+On the existing working inference server:
+
+```bash
+python benchmark_fastv.py --gpu 5 --output-dir output/fastv_lat_mem_01
+```
+
+Defaults match the earlier full-data command: checkpoint
+`/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/`, input
+`/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl`, data root
+`/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/`, v0, `anyres_max_9`, base-first
+packing, greedy generation, FP16 and FlashAttention2. **No visualization is
+captured or saved.** The layer/minimum-token/newline settings come from
+`configs/fastv.json`; rates are fixed to 0/50/70/90 in a new effective config,
+without modifying the source config. It prints the chosen layer at startup.
+
+Use `--model-path`, `--input-json`, `--data-root`, `--method-config`, `--seed`
+(default 42), and `--warmup` (default 10) to override these settings. GPU selection
+is through `--gpu`, not a required `CUDA_VISIBLE_DEVICES` prefix: the launcher
+sets each child's environment before importing Torch. Keep that GPU free of
+other jobs and use the same hardware/software for comparisons. The output
+directory must be new/empty. No new reporting dependencies or environment
+upgrade are needed. Sync **all three runtime files** when updating the server:
+`benchmark_fastv.py`, `llava_pruning/benchmark_timing.py`, and
+`llava_pruning/backend.py`; changing only the launcher is insufficient.
+
+Each job warms up on up to 10 evenly spaced input images, discards those
+measurements, then evaluates **every image in file order**, including the warmup
+images again. Batch size is 1, with the same per-image seed across jobs. Full
+model weights must fit on one GPU; CPU/disk offload is rejected. Source JSON
+identity and effective settings are checked between jobs. Progress is shown in
+the terminal and copied to `prune_XX.log`.
+
+Outputs in the selected directory:
+
+- `summary.csv`: four rows, with classification metrics, mean/p50/p95/std Lat,
+  peak allocated/reserved GiB, allocated percentage, counts and completion status.
+  `accuracy`, `precision`, `recall`, `tnr` are fractions (0.9 means 90%);
+  `lat_mean_ms` is the primary Lat metric and `mem_peak_allocated_gib` is primary Mem.
+- `summary.json`: the same results with measurement definitions and recorded
+  inference environment; `run.json` and `fastv_effective.json` preserve settings.
+- `prune_00`, `prune_50`, `prune_70`, `prune_90`: each contains `metrics.json` and
+  concise `predictions.jsonl` (ID, ground truth, full answer, timing and peak memory).
+
+**Lat boundary:** preprocessed image/text tensors are already on the GPU and
+synchronized. Timing starts immediately before LLaVA `model.generate()`, includes
+vision encoding, projector, multimodal packing, LLM prefill, independent attention
+scoring and masking, and ends when the **first generated token is selected/appended
+and the GPU is synchronized**. Thus model loading, disk reads, CPU preprocessing,
+input GPU transfer, text decoding and saving are excluded. No pruning time is
+subtracted. A passive stopping-criteria observer always returns false and leaves
+the normal EOS/token budget unchanged. Generation continues to the full answer
+for ACC/PRE/Recall/TNR. This is not timing only the LLM, only prefill, or a separate
+one-token inference. The secondary `generation_mean_ms` includes the observer's
+first-token synchronization overhead; it is not uninstrumented throughput.
+
+**Mem boundary:** PyTorch peak counters reset after input preparation, immediately
+before each measured generate call. The report takes the maximum over all
+measured **full-answer** calls, including resident model weights and inputs,
+excluding loading, preprocessing and warmup transient peaks. Reserved memory can
+include cached warmup allocations. `mem_peak_allocated_pct` is allocated peak /
+device capacity ×100, **not compute utilization or whole-board nvidia-smi usage**;
+CUDA contexts, other processes and allocations outside PyTorch are not counted.
+
+Classification uses the existing pooled A/B rules: A=defect, B=normal; ACC counts
+unparsed labeled answers as errors; PRE/Recall/TNR use only parsed labeled answers.
+Unparsed counts are reported, and zero denominators stay blank/null. This
+benchmark requires all samples to have gt=0/1. Failed or partial jobs are marked
+explicitly, remaining jobs still run, and unknown measurements are never filled
+with zero. `lat_speedup_vs_baseline` is baseline mean Lat / current mean Lat for
+complete successful runs only; values below 1 mean slower. Because this is the
+existing mask implementation, neither higher speed nor lower memory is guaranteed.
+Repeat whole runs into new output directories to assess run-to-run variability.
+
 ## Research cautions
 
 - This FastV implementation masks visual keys in decoder attention. It does **not** shorten the token sequence or prove wall-clock acceleration from token removal. `generation_seconds` is diagnostic, not a claimed speedup metric.
