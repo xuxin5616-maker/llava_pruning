@@ -912,6 +912,78 @@ complete successful runs only; values below 1 mean slower. Because this is the
 existing mask implementation, neither higher speed nor lower memory is guaranteed.
 Repeat whole runs into new output directories to assess run-to-run variability.
 
+### Run the same seven jobs on VisA (no question JSON required)
+
+```bash
+python benchmark_fastv.py --dataset visa --gpu 5 \
+  --data-root /home/yz/xxy/data/datasets/VisA \
+  --output-dir output/visa_layer2_3_lat_mem_01
+```
+
+The VisA root above is also the default for `--dataset visa`; do not pass
+`--input-json`. The checkpoint, AnyRes max9/base-first, FP16/FlashAttention2,
+greedy decoding, warmup, complete test-set evaluation, seven-job schedule and
+Lat/Mem boundaries remain exactly the same. No sample visualizations are saved.
+Without `--dataset visa`, the existing MVTec JSON workflow remains the default.
+
+The question is **Triad v0 with the category clause removed**, identical for
+every image, with no category name, mask, bounding box or ground-truth hint:
+
+```text
+Are there any defects in this image?
+A. Yes
+B. No
+Answer with the option's letter from the given choices directly.
+```
+
+The expected answer is **A/B**, not literal Yes/No. A means anomaly (`gt=1`), B
+means normal (`gt=0`); existing metric parsing and unparsed-answer treatment are
+unchanged. VisA uses `prompt_version: v0_generic` in the saved configuration,
+and the exact prompt is recorded in `run.json`. Category names are retained only
+in dataset bookkeeping, not inserted into the model's question.
+
+The loader checks these sources in order (an explicit `--visa-split-csv` takes
+precedence over all automatic detection):
+
+1. Existing `<root>/<category>/test/good|bad` folders, or
+   `<root>/1cls/<category>/test/good|bad`. Labels `normal`, `anomaly`, `abnormal`
+   are also supported. Read only these test images; never scan train or
+   ground_truth. If two prepared layouts coexist, select the desired root explicitly.
+2. For raw VisA, use `<root>/split_csv/1cls.csv` or `<root>/1cls.csv` and select
+   only rows whose split is `test`.
+3. If neither exists, use the bundled **official 1-class test split snapshot**,
+   `llava_pruning/assets/visa_1cls_test.csv`, without network access. It selects
+   2,162 original images (962 normal, 1,200 anomaly) across 12 categories, using
+   paths such as `candle/Data/Images/Normal/0790.JPG`. This is not a new random
+   split and does not require a physical test/ directory.
+
+The original layout and split are documented in the
+[VisA authors' repository](https://github.com/amazon-science/spot-diff#data-preparation);
+the bundled file is derived from their
+[1cls.csv](https://github.com/amazon-science/spot-diff/blob/main/split_csv/1cls.csv).
+Attribution and the transformation are in `llava_pruning/assets/README.md`.
+For an explicit alternative split: `--visa-split-csv /path/to/1cls.csv` (CSV
+columns: `object,split,label,image`, optional unused `mask`). Its labels must
+be `normal`/`anomaly`. A local/prepared selection may have different counts;
+the script reports the actual counts and records the selection source, rather
+than claiming that every layout is necessarily the official 1-class split.
+
+Missing selected images, unknown labels, duplicate image entries and ambiguous
+layouts fail before model loading instead of silently dropping samples. Training
+and validation rows are excluded. Masks are never loaded or passed to the model.
+The loader freezes the selected test inputs in `input_visa_test.jsonl` **inside
+the output directory**, shared and hash-checked by all seven workers. Source
+images, split files and the VisA directory are not changed. `run.json` records
+layout, category counts, normal/anomaly counts, and CSV path/hash when applicable.
+The usual `summary.csv` additionally records `dataset=visa` and `fastv_layer`.
+
+When updating from the previous seven-job benchmark, sync `benchmark_fastv.py`,
+`llava_pruning/prompts.py`, `llava_pruning/visa_data.py`, and the entire
+`llava_pruning/assets/` folder. Keep the previously supplied `backend.py` and
+`benchmark_timing.py`; they are unchanged. Use a new/empty output directory.
+These adapters are tested with synthetic directory/CSV fixtures; the actual
+server dataset and 7B GPU run are not accessible in this Windows workspace.
+
 ## Research cautions
 
 - This FastV implementation masks visual keys in decoder attention. It does **not** shorten the token sequence or prove wall-clock acceleration from token removal. `generation_seconds` is diagnostic, not a claimed speedup metric.

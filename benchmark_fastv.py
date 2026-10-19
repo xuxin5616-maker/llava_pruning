@@ -3,6 +3,7 @@
 Run on the inference server: python benchmark_fastv.py --gpu 5
 Each configuration uses a fresh process, the same GPU, and warmup before timing.
 One baseline plus FastV layers 2/3 independently at 50/70/90%: seven jobs.
+Use --dataset visa for raw/prepared VisA test data with category-free Triad v0.
 """
 
 from __future__ import annotations
@@ -25,6 +26,11 @@ from datetime import datetime
 ROOT = Path(__file__).resolve().parent
 RATES = (0, 50, 70, 90)
 LAYERS = (2, 3)
+DEFAULT_MVTEC_JSON = "/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl"
+DEFAULT_DATA_ROOTS = {
+    "mvtec": "/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/",
+    "visa": "/home/yz/xxy/data/datasets/VisA",
+}
 GIB = 1024 ** 3
 DEFINITIONS = {
     "baseline": "Same LLaVA checkpoint/backend, pruning disabled; not a separate checkpoint.",
@@ -47,7 +53,7 @@ DEFINITIONS = {
              "mem_peak_*_gib are GiB; mem_peak_allocated_pct is percent [0,100].",
 }
 CSV_FIELDS = (
-    "model", "fastv_layer", "prune_rate", "status", "complete", "expected_samples", "evaluated_samples",
+    "dataset", "model", "fastv_layer", "prune_rate", "status", "complete", "expected_samples", "evaluated_samples",
     "labeled_samples", "correct", "unparsed", "tp", "fp", "tn", "fn",
     "accuracy", "precision", "recall", "tnr", "lat_mean_ms", "lat_p50_ms", "lat_p95_ms",
     "lat_std_ms", "lat_speedup_vs_baseline", "mem_peak_allocated_gib", "mem_peak_reserved_gib",
@@ -80,12 +86,22 @@ def experiment_jobs():
     return [job_info(0)] + [job_info(rate, layer) for layer in LAYERS for rate in RATES[1:]]
 
 
+def benchmark_prompt(sample, version):
+    from llava_pruning.prompts import GENERIC_PROMPT_V0, resolve_prompt
+    if version == "v0_generic":
+        return GENERIC_PROMPT_V0  # Deliberately ignore category and dataset text.
+    return resolve_prompt(version, sample.category, sample.text)[0]
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu", type=int, default=5, help="Physical GPU ID; all seven jobs run sequentially")
     parser.add_argument("--model-path", default="/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/")
-    parser.add_argument("--input-json", default="/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl")
-    parser.add_argument("--data-root", default="/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/")
+    parser.add_argument("--dataset", choices=("mvtec", "visa"), default="mvtec",
+                        help="mvtec: original JSON benchmark; visa: test-only raw/prepared images, no input JSON needed")
+    parser.add_argument("--input-json", help=f"MVTec only; default {DEFAULT_MVTEC_JSON}")
+    parser.add_argument("--data-root", help="Dataset root; default follows --dataset (VisA: /home/yz/xxy/data/datasets/VisA)")
+    parser.add_argument("--visa-split-csv", help="Optional explicit VisA split CSV; otherwise detect test folders/local CSV, then official bundled split")
     parser.add_argument("--method-config", default=str(ROOT / "configs" / "fastv.json"),
                         help="Reuse min_tokens/newline settings; override layer with 2 and 3; rates 0,50,70,90")
     parser.add_argument("--warmup", type=int, default=10, help="Warmup images per job, excluded from metrics (default 10)")
@@ -100,27 +116,44 @@ def build_parser():
 def prepare(args):
     from llava_pruning.data import load_samples
     from llava_pruning.methods import FastVMethod
-    from llava_pruning.prompts import resolve_prompt
 
     if args.gpu < 0 or args.warmup < 1 or not 0 <= args.seed < 2 ** 32:
         raise ValueError("gpu must be nonnegative, warmup >= 1, seed in [0, 2**32)")
     model_path = Path(args.model_path).expanduser().resolve()
     if not model_path.is_dir():
         raise NotADirectoryError(f"Model checkpoint not found: {model_path}")
-    source = Path(args.input_json).expanduser().resolve()
-    data_root = Path(args.data_root).expanduser().resolve()
+    data_root = Path(args.data_root or DEFAULT_DATA_ROOTS[args.dataset]).expanduser().resolve()
     method = FastVMethod.from_config(args.method_config)
-    samples = load_samples(source, data_root)
+    if args.dataset == "visa":
+        if args.input_json is not None:
+            raise ValueError("--dataset visa reads test images directly; do not supply --input-json")
+        from llava_pruning.visa_data import load_visa_test
+        samples, dataset_info = load_visa_test(data_root, args.visa_split_csv)
+        source = None
+        prompt_version = "v0_generic"
+    else:
+        if args.visa_split_csv is not None:
+            raise ValueError("--visa-split-csv requires --dataset visa")
+        source = Path(args.input_json or DEFAULT_MVTEC_JSON).expanduser().resolve()
+        samples = load_samples(source, data_root)
+        dataset_info = {"layout": "question_json", "source": str(source)}
+        prompt_version = "v0"
     if not samples:
         raise ValueError("Input dataset is empty")
     if any(sample.gt is None for sample in samples):
         raise ValueError("This classification benchmark requires gt=0/1 on every sample")
     for sample in samples:
-        resolve_prompt("v0", sample.category, sample.text)
+        benchmark_prompt(sample, prompt_version)
     output = Path(args.output_dir or f"output/benchmark_fastv_{datetime.now():%Y%m%d_%H%M%S}").resolve()
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise FileExistsError(f"Use a new or empty output directory: {output}")
     output.mkdir(parents=True, exist_ok=True)
+    if source is None:
+        # Freeze the exact test selection for all seven jobs; never modify VisA.
+        source = output / "input_visa_test.jsonl"
+        with source.open("x", encoding="utf-8") as stream:
+            for sample in samples:
+                stream.write(json.dumps(sample.source, ensure_ascii=False, allow_nan=False) + "\n")
     configs = {}
     for layer in LAYERS:
         effective = {"layer": layer, "prune_rates": list(RATES), "visualize_rates": [],
@@ -129,14 +162,17 @@ def prepare(args):
         save_json(path, effective)
         configs[str(layer)] = {"method_config": str(path), "fastv": effective}
     spec = {"model_path": str(model_path), "input_json": str(source), "data_root": str(data_root),
+            "dataset": args.dataset, "dataset_info": dataset_info,
             "input_sha256": file_sha256(source), "sample_count": len(samples), "gpu": args.gpu,
             "seed": args.seed, "warmup": args.warmup, "prune_rates": list(RATES),
             "fastv_layers": list(LAYERS), "jobs": experiment_jobs(),
-            "prompt_version": "v0", "roi_mode": "anyres_max_9", "image_token_order": "base_first",
+            "prompt_version": prompt_version, "roi_mode": "anyres_max_9", "image_token_order": "base_first",
             "batch_size": 1, "decoding": "greedy, max_new_tokens<=512 (existing LLaVA context budget)",
             "do_sample": False, "include_pruning_time": True, "save_visualizations": False,
             "fastv_configs": configs,
             "definitions": DEFINITIONS}
+    if args.dataset == "visa":
+        spec["prompt_text"] = benchmark_prompt(samples[0], prompt_version)
     save_json(output / "run.json", spec)
     return output, spec
 
@@ -186,7 +222,7 @@ def run_worker(manifest, rate, layer=None):
     output.mkdir(parents=True, exist_ok=False)
     from llava_pruning.metrics import Accuracy
     accuracy = Accuracy(spec["sample_count"])
-    report = {**job, "status": "failed", "warmup_samples": 0}
+    report = {**job, "dataset": spec.get("dataset", "mvtec"), "status": "failed", "warmup_samples": 0}
     measurements = []
     total_memory = None
     try:
@@ -194,14 +230,13 @@ def run_worker(manifest, rate, layer=None):
         from llava_pruning.backend import LlavaBackend
         from llava_pruning.data import load_samples
         from llava_pruning.methods import FastVMethod
-        from llava_pruning.prompts import resolve_prompt
 
         if file_sha256(spec["input_json"]) != spec["input_sha256"]:
             raise ValueError("Input JSON changed after benchmark setup")
         samples = load_samples(spec["input_json"], spec["data_root"])
         if len(samples) != spec["sample_count"]:
             raise ValueError("Dataset size changed after benchmark setup")
-        prompts = [resolve_prompt("v0", sample.category, sample.text)[0] for sample in samples]
+        prompts = [benchmark_prompt(sample, spec["prompt_version"]) for sample in samples]
         if job not in spec["jobs"]:
             raise ValueError("Worker configuration is not in the experiment manifest")
         # The baseline's layer is unused because pruning is disabled; report null.
@@ -309,8 +344,13 @@ def run_child(manifest, rate, gpu, log_path, *, layer=None):
 
 def launch(args):
     output, spec = prepare(args)
-    print(f"Full dataset: {spec['sample_count']} images; rates={RATES}; "
+    print(f"Dataset={spec['dataset']}: {spec['sample_count']} images; rates={RATES}; "
           f"GPU={spec['gpu']}; FastV layers={LAYERS}; {len(spec['jobs'])} jobs; output={output}", flush=True)
+    if spec["dataset"] == "visa":
+        info = spec["dataset_info"]
+        print(f"VisA TEST only: normal={info['normal']}, abnormal={info['abnormal']}; "
+              f"layout={info['layout']}; per-category={info['categories']}", flush=True)
+        print(f"Prompt for every image:\n{spec['prompt_text']}", flush=True)
     print("FP16/FlashAttention2 unchanged; greedy; warmup per job; no visualization. "
           "Lat includes pruning. Mem is PyTorch allocated/reserved, not whole-board usage.", flush=True)
     reports = []
@@ -324,7 +364,7 @@ def launch(args):
         if metrics_path.is_file():
             report = json.loads(metrics_path.read_text(encoding="utf-8"))
         else:
-            report = {**job, "status": "failed", "complete": False,
+            report = {**job, "dataset": spec["dataset"], "status": "failed", "complete": False,
                       "error": f"Worker exited {exit_code} without metrics; inspect its log"}
         if exit_code != 0:
             report.update(status="failed", complete=False)

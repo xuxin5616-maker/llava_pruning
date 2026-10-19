@@ -12,6 +12,14 @@ PROMPTS = {
     "v3": MVTEC_PROMPT_V1_2,
 }
 
+# Triad v0 with only the category-specific "on the <object>" removed.
+GENERIC_PROMPT_V0 = (
+    "Are there any defects in this image?\n"
+    "A. Yes\n"
+    "B. No\n"
+    "Answer with the option's letter from the given choices directly."
+)
+
 
 def resolve_prompt(version: str, category: str, dataset_text: str | None) -> tuple[str, str]:
     if version not in PROMPTS:
