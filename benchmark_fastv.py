@@ -101,7 +101,9 @@ def build_parser():
                         help="mvtec: original JSON benchmark; visa: test-only raw/prepared images, no input JSON needed")
     parser.add_argument("--input-json", help=f"MVTec only; default {DEFAULT_MVTEC_JSON}")
     parser.add_argument("--data-root", help="Dataset root; default follows --dataset (VisA: /home/yz/xxy/data/datasets/VisA)")
-    parser.add_argument("--visa-split-csv", help="Optional explicit VisA split CSV; otherwise detect test folders/local CSV, then official bundled split")
+    parser.add_argument("--visa-split-csv", help="VisA split CSV (or its directory containing 1cls.csv); "
+                        "default: data-root/split_csv/1cls.csv, then data-root/1cls.csv, "
+                        "then test folders, then bundled split")
     parser.add_argument("--method-config", default=str(ROOT / "configs" / "fastv.json"),
                         help="Reuse min_tokens/newline settings; override layer with 2 and 3; rates 0,50,70,90")
     parser.add_argument("--warmup", type=int, default=10, help="Warmup images per job, excluded from metrics (default 10)")
@@ -129,6 +131,15 @@ def prepare(args):
             raise ValueError("--dataset visa reads test images directly; do not supply --input-json")
         from llava_pruning.visa_data import load_visa_test
         samples, dataset_info = load_visa_test(data_root, args.visa_split_csv)
+        if not dataset_info["normal"] or not dataset_info["abnormal"]:
+            raise ValueError(
+                f"VisA benchmark requires both normal and abnormal test images; selected "
+                f"normal={dataset_info['normal']}, abnormal={dataset_info['abnormal']} "
+                f"from {dataset_info['split_csv'] or dataset_info['category_root']}. "
+                "Check split_csv/1cls.csv (split=test, label=normal/anomaly) and its image paths. "
+                "An anomaly-only test/ folder cannot measure TNR. "
+                "Training images will not be added automatically. No benchmark jobs started."
+            )
         source = None
         prompt_version = "v0_generic"
     else:
@@ -350,6 +361,8 @@ def launch(args):
         info = spec["dataset_info"]
         print(f"VisA TEST only: normal={info['normal']}, abnormal={info['abnormal']}; "
               f"layout={info['layout']}; per-category={info['categories']}", flush=True)
+        if info["split_csv"]:
+            print(f"VisA split CSV: {info['split_csv']} (only split=test rows)", flush=True)
         print(f"Prompt for every image:\n{spec['prompt_text']}", flush=True)
     print("FP16/FlashAttention2 unchanged; greedy; warmup per job; no visualization. "
           "Lat includes pruning. Mem is PyTorch allocated/reserved, not whole-board usage.", flush=True)

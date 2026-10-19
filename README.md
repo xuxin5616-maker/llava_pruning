@@ -945,12 +945,20 @@ in dataset bookkeeping, not inserted into the model's question.
 The loader checks these sources in order (an explicit `--visa-split-csv` takes
 precedence over all automatic detection):
 
-1. Existing `<root>/<category>/test/good|bad` folders, or
+1. Use `<root>/split_csv/1cls.csv` (preferred) or `<root>/1cls.csv` and select
+   only rows whose `split` is `test`; `label=normal` maps to `gt=0` and
+   `label=anomaly` to `gt=1`. A local split CSV takes precedence even when
+   `test/` folders exist, including anomaly-only folders. This is the split
+   file, **not** the per-category `image_anno.csv` annotation file.
+2. Only when no local split CSV exists, use existing
+   `<root>/<category>/test/good|bad` folders, or
    `<root>/1cls/<category>/test/good|bad`. Labels `normal`, `anomaly`, `abnormal`
-   are also supported. Read only these test images; never scan train or
+   are also supported. Specific defect subdirectories such as
+   `candle/test/chunk_of_wax_missing` are supported too: `good`/`normal` map to
+   `gt=0`, all other defect-type folders to `gt=1` (case-insensitive). Reserved
+   names such as `masks`, `ground_truth`, `unknown` and `unlabeled` are rejected
+   rather than treated as defects. Read only these test images; never scan train or
    ground_truth. If two prepared layouts coexist, select the desired root explicitly.
-2. For raw VisA, use `<root>/split_csv/1cls.csv` or `<root>/1cls.csv` and select
-   only rows whose split is `test`.
 3. If neither exists, use the bundled **official 1-class test split snapshot**,
    `llava_pruning/assets/visa_1cls_test.csv`, without network access. It selects
    2,162 original images (962 normal, 1,200 anomaly) across 12 categories, using
@@ -962,13 +970,33 @@ The original layout and split are documented in the
 the bundled file is derived from their
 [1cls.csv](https://github.com/amazon-science/spot-diff/blob/main/split_csv/1cls.csv).
 Attribution and the transformation are in `llava_pruning/assets/README.md`.
-For an explicit alternative split: `--visa-split-csv /path/to/1cls.csv` (CSV
+For an explicit split: `--visa-split-csv /path/to/1cls.csv`, or pass the
+directory containing `1cls.csv` (CSV
 columns: `object,split,label,image`, optional unused `mask`). Its labels must
 be `normal`/`anomaly`. A local/prepared selection may have different counts;
 the script reports the actual counts and records the selection source, rather
 than claiming that every layout is necessarily the official 1-class split.
+For the server path above, the original command automatically selects
+`/home/yz/xxy/data/datasets/VisA/split_csv/1cls.csv`. To make the selection explicit:
 
-Missing selected images, unknown labels, duplicate image entries and ambiguous
+```bash
+python benchmark_fastv.py --dataset visa --gpu 0 \
+  --data-root /home/yz/xxy/data/datasets/VisA \
+  --visa-split-csv /home/yz/xxy/data/datasets/VisA/split_csv/1cls.csv \
+  --output-dir output/visa_layer2_3_lat_mem_csv_01
+```
+
+CSV image paths are resolved relative to `--data-root`. If a selected image is
+missing, the loader reports the CSV row and expected path and stops: it does
+not silently fall back to test folders or match unrelated images by basename.
+Restore the listed paths or supply a verified split CSV matching the actual
+layout; source data is never moved or relabeled automatically. The benchmark
+requires at least one normal and one abnormal selected test image, before any
+worker is started or output directory is created. An anomaly-only selection
+cannot measure TNR; training images are not automatically added to compensate.
+
+Missing selected images, invalid CSV labels or reserved/unlabeled directories,
+duplicate image entries and ambiguous
 layouts fail before model loading instead of silently dropping samples. Training
 and validation rows are excluded. Masks are never loaded or passed to the model.
 The loader freezes the selected test inputs in `input_visa_test.jsonl` **inside

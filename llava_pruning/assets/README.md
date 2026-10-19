@@ -17,6 +17,7 @@ VisA dataset attribution/license: CC BY 4.0,
 https://github.com/amazon-science/spot-diff/blob/main/LICENSE-DATASET
 and https://creativecommons.org/licenses/by/4.0/.
 
-The loader uses this offline snapshot only if existing test folders and a
-local split CSV are absent. A missing listed image is an error, never silently
-skipped. Use `--visa-split-csv` to select an explicit, documented alternative.
+The loader prefers a local `split_csv/1cls.csv` (or `1cls.csv`) over existing
+test folders. It uses this offline snapshot only if both are absent. A selected
+CSV with missing images is an error, never silently skipped or replaced by a
+directory scan. Use `--visa-split-csv` to select an explicit, documented split.

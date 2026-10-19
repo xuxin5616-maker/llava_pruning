@@ -1,6 +1,6 @@
 """Read VisA TEST images only, without moving data or loading annotation masks.
 
-Supports prepared <category>/test/{good,bad} and raw VisA with a split CSV.
+Supports prepared <category>/test/{good,bad,<defect_type>} and raw VisA with a split CSV.
 Official layout/split: https://github.com/amazon-science/spot-diff
 """
 
@@ -19,6 +19,10 @@ CATEGORIES = frozenset(("candle", "capsules", "cashew", "chewinggum", "fryum",
                         "macaroni1", "macaroni2", "pcb1", "pcb2", "pcb3", "pcb4", "pipe_fryum"))
 IMAGE_SUFFIXES = frozenset((".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"))
 DIRECTORY_LABELS = {"good": 0, "normal": 0, "bad": 1, "anomaly": 1, "abnormal": 1}
+# These are not defect names. Fail rather than mislabel masks or unlabeled data.
+NON_LABEL_DIRECTORIES = frozenset(("ground_truth", "mask", "masks", "annotation", "annotations",
+                                   "labels", "images", "train", "test", "val", "validation",
+                                   "unknown", "unlabeled", "unlabelled"))
 BUNDLED_SPLIT = Path(__file__).resolve().parent / "assets" / "visa_1cls_test.csv"
 
 
@@ -51,7 +55,8 @@ def _from_csv(root, path):
         reader = csv.DictReader(stream)
         required = {"object", "split", "label", "image"}
         if not required.issubset(reader.fieldnames or []):
-            raise ValueError(f"VisA split CSV requires columns {sorted(required)}: {path}")
+            raise ValueError(f"VisA split CSV requires columns {sorted(required)}: {path}. "
+                             "Use split_csv/1cls.csv, not the image_anno.csv annotation file.")
         for number, row in enumerate(reader, 2):
             if any(row.get(key) is None for key in required):
                 raise ValueError(f"Incomplete VisA CSV row {number}")
@@ -74,7 +79,15 @@ def _from_csv(root, path):
             gt = int(label == "anomaly")
             if parent_label in DIRECTORY_LABELS and DIRECTORY_LABELS[parent_label] != gt:
                 raise ValueError(f"CSV label conflicts with image directory: {relative}")
-            samples.append(_sample(root, relative, category, gt))
+            try:
+                samples.append(_sample(root, relative, category, gt))
+            except FileNotFoundError as error:
+                raise FileNotFoundError(
+                    f"{error}\nSelected by CSV row {number}: {path}. "
+                    "CSV image paths are relative to --data-root. Restore the listed image paths "
+                    "or provide a verified split CSV matching your layout. "
+                    "No images are skipped or guessed by filename; no fallback to test/ folders."
+                ) from error
     return samples
 
 
@@ -106,14 +119,18 @@ def _from_directories(root, categories):
                     raise ValueError(f"Unlabeled image directly under test/: {folder}")
                 continue
             label = folder.name.lower()
-            if label not in DIRECTORY_LABELS:
-                raise ValueError(f"Unknown VisA test label directory: {folder}; expected good/bad or normal/anomaly")
+            if label in NON_LABEL_DIRECTORIES or label.startswith("."):
+                raise ValueError(f"Unknown VisA test label directory: {folder}; expected good/normal "
+                                 "or an anomaly/defect-type directory, not masks or unlabeled data")
+            # MVTec-style exports retain specific defect names, e.g.
+            # candle/test/chunk_of_wax_missing. They are positive class samples.
+            gt = DIRECTORY_LABELS.get(label, 1)
             images = sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
             if not images:
                 raise ValueError(f"Empty VisA test image directory: {folder}")
             for image in images:
                 category_samples.append(_sample(root, image.relative_to(root).as_posix(),
-                                                category_path.name.lower(), DIRECTORY_LABELS[label]))
+                                                category_path.name.lower(), gt))
         if not category_samples:
             raise ValueError(f"No labeled VisA images in {test}")
         samples.extend(category_samples)
@@ -123,25 +140,33 @@ def _from_directories(root, categories):
 def load_visa_test(data_root, split_csv=None):
     """Return deterministic Sample objects and a compact, auditable split description.
 
-    Explicit CSV takes precedence. Otherwise use existing test folders first,
-    then a local official-shaped CSV, then the bundled official 1-class test list.
+    Explicit CSV takes precedence, then local split_csv/1cls.csv or 1cls.csv,
+    then existing test folders, then the bundled official 1-class test list.
+    Once a CSV is selected, its test rows are authoritative: a broken/missing
+    path is an error, never a reason to switch to a different test population.
     No random split, no network, no mask loading, and no silently skipped images.
     """
     root = Path(data_root).expanduser().resolve()
     if not root.is_dir():
         raise NotADirectoryError(f"VisA root not found: {root}")
-    prepared = None if split_csv is not None else _prepared_base(root)
+    if split_csv is not None:
+        path = Path(split_csv).expanduser().resolve()
+        if path.is_dir():
+            path = path / "1cls.csv"
+    else:
+        path = next((p for p in (root / "split_csv" / "1cls.csv", root / "1cls.csv")
+                     if p.exists()), None)
+    prepared = _prepared_base(root) if path is None else None
     metadata = {"split": "test", "mask_input": False}
     if prepared is not None:
         base, categories = prepared
         samples = _from_directories(root, categories)
-        metadata.update(layout="test_directories", category_root=str(base), split_csv=None)
+        metadata.update(layout="test_directories", category_root=str(base), split_csv=None,
+                        directory_label_rule="good/normal=0; other defect folders=1; "
+                                             "reserved/unlabeled folders rejected")
     else:
-        if split_csv is not None:
-            path = Path(split_csv).expanduser().resolve()
-        else:
-            path = next((p for p in (root / "split_csv" / "1cls.csv", root / "1cls.csv") if p.is_file()),
-                        BUNDLED_SPLIT)
+        if path is None:
+            path = BUNDLED_SPLIT
         if not path.is_file():
             raise FileNotFoundError(f"VisA split CSV missing: {path}. Sync llava_pruning/assets/ "
                                     "or provide --visa-split-csv /path/to/1cls.csv")

@@ -55,6 +55,35 @@ class VisaDataTests(unittest.TestCase):
                     self.assertEqual(sample.text, GENERIC_PROMPT_V0)
                     self.assertEqual(sample.gt, int("/bad/" in sample.origin_path))
 
+    def test_named_defect_directories_are_abnormal(self):
+        for prefix in ("", "1cls/"):
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                labels = {"good": 0, "Normal": 0, "bad": 1, "anomaly": 1, "abnormal": 1,
+                          "chunk_of_wax_missing": 1, "scratch": 1, "combined_defects": 1}
+                for label in labels:
+                    self.image(root, f"{prefix}candle/test/{label}/001.png")
+                # Neither masks nor training images may enter the test set.
+                self.image(root, f"{prefix}candle/train/good/001.png")
+                self.image(root, f"{prefix}candle/ground_truth/chunk_of_wax_missing/001.png")
+                samples, metadata = visa_data.load_visa_test(root)
+                self.assertEqual(len(samples), len(labels))
+                self.assertEqual((metadata["normal"], metadata["abnormal"]), (2, 6))
+                self.assertIn("good/normal=0", metadata["directory_label_rule"])
+                for sample in samples:
+                    self.assertEqual(sample.gt, labels[sample.image.parent.name])
+                    self.assertIsNone(sample.mask)
+                    self.assertEqual(sample.text, GENERIC_PROMPT_V0)
+
+    def test_mask_and_unlabeled_directories_are_not_treated_as_defects(self):
+        for label in ("ground_truth", "masks", "annotations", "images", "unknown", ".cache"):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.image(root, "candle/test/good/a.png")
+                self.image(root, f"candle/test/{label}/a.png")
+                with self.assertRaisesRegex(ValueError, "Unknown VisA test label"):
+                    visa_data.load_visa_test(root)
+
     def test_raw_csv_filters_train_and_validation_without_needing_masks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -86,22 +115,54 @@ class VisaDataTests(unittest.TestCase):
         self.assertEqual(len({row["image"] for row in rows}), 2162)
         self.assertTrue(all("mask" not in row for row in rows))
 
-    def test_explicit_then_directory_then_local_then_bundled_selection(self):
+    def test_explicit_then_local_then_directory_then_bundled_selection(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             good = "candle/Data/Images/Normal/a.JPG"
             self.image(root, good)
             bundled = self.csv(root / "bundled.csv", [["candle", "test", "normal", good, ""]])
             with patch.object(visa_data, "BUNDLED_SPLIT", bundled):
                 samples, info = visa_data.load_visa_test(root)
                 self.assertEqual(info["split_source"], "bundled_official_1cls_test")
-                self.csv(root / "split_csv/1cls.csv", [["candle", "test", "normal", good, ""]])
-                self.assertEqual(visa_data.load_visa_test(root)[1]["split_source"], "local_csv")
                 self.image(root, "candle/test/good/different.png")
                 self.assertEqual(visa_data.load_visa_test(root)[1]["layout"], "test_directories")
+                root_csv = self.csv(root / "1cls.csv", [["candle", "test", "normal", good, ""]])
+                self.assertEqual(visa_data.load_visa_test(root)[1]["split_csv"], str(root_csv))
+                local = self.csv(root / "split_csv/1cls.csv", [["candle", "test", "normal", good, ""]])
+                selected, info = visa_data.load_visa_test(root)
+                self.assertEqual(info["split_source"], "local_csv")
+                self.assertEqual(info["split_csv"], str(local))
+                self.assertEqual(selected[0].source["image"], good)
+                # An unrelated second prepared layout must not override the CSV.
+                self.image(root, "1cls/candle/test/good/different.png")
+                self.assertEqual(visa_data.load_visa_test(root)[1]["split_csv"], str(local))
                 selected, explicit = visa_data.load_visa_test(root, bundled)
                 self.assertEqual(selected[0].source["image"], good)
+                self.assertEqual(explicit["split_csv"], str(bundled))
                 self.assertEqual(explicit["layout"], "raw_csv")
+                self.assertEqual(visa_data.load_visa_test(root, local.parent)[1]["split_csv"], str(local))
+
+    def test_invalid_local_csv_never_falls_back_to_test_folders(self):
+        for invalid in ("missing_image", "annotation_csv", "empty_selection"):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.image(root, "candle/test/good/a.png")
+                self.image(root, "candle/test/chunk_of_wax_missing/b.png")
+                local = root / "split_csv/1cls.csv"
+                if invalid == "missing_image":
+                    self.csv(local, [["candle", "test", "normal", "candle/Data/Images/Normal/a.JPG", ""]])
+                    message = "No images are skipped or guessed by filename"
+                elif invalid == "annotation_csv":
+                    local.parent.mkdir()
+                    local.write_text("image,label\ncandle/test/good/a.png,normal\n", encoding="utf-8")
+                    message = "not the image_anno.csv"
+                else:
+                    self.csv(local, [["candle", "train", "normal", "candle/test/good/a.png", ""]])
+                    message = "empty"
+                with self.assertRaisesRegex((ValueError, FileNotFoundError), message):
+                    visa_data.load_visa_test(root)
+                with self.assertRaisesRegex(FileNotFoundError, "split CSV missing"):
+                    visa_data.load_visa_test(root, root / "does_not_exist.csv")
 
     def test_invalid_missing_duplicate_and_overlapping_csv_samples_fail(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -170,12 +231,21 @@ class VisaBenchmarkTests(unittest.TestCase):
                         "peak_allocated_bytes": 100, "peak_reserved_bytes": 200}
 
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             data = root / "VisA"
             helper = VisaDataTests()
-            helper.image(data, "candle/test/good/a.png")
-            helper.image(data, "candle/test/bad/a.png")
+            good = "candle/Data/Images/Normal/a.JPG"
+            bad = "candle/Data/Images/Anomaly/b.JPG"
+            helper.image(data, good)
+            helper.image(data, bad)
+            # Regression: test/ alone contains no normal images, but the CSV does.
+            helper.image(data, "candle/test/chunk_of_wax_missing/extra.png")
             helper.image(data, "candle/train/good/not_test.png")
+            split = helper.csv(data / "split_csv/1cls.csv", [
+                ["candle", "train", "normal", "candle/train/good/not_test.png", ""],
+                ["candle", "test", "normal", good, ""],
+                ["candle", "test", "anomaly", bad, "missing-mask.png"],
+            ])
             model = root / "model"
             model.mkdir()
             args = benchmark.build_parser().parse_args([
@@ -187,10 +257,13 @@ class VisaBenchmarkTests(unittest.TestCase):
             self.assertEqual(spec["prompt_version"], "v0_generic")
             self.assertEqual(spec["prompt_text"], GENERIC_PROMPT_V0)
             self.assertEqual(spec["dataset"], "visa")
+            self.assertEqual(spec["dataset_info"]["split_csv"], str(split))
+            self.assertEqual((spec["dataset_info"]["normal"], spec["dataset_info"]["abnormal"]), (1, 1))
             self.assertEqual(len(spec["jobs"]), 7)
             self.assertTrue((output / "input_visa_test.jsonl").is_file())
             loaded = load_samples(spec["input_json"], spec["data_root"])
             self.assertEqual({s.gt for s in loaded}, {0, 1})
+            self.assertEqual({s.source["image"] for s in loaded}, {good, bad})
             self.assertTrue(all(s.text == GENERIC_PROMPT_V0 and s.mask is None for s in loaded))
             self.assertFalse(list(data.rglob("*.json*")))
             reports = []
@@ -221,6 +294,33 @@ class VisaBenchmarkTests(unittest.TestCase):
                 rows = list(csv.DictReader(stream))
             self.assertEqual(len(rows), 7)
             self.assertEqual({row["dataset"] for row in rows}, {"visa"})
+
+    def test_single_class_selection_fails_before_any_worker_or_output(self):
+        helper = VisaDataTests()
+        for use_csv in (False, True):
+            for label in ("good", "chunk_of_wax_missing"):
+                with self.subTest(csv=use_csv, label=label), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    data = root / "VisA"
+                    relative = f"candle/test/{label}/one.png"
+                    helper.image(data, relative)
+                    helper.image(data, "candle/train/good/not_test.png")
+                    if use_csv:
+                        helper.csv(data / "split_csv/1cls.csv", [
+                            ["candle", "test", "normal" if label == "good" else "anomaly", relative, ""],
+                            ["candle", "train", "normal", "candle/train/good/not_test.png", ""],
+                        ])
+                    model = root / "model"
+                    model.mkdir()
+                    args = benchmark.build_parser().parse_args([
+                        "--dataset", "visa", "--data-root", str(data), "--model-path", str(model),
+                        "--output-dir", str(root / "output"),
+                    ])
+                    with patch.object(benchmark, "run_child") as child:
+                        with self.assertRaisesRegex(ValueError, "requires both normal and abnormal"):
+                            benchmark.launch(args)
+                        child.assert_not_called()
+                    self.assertFalse((root / "output").exists())
 
     def test_default_dataset_and_server_roots_are_explicit(self):
         parser = benchmark.build_parser()
