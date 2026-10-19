@@ -2,6 +2,7 @@
 
 Run on the inference server: python benchmark_fastv.py --gpu 5
 Each configuration uses a fresh process, the same GPU, and warmup before timing.
+One baseline plus FastV layers 2/3 independently at 50/70/90%: seven jobs.
 """
 
 from __future__ import annotations
@@ -23,10 +24,13 @@ from datetime import datetime
 
 ROOT = Path(__file__).resolve().parent
 RATES = (0, 50, 70, 90)
+LAYERS = (2, 3)
 GIB = 1024 ** 3
 DEFINITIONS = {
     "baseline": "Same LLaVA checkpoint/backend, pruning disabled; not a separate checkpoint.",
     "fastv": "Existing attention-mask implementation; no physical token/KV sequence compaction.",
+    "layers": "Independent layer=2 and layer=3 experiments, each at 50/70/90%; "
+              "not two pruning stages in one model. One shared no-pruning baseline (fastv_layer=null).",
     "lat": "Seconds from synchronized resident inputs entering model.generate to first selected "
            "token appended and synchronized. Includes vision/projector/packing/prefill/pruning. "
            "Excludes model loading, file I/O, CPU preprocessing, H2D input transfer and saving.",
@@ -43,7 +47,7 @@ DEFINITIONS = {
              "mem_peak_*_gib are GiB; mem_peak_allocated_pct is percent [0,100].",
 }
 CSV_FIELDS = (
-    "model", "prune_rate", "status", "complete", "expected_samples", "evaluated_samples",
+    "model", "fastv_layer", "prune_rate", "status", "complete", "expected_samples", "evaluated_samples",
     "labeled_samples", "correct", "unparsed", "tp", "fp", "tn", "fn",
     "accuracy", "precision", "recall", "tnr", "lat_mean_ms", "lat_p50_ms", "lat_p95_ms",
     "lat_std_ms", "lat_speedup_vs_baseline", "mem_peak_allocated_gib", "mem_peak_reserved_gib",
@@ -61,19 +65,35 @@ def file_sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def job_info(rate, layer=None):
+    if rate == 0 and layer is None:
+        return {"job_id": "prune_00", "output_subdir": "prune_00",
+                "model": "LLaVA (no pruning)", "fastv_layer": None, "prune_rate": 0}
+    if rate not in RATES[1:] or layer not in LAYERS:
+        raise ValueError("Use baseline rate=0 without a layer, or FastV layer=2/3 with rate=50/70/90")
+    return {"job_id": f"layer_{layer}_prune_{rate:02d}",
+            "output_subdir": f"layer_{layer}/prune_{rate:02d}",
+            "model": f"FastV-mask layer={layer} {rate}%", "fastv_layer": layer, "prune_rate": rate}
+
+
+def experiment_jobs():
+    return [job_info(0)] + [job_info(rate, layer) for layer in LAYERS for rate in RATES[1:]]
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--gpu", type=int, default=5, help="Physical GPU ID; all four jobs run sequentially")
+    parser.add_argument("--gpu", type=int, default=5, help="Physical GPU ID; all seven jobs run sequentially")
     parser.add_argument("--model-path", default="/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/")
     parser.add_argument("--input-json", default="/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl")
     parser.add_argument("--data-root", default="/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/")
     parser.add_argument("--method-config", default=str(ROOT / "configs" / "fastv.json"),
-                        help="Reuse layer/min_tokens/newline settings; rates fixed to 0,50,70,90")
+                        help="Reuse min_tokens/newline settings; override layer with 2 and 3; rates 0,50,70,90")
     parser.add_argument("--warmup", type=int, default=10, help="Warmup images per job, excluded from metrics (default 10)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", help="New or empty directory; default output/benchmark_fastv_<timestamp>")
     parser.add_argument("--worker-manifest", help=argparse.SUPPRESS)
     parser.add_argument("--worker-rate", type=int, choices=RATES, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-layer", type=int, choices=LAYERS, help=argparse.SUPPRESS)
     return parser
 
 
@@ -97,20 +117,25 @@ def prepare(args):
         raise ValueError("This classification benchmark requires gt=0/1 on every sample")
     for sample in samples:
         resolve_prompt("v0", sample.category, sample.text)
-    effective = {"layer": method.layer, "prune_rates": list(RATES), "visualize_rates": [],
-                 "min_tokens": method.min_tokens, "preserve_image_newline": method.preserve_image_newline}
     output = Path(args.output_dir or f"output/benchmark_fastv_{datetime.now():%Y%m%d_%H%M%S}").resolve()
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise FileExistsError(f"Use a new or empty output directory: {output}")
     output.mkdir(parents=True, exist_ok=True)
-    save_json(output / "fastv_effective.json", effective)
+    configs = {}
+    for layer in LAYERS:
+        effective = {"layer": layer, "prune_rates": list(RATES), "visualize_rates": [],
+                     "min_tokens": method.min_tokens, "preserve_image_newline": method.preserve_image_newline}
+        path = output / f"fastv_layer_{layer}.json"
+        save_json(path, effective)
+        configs[str(layer)] = {"method_config": str(path), "fastv": effective}
     spec = {"model_path": str(model_path), "input_json": str(source), "data_root": str(data_root),
             "input_sha256": file_sha256(source), "sample_count": len(samples), "gpu": args.gpu,
             "seed": args.seed, "warmup": args.warmup, "prune_rates": list(RATES),
+            "fastv_layers": list(LAYERS), "jobs": experiment_jobs(),
             "prompt_version": "v0", "roi_mode": "anyres_max_9", "image_token_order": "base_first",
             "batch_size": 1, "decoding": "greedy, max_new_tokens<=512 (existing LLaVA context budget)",
             "do_sample": False, "include_pruning_time": True, "save_visualizations": False,
-            "method_config": str(output / "fastv_effective.json"), "fastv": effective,
+            "fastv_configs": configs,
             "definitions": DEFINITIONS}
     save_json(output / "run.json", spec)
     return output, spec
@@ -153,15 +178,15 @@ def validate_single_gpu(model, torch):
         raise RuntimeError("Model must fit entirely on cuda:0; CPU/disk offloading is not comparable")
 
 
-def run_worker(manifest, rate):
+def run_worker(manifest, rate, layer=None):
     # Parent sets CUDA_VISIBLE_DEVICES before this process imports Torch.
     spec = json.loads(Path(manifest).read_text(encoding="utf-8"))
-    output = Path(manifest).parent / f"prune_{rate:02d}"
-    output.mkdir(exist_ok=False)
+    job = job_info(rate, layer)
+    output = Path(manifest).parent / job["output_subdir"]
+    output.mkdir(parents=True, exist_ok=False)
     from llava_pruning.metrics import Accuracy
     accuracy = Accuracy(spec["sample_count"])
-    report = {"model": "LLaVA (no pruning)" if rate == 0 else f"FastV-mask {rate}%",
-              "prune_rate": rate, "status": "failed", "warmup_samples": 0}
+    report = {**job, "status": "failed", "warmup_samples": 0}
     measurements = []
     total_memory = None
     try:
@@ -177,8 +202,14 @@ def run_worker(manifest, rate):
         if len(samples) != spec["sample_count"]:
             raise ValueError("Dataset size changed after benchmark setup")
         prompts = [resolve_prompt("v0", sample.category, sample.text)[0] for sample in samples]
-        method = FastVMethod.from_config(spec["method_config"])
-        if json.loads(Path(spec["method_config"]).read_text(encoding="utf-8")) != spec["fastv"]:
+        if job not in spec["jobs"]:
+            raise ValueError("Worker configuration is not in the experiment manifest")
+        # The baseline's layer is unused because pruning is disabled; report null.
+        config_layer = LAYERS[0] if layer is None else layer
+        configured = spec["fastv_configs"][str(config_layer)]
+        method = FastVMethod.from_config(configured["method_config"])
+        if (method.layer != config_layer or
+                json.loads(Path(configured["method_config"]).read_text(encoding="utf-8")) != configured["fastv"]):
             raise ValueError("Effective FastV configuration changed")
         print(f"Loading {report['model']}; {len(samples)} evaluation images, GPU {spec['gpu']}", flush=True)
         torch.manual_seed(spec["seed"])
@@ -201,7 +232,7 @@ def run_worker(manifest, rate):
         for position, index in enumerate(indices, 1):
             generate(index)  # Identical instrumented path; discard ALL warmup metrics.
             report["warmup_samples"] += 1
-            print(f"prune={rate}% warmup {position}/{len(indices)}", flush=True)
+            print(f"{job['job_id']} warmup {position}/{len(indices)}", flush=True)
         with (output / "predictions.jsonl").open("x", encoding="utf-8") as stream:
             for index, sample in enumerate(samples):
                 result = generate(index)
@@ -216,7 +247,7 @@ def run_worker(manifest, rate):
                 measurements.append(measurement)
                 del result
                 if index == 0 or (index + 1) % 25 == 0 or index + 1 == len(samples):
-                    print(f"prune={rate}% evaluated {index + 1}/{len(samples)}; "
+                    print(f"{job['job_id']} evaluated {index + 1}/{len(samples)}; "
                           f"last Lat={measurement['lat_seconds'] * 1000:.2f} ms", flush=True)
         report["status"] = "success"
     except Exception as error:
@@ -244,10 +275,13 @@ def write_summary(output, reports):
         writer.writerows(reports)
 
 
-def run_child(manifest, rate, gpu, log_path):
+def run_child(manifest, rate, gpu, log_path, *, layer=None):
+    job_info(rate, layer)  # Validate before starting a GPU process.
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), PYTHONUNBUFFERED="1")
     command = [sys.executable, "-u", str(Path(__file__).resolve()),
                "--worker-manifest", str(manifest), "--worker-rate", str(rate)]
+    if layer is not None:
+        command.extend(["--worker-layer", str(layer)])
     process = None
     with Path(log_path).open("x", encoding="utf-8") as log:
         try:
@@ -276,20 +310,21 @@ def run_child(manifest, rate, gpu, log_path):
 def launch(args):
     output, spec = prepare(args)
     print(f"Full dataset: {spec['sample_count']} images; rates={RATES}; "
-          f"GPU={spec['gpu']}; FastV layer={spec['fastv']['layer']}; output={output}", flush=True)
+          f"GPU={spec['gpu']}; FastV layers={LAYERS}; {len(spec['jobs'])} jobs; output={output}", flush=True)
     print("FP16/FlashAttention2 unchanged; greedy; warmup per job; no visualization. "
           "Lat includes pruning. Mem is PyTorch allocated/reserved, not whole-board usage.", flush=True)
     reports = []
-    for rate in RATES:
+    for job in spec["jobs"]:
+        rate, layer = job["prune_rate"], job["fastv_layer"]
         start = time.perf_counter()
-        print(f"\nStarting prune={rate}% on GPU {spec['gpu']} (new process)", flush=True)
-        exit_code = run_child(output / "run.json", rate, spec["gpu"], output / f"prune_{rate:02d}.log")
-        metrics_path = output / f"prune_{rate:02d}" / "metrics.json"
+        print(f"\nStarting {job['model']} on GPU {spec['gpu']} (new process)", flush=True)
+        exit_code = run_child(output / "run.json", rate, spec["gpu"],
+                              output / f"{job['job_id']}.log", layer=layer)
+        metrics_path = output / job["output_subdir"] / "metrics.json"
         if metrics_path.is_file():
             report = json.loads(metrics_path.read_text(encoding="utf-8"))
         else:
-            report = {"model": "LLaVA (no pruning)" if rate == 0 else f"FastV-mask {rate}%",
-                      "prune_rate": rate, "status": "failed", "complete": False,
+            report = {**job, "status": "failed", "complete": False,
                       "error": f"Worker exited {exit_code} without metrics; inspect its log"}
         if exit_code != 0:
             report.update(status="failed", complete=False)
@@ -302,11 +337,11 @@ def launch(args):
                               else f"{name}=N/A" for name, key in (
                                   ("ACC", "accuracy"), ("PRE", "precision"),
                                   ("Recall", "recall"), ("TNR", "tnr")))
-            print(f"Finished prune={rate}%: {scores}; Lat(mean)={report['lat_mean_ms']:.2f} ms; "
+            print(f"Finished {job['model']}: {scores}; Lat(mean)={report['lat_mean_ms']:.2f} ms; "
                   f"Mem(allocated)={report['mem_peak_allocated_gib']:.3f} GiB "
                   f"({report['mem_peak_allocated_pct']:.2f}%); unparsed={report['unparsed']}", flush=True)
         else:
-            print(f"FAILED prune={rate}%: {report.get('error')}; continuing remaining jobs", flush=True)
+            print(f"FAILED {job['model']}: {report.get('error')}; continuing remaining jobs", flush=True)
     print(f"Summary: {output / 'summary.csv'}", flush=True)
     return 0 if all(row["status"] == "success" for row in reports) else 1
 
@@ -317,9 +352,13 @@ def main():
     if args.worker_manifest:
         if args.worker_rate is None:
             parser.error("--worker-manifest requires --worker-rate")
-        return run_worker(args.worker_manifest, args.worker_rate)
-    if args.worker_rate is not None:
-        parser.error("--worker-rate is an internal option")
+        try:
+            job_info(args.worker_rate, args.worker_layer)
+        except ValueError as error:
+            parser.error(str(error))
+        return run_worker(args.worker_manifest, args.worker_rate, args.worker_layer)
+    if args.worker_rate is not None or args.worker_layer is not None:
+        parser.error("--worker-rate and --worker-layer are internal options")
     try:
         return launch(args)
     except (ValueError, OSError) as error:

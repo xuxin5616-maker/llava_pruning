@@ -821,16 +821,19 @@ Nonzero rates still include independent Q/K scoring overhead. The current implem
 ## Full-dataset ACC / PRE / Recall / TNR / Lat / Mem benchmark
 
 `benchmark_fastv.py` is separate from `ex.py` and `run.py`: it evaluates **all input
-records**, not the first 100. Four jobs run **sequentially on the same GPU**, each
+records**, not the first 100. Seven jobs run **sequentially on the same GPU**, each
 in a fresh process: LLaVA with pruning disabled, then the existing FastV **mask**
-implementation at 50%, 70% and 90%. The baseline uses the same checkpoint and
+implementation at 50%, 70% and 90% for **layer=2**, then those three rates for
+**layer=3**. These are independent single-layer FastV experiments, not two
+pruning stages in one run. The no-pruning baseline runs only once and is shared
+by both layer groups. The baseline uses the same checkpoint and
 the original no-pruning decoder path, not another checkpoint or a separate
 Triad checkout. The script does not physically drop tokens or change algorithms.
 
 On the existing working inference server:
 
 ```bash
-python benchmark_fastv.py --gpu 5 --output-dir output/fastv_lat_mem_01
+python benchmark_fastv.py --gpu 5 --output-dir output/fastv_layer2_3_lat_mem_01
 ```
 
 Defaults match the earlier full-data command: checkpoint
@@ -838,9 +841,10 @@ Defaults match the earlier full-data command: checkpoint
 `/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl`, data root
 `/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/`, v0, `anyres_max_9`, base-first
 packing, greedy generation, FP16 and FlashAttention2. **No visualization is
-captured or saved.** The layer/minimum-token/newline settings come from
-`configs/fastv.json`; rates are fixed to 0/50/70/90 in a new effective config,
-without modifying the source config. It prints the chosen layer at startup.
+captured or saved.** Minimum-token/newline settings come from `configs/fastv.json`;
+its layer/rates are overridden with layers 2/3 and rates 0/50/70/90 in separate
+effective configs, without modifying the source config. It prints the schedule
+at startup; layer numbers retain the existing FastV config semantics.
 
 Use `--model-path`, `--input-json`, `--data-root`, `--method-config`, `--seed`
 (default 42), and `--warmup` (default 10) to override these settings. GPU selection
@@ -848,26 +852,34 @@ is through `--gpu`, not a required `CUDA_VISIBLE_DEVICES` prefix: the launcher
 sets each child's environment before importing Torch. Keep that GPU free of
 other jobs and use the same hardware/software for comparisons. The output
 directory must be new/empty. No new reporting dependencies or environment
-upgrade are needed. Sync **all three runtime files** when updating the server:
+upgrade are needed. For the first installation, sync **all three runtime files**:
 `benchmark_fastv.py`, `llava_pruning/benchmark_timing.py`, and
-`llava_pruning/backend.py`; changing only the launcher is insufficient.
+`llava_pruning/backend.py`. To update the previous four-job benchmark to this
+seven-job version, only `benchmark_fastv.py` needs replacing; the measurement
+helper and backend have not changed. Use a new output directory and stop any old
+run before starting another on the same GPU; updating a file does not change an
+already-running launcher.
 
 Each job warms up on up to 10 evenly spaced input images, discards those
 measurements, then evaluates **every image in file order**, including the warmup
 images again. Batch size is 1, with the same per-image seed across jobs. Full
 model weights must fit on one GPU; CPU/disk offload is rejected. Source JSON
 identity and effective settings are checked between jobs. Progress is shown in
-the terminal and copied to `prune_XX.log`.
+the terminal and copied to `prune_00.log` or `layer_2_prune_50.log`, etc.
 
 Outputs in the selected directory:
 
-- `summary.csv`: four rows, with classification metrics, mean/p50/p95/std Lat,
+- `summary.csv`: seven rows, with `fastv_layer` (2/3, blank for the baseline),
+  `prune_rate`, classification metrics, mean/p50/p95/std Lat,
   peak allocated/reserved GiB, allocated percentage, counts and completion status.
   `accuracy`, `precision`, `recall`, `tnr` are fractions (0.9 means 90%);
   `lat_mean_ms` is the primary Lat metric and `mem_peak_allocated_gib` is primary Mem.
 - `summary.json`: the same results with measurement definitions and recorded
-  inference environment; `run.json` and `fastv_effective.json` preserve settings.
-- `prune_00`, `prune_50`, `prune_70`, `prune_90`: each contains `metrics.json` and
+  inference environment; `run.json`, `fastv_layer_2.json` and `fastv_layer_3.json`
+  preserve settings. Baseline `fastv_layer` is JSON null because it does not prune.
+- `prune_00` for the baseline, and `layer_2/prune_50`, `layer_2/prune_70`,
+  `layer_2/prune_90`, `layer_3/prune_50`, `layer_3/prune_70`, `layer_3/prune_90`:
+  each contains `metrics.json` and
   concise `predictions.jsonl` (ID, ground truth, full answer, timing and peak memory).
 
 **Lat boundary:** preprocessed image/text tensors are already on the GPU and
