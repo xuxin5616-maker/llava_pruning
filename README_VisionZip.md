@@ -62,6 +62,19 @@ max9 特征缩放、每行分隔 token 和可选的末尾分隔 token，与模�
 50%、90% 同理分别传入 `--prune-rate 50`、`90`。
 只支持整数 0～99，默认值已修正为 **70**。
 
+版本 `3.3-all-rate-layout` 同时对非零剪枝生效：在评分、选择和合并完成之后，
+将压缩特征按编码器原来的**内存轴排列**重新存储，再送入 projector。只复制数值，
+不改变 token 的逻辑顺序、合并公式、FP16 或 FlashAttention2，也不补回完整长度。
+例如编码器 `[B,N,C]` 使用 `[B,C,N]` 存储时，压缩后保持 `[B,C,K]` 存储；
+步长随保留长度 K 改变。原输入已经连续时不需要额外拷贝。
+0% 仍直接复用原张量，严格一致性检查不变。
+
+这是轻量布局修复，不保证非零剪枝的 projector 输出与未剪枝逐元素一致，
+因为输入尺寸不同仍可能改变底层计算。布局复制发生在生成计时内，计入 Lat/Mem。
+`run.json` 记录布局策略，逐样本 `predictions.jsonl` 的 `pruning` 下记录
+`encoder_feature_stride` 和 `projector_input_stride`，便于在服务器核对实际排列。
+原有非零率稀疏 AnyRes 拼接规则不变，因此 0%→1% 的指标差异不能只归因于布局。
+
 ### 在服务器上实际核对 0% 是否与原版一致
 
 ```bash
@@ -93,6 +106,28 @@ CUDA_VISIBLE_DEVICES=5 python runVisionZip.py \
   去掉 `--verify-zero` 可正常统计 VisionZip 0% 的指标。
 - 0% 仍有评分、选择等开销，所以即使答案完全一致，Lat/Mem **不必等于原版**。
   评估方法开销时不要把这个耗时当作纯原版 LLaVA 的耗时。
+
+### 比较布局修复后的 0% 与 1%
+
+更新脚本后，`python runVisionZip.py --version` 应显示 `3.3-all-rate-layout`。
+先按上面的方式运行 0% 严格校验（输出目录换成新的，例如
+`output/visionzip_layout_zero_check_01`）。验证模式没有分类汇总 CSV。
+如果要对比 ACC/PRE/Recall/TNR 和 Lat/Mem，再顺序运行以下两个正常实验：
+
+```bash
+for rate in 0 1; do
+  CUDA_VISIBLE_DEVICES=5 python runVisionZip.py \
+    --prune-rate "$rate" \
+    --save-prune-vis False \
+    --output-dir "output/visionzip_layout_rate_${rate}_01" || break
+done
+```
+
+沿用默认 MVTec 完整输入及提示词，不限制 100 张；自定义数据时两个实验需使用
+相同的模型、输入 JSON、data-root、prompt-version 和 seed。
+两份 `summary.csv` 对比总体指标，`prune_00/` 与 `prune_01/` 下的
+`classification_results.csv` 按 `question_id` 对齐后可比较 A/B 翻转及 token 数。
+1% 不能带 `--verify-zero`，该开关只用于未压缩路径的严格等价检查。
 
 共同设置固定为 AnyRes `anyres_max_9`、`base_first`、FP16、LLM FlashAttention2、
 greedy decoding（`do_sample=False`），完整生成答案，不强行只生成一个 token。
@@ -177,3 +212,5 @@ python -m unittest discover -s tests -p test_visionzip.py -v
 max9 缩放、分隔 token 配置和 dtype 的拼接与参考一致；真实 SigLIP attention 模块
 搭配非连续残差特征、MLP projector 和小 Qwen 的完整配对检查；FP16/FP32 特征的
 原存储及非零偏移保留。FP16 CUDA/7B 完整数据仍需上面的 `--verify-zero` 实测。
+非零率还覆盖：FP16/FP32 六种内存轴排列的无损重排；1/50/70/90/99% 的压缩数值
+和决策不变；1% 使用非连续 projector 输入的小 Qwen 完整生成。

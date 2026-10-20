@@ -51,7 +51,7 @@ DEFAULT_INPUT = "/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.
 PRUNE_RATE = 70
 SOURCE_COMMIT = "8f86b55c6f000eb033e6912538af2dd7dcb30502"
 SOURCE_URL = f"https://github.com/JIA-Lab-research/VisionZip/tree/{SOURCE_COMMIT}"
-SCRIPT_VERSION = "3.2-zero-layout"
+SCRIPT_VERSION = "3.3-all-rate-layout"
 
 
 # Reuse the project's loader, dataset protocol, metrics and passive TTFT timer.
@@ -147,6 +147,21 @@ class TokenDecisions:
         ]
 
 
+def _match_feature_memory_order(selected, reference):
+    """Store [B,K,F] in the encoder's axis order without changing its values.
+
+    SigLIP can expose [B,N,F] using channel-major [B,F,N] storage. Recreate
+    that order compactly for K retained tokens; do not pad back to N or cast.
+    Stride magnitudes necessarily change with K. Matching the layout removes
+    one source of Linear dispatch differences, not shape-dependent rounding.
+    """
+    if selected is reference:
+        return selected
+    order = sorted(range(reference.ndim), key=lambda dim: reference.stride(dim), reverse=True)
+    inverse = [order.index(dim) for dim in range(reference.ndim)]
+    return selected.permute(order).contiguous().permute(inverse)
+
+
 def compress_tokens(features, scores, metric, dominant_count, contextual_count, *, capture=False):
     """Return compressed [B,D+C,F] and GPU-only decisions for sparse packing.
 
@@ -165,6 +180,7 @@ def compress_tokens(features, scores, metric, dominant_count, contextual_count, 
     A full dominant budget still runs selection, but returns the original
     feature tensor: materializing equal values in contiguous storage can change
     Linear's dispatch/rounding relative to the original SigLIP residual layout.
+    Compressed features keep the encoder's memory axis order in compact storage.
     """
     dominant_count, contextual_count = _validate_inputs(
         features, scores, metric, dominant_count, contextual_count
@@ -218,7 +234,9 @@ def compress_tokens(features, scores, metric, dominant_count, contextual_count, 
 
     # No reduction/merge: preserve the tensor itself, including strides and
     # storage offset, not just its values. Scoring/selection/audit still run.
-    compressed = features if full_selection else torch.cat((dominant_features, contextual_features), dim=1)
+    compressed = (features if full_selection else
+                  _match_feature_memory_order(
+                      torch.cat((dominant_features, contextual_features), dim=1), features))
     if not bool(torch.isfinite(compressed).all()):
         raise ValueError("VisionZip feature aggregation produced non-finite values")
     # No .cpu()/.tolist() here: packing consumes GPU indices directly.
@@ -401,6 +419,8 @@ class VisionZipAdapter:
             "dominant_per_view": dominant, "contextual_per_view": contextual,
             "encoder_tokens_before": int(hidden.shape[0] * hidden.shape[1]),
             "encoder_tokens_after": int(hidden.shape[0] * (dominant + contextual)),
+            "encoder_feature_stride": list(hidden.stride()),
+            "projector_input_stride": list(zipped.stride()),
             "actual_encoder_prune_rate_percent": 100 * (1 - (dominant + contextual) / hidden.shape[1]),
             "packing": "base_compressed + global_row_major_tile_dominants + tile_contextual; no row newlines",
             "budget_scope": "per_raw_encoder_view; ceil(remaining); 54:10 when compressed, all dominant when full",
@@ -982,6 +1002,9 @@ def source_metadata(prune_rate=PRUNE_RATE):
         "zero_policy": "Run the method: score/select all tokens in original order, no merge; "
                        "reuse the original feature tensor and strides for projector input; "
                        "complete-grid AnyRes packing preserves unpad/max9/newlines. No model-path bypass.",
+        "projector_layout_policy": "Match encoder memory axis order for compressed features in compact storage; "
+                                   "no dtype change, full-length padding or change to merge/packing. "
+                                   "Reduced shapes can still change numerical rounding.",
         "packing": ("complete selected grid with unpad/max9/newlines" if prune_rate == 0 else
                     "official sparse Base + spatial tile dominants + tile contextual, no unpad/max9 resize/newlines"),
         "visualization": {"visibility_over_white": VISIBILITY,

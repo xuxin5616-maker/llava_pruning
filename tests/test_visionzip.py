@@ -2,6 +2,7 @@
 import contextlib
 import csv
 import io
+import itertools
 import json
 import math
 from pathlib import Path
@@ -140,6 +141,49 @@ class CompressionTests(unittest.TestCase):
                     self.assertEqual(output.data_ptr(), features.data_ptr())
                     self.assertEqual(decisions.retained_count, 729)
                     self.assertEqual(decisions.audit is not None, capture)
+
+    def test_repacking_preserves_values_dtype_and_matches_reference_memory_order(self):
+        source_shape, selected_shape = (2, 11, 8), (2, 7, 8)
+        for dtype in (torch.float32, torch.float16):
+            for order in itertools.permutations(range(3)):
+                with self.subTest(dtype=dtype, order=order):
+                    inverse = tuple(order.index(dim) for dim in range(3))
+                    reference = torch.empty(tuple(source_shape[dim] for dim in order),
+                                            dtype=dtype).permute(inverse)
+                    selected = torch.randn(selected_shape).to(dtype)
+                    with patch.object(torch.Tensor, "cpu", side_effect=AssertionError("No CPU transfer")):
+                        actual = vz._match_feature_memory_order(selected, reference)
+                    strides, step = [0] * 3, 1
+                    for dim in reversed(order):
+                        strides[dim] = step
+                        step *= selected_shape[dim]
+                    self.assertEqual(actual.stride(), tuple(strides))
+                    self.assertTrue(torch.equal(actual, selected))
+                    self.assertEqual(actual.dtype, selected.dtype)
+                    self.assertEqual(actual.device, selected.device)
+                    self.assertEqual(actual.untyped_storage().nbytes(),
+                                     selected.numel() * selected.element_size())
+                    if order == (0, 1, 2):
+                        self.assertEqual(actual.data_ptr(), selected.data_ptr())
+
+    def test_nonzero_compression_matches_old_values_and_keeps_siglip_memory_order(self):
+        torch.manual_seed(91)
+        features = torch.randn(2, 8, 729).transpose(1, 2)
+        scores, metric = torch.rand(2, 729), torch.randn(2, 729, 4)
+        for rate in (1, 50, 70, 90, 99):
+            with self.subTest(rate=rate):
+                counts = vz.token_budget(729, rate / 100)
+                # Disable only the new layout copy to recover the pre-fix path.
+                with patch.object(vz, "_match_feature_memory_order", side_effect=lambda x, reference: x):
+                    previous, previous_decisions = vz.compress_tokens(
+                        features, scores, metric, *counts, capture=True)
+                output, decisions = vz.compress_tokens(features, scores, metric, *counts, capture=True)
+                retained = sum(counts)
+                self.assertEqual(output.shape, (2, retained, 8))
+                self.assertEqual(output.stride(), (8 * retained, 1, retained))
+                self.assertFalse(output.is_contiguous())
+                self.assertTrue(torch.equal(output, previous))
+                self.assertEqual(decisions.export(), previous_decisions.export())
 
     def test_complete_grid_packing_matches_actual_reference_for_geometry_and_dtypes(self):
         from test_reference import ToyPacking
@@ -629,6 +673,21 @@ class ZeroVerificationTests(unittest.TestCase):
         self.assertNotIn("prepare_inputs_labels_for_multimodal", backend.model.__dict__)
         self.assertNotIn("generate", backend.model.__dict__)
         self.assertFalse(backend.model.get_model().mm_projector._forward_hooks)
+
+    def test_one_percent_runs_sparse_prefill_with_original_feature_memory_order(self):
+        backend = self.backend()
+        method = vz.SingleFileVisionZip(backend.model.get_model())
+        trace = {}
+        result = vz.generate_sample(backend, method, types.SimpleNamespace(sample_id="one_percent"),
+                                    "test", 1, 42, measure=False, capture=False, trace=trace)
+        layout = trace["tensor_layouts"]["selected_features"]
+        self.assertEqual(trace["selected_features"].shape, (2, 722, 8))
+        self.assertEqual(layout["stride"], [8 * 722, 1, 722])
+        self.assertFalse(layout["is_contiguous"])
+        self.assertEqual(result["stats"]["tokens_per_view_after"], 722)
+        self.assertEqual(result["stats"]["final_llm_visual_tokens"], 1444)
+        self.assertFalse(result["stats"]["full_grid_identity"])
+        self.assertGreater(trace["generated_token_ids"].numel(), 0)
 
     def test_missing_shape_or_dtype_difference_cannot_pass(self):
         base = {key: torch.ones(2) for key in vz.TRACE_FIELDS}
