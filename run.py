@@ -42,6 +42,10 @@ def build_parser():
     timing.add_argument("--exclude-pruning-time", dest="include_pruning_time", action="store_false",
                         help="Subtract separately timed pruning blocks; diagnostic timing, pruning still runs")
     parser.set_defaults(include_pruning_time=True)
+    parser.add_argument("--benchmark-metrics", action="store_true",
+                        help="Record first-token Lat and peak Mem; requires one GPU, greedy decoding, included pruning time and no sample visualization")
+    parser.add_argument("--warmup", type=int, default=10,
+                        help="With --benchmark-metrics: warmup images per rate before evaluating ALL inputs (default 10; 0 disables warmup)")
     parser.add_argument("--output-dir", type=Path, default=PROJECT / "outputs" / "run")
     parser.add_argument("--seed", type=int, default=None,
                         help="Fixed seed for a repeatable run; default generates a new seed")
@@ -61,6 +65,7 @@ def main():
         image_token_order=args.image_token_order,
         save_attention_vis=args.save_attention_vis and not no_plots, output_dir=args.output_dir,
         seed=args.seed, no_sample=args.no_sample, include_pruning_time=args.include_pruning_time,
+        benchmark_metrics=args.benchmark_metrics, warmup=args.warmup,
     )
     print(f"Saved results to {output}")
     if no_plots:

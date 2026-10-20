@@ -6,6 +6,15 @@ from run import build_parser
 
 
 class CliTests(unittest.TestCase):
+    def test_benchmark_metrics_is_opt_in_with_ten_warmup_images(self):
+        basic = ["--model-path", "checkpoint", "--input-json", "input.jsonl", "--data-root", "dataset"]
+        args = build_parser().parse_args(basic)
+        self.assertFalse(args.benchmark_metrics)
+        self.assertEqual(args.warmup, 10)
+        args = build_parser().parse_args(basic + ["--benchmark-metrics", "--warmup", "0"])
+        self.assertTrue(args.benchmark_metrics)
+        self.assertEqual(args.warmup, 0)
+
     def test_image_order_default_and_forwarding(self):
         import run as cli
         basic = ["--model-path", "checkpoint", "--input-json", "input.jsonl", "--data-root", "dataset"]

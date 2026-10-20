@@ -13,6 +13,15 @@ from .metrics import Accuracy, METRIC_RULE
 from .prompts import resolve_prompt
 
 
+BENCHMARK_SAMPLE_FIELDS = ("lat_seconds", "generation_seconds", "generated_tokens",
+                           "peak_allocated_bytes", "peak_reserved_bytes")
+BENCHMARK_SUMMARY_FIELDS = (
+    "lat_mean_ms", "lat_p50_ms", "lat_p95_ms", "lat_std_ms",
+    "mem_peak_allocated_gib", "mem_peak_reserved_gib", "mem_peak_allocated_pct",
+    "device_total_gib", "generation_mean_ms", "mean_generated_tokens", "warmup_samples",
+)
+
+
 def _write_metrics(path, metrics):
     # The rule is shared by every rate and is already recorded in run.json.
     results = {key: value for key, value in metrics.items() if key != "rule"}
@@ -22,9 +31,17 @@ def _write_metrics(path, metrics):
 def run(*, model_path, input_json, data_root, prompt_version, method_name,
         method_config, roi_mode, save_prune_vis, save_attention_vis,
         output_dir, seed=None, no_sample=True, include_pruning_time=True,
-        image_token_order="base_first"):
+        image_token_order="base_first", benchmark_metrics=False, warmup=10):
     if type(include_pruning_time) is not bool:
         raise ValueError("include_pruning_time must be a boolean")
+    if type(benchmark_metrics) is not bool:
+        raise ValueError("benchmark_metrics must be a boolean")
+    if type(warmup) is not int or warmup < 0:
+        raise ValueError("warmup must be a nonnegative integer")
+    if benchmark_metrics and (not no_sample or not include_pruning_time
+                              or save_prune_vis or save_attention_vis):
+        raise ValueError("--benchmark-metrics requires --no-sample, --include-pruning-time "
+                         "and no sample visualization (use --no-plots)")
     validate_image_token_order(image_token_order, roi_mode)
     if roi_mode == "base_only" and method_config is None and method_name == "fastv":
         method_config = Path(__file__).resolve().parents[1] / "configs" / "baseline.json"
@@ -49,7 +66,19 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
     output = Path(output_dir).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {output}")
+    if benchmark_metrics:
+        # Reuse the exact reporting/warmup protocol already used by VisionZip.
+        # No heavy dependencies or CUDA checks are added to the legacy path.
+        import torch
+        from benchmark_fastv import (DEFINITIONS, measurement_summary,
+                                     validate_single_gpu, warmup_indices)
+        if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+            raise RuntimeError("--benchmark-metrics requires exactly one visible CUDA GPU; "
+                               "set CUDA_VISIBLE_DEVICES=0 (or another single GPU ID)")
     backend = LlavaBackend(model_path, roi_mode=roi_mode, image_token_order=image_token_order)
+    if benchmark_metrics:
+        validate_single_gpu(backend.model, torch)
+        total_memory = torch.cuda.get_device_properties(0).total_memory
     output.mkdir(parents=True, exist_ok=True)
     config = json.loads(Path(method_config).read_text(encoding="utf-8"))
     metadata = {
@@ -68,12 +97,23 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         "seed_origin": "generated" if generated_seed else "explicit",
         "do_sample": not no_sample,
         "include_pruning_time": include_pruning_time,
+        "benchmark_metrics": benchmark_metrics,
         "samples": len(samples),
         "decoding": ("sampling, temperature=0.2, top_p=0.7, max_new_tokens<=512"
                      if not no_sample else "greedy, max_new_tokens<=512 (LLaVA context budget)"),
         "inference": getattr(backend, "inference_config", {}),
         "metric_rule": METRIC_RULE,
     }
+    if benchmark_metrics:
+        metadata.update(
+            warmup_requested=warmup,
+            benchmark_definitions={key: DEFINITIONS[key] for key in
+                                   ("lat", "memory", "memory_percent", "generation", "units")},
+            benchmark_protocol="One model load; warm up separately before each rate, then evaluate "
+                               "ALL input images. Warmup answers/timings excluded. No allocator cache "
+                               "clearing between rates; reserved memory may reflect earlier rates. "
+                               "Per-sample peaks reset immediately before full-answer generation.",
+        )
     (output / "run.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     if not include_pruning_time:
         print("Timing diagnostic: generation_seconds = generation_with_pruning_seconds - pruning_seconds. "
@@ -83,6 +123,8 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
     summary_fields = ("prune_rate", "complete", "expected_samples", "evaluated_samples",
                       "labeled_samples", "correct", "incorrect", "unparsed", "accuracy",
                       "parsed_samples", "tp", "fp", "tn", "fn", "precision", "recall", "tnr")
+    if benchmark_metrics:
+        summary_fields += BENCHMARK_SUMMARY_FIELDS
     with summary_path.open("w", encoding="utf-8", newline="") as summary_file:
         csv.writer(summary_file).writerow(summary_fields)
     for rate in method.rates:
@@ -91,6 +133,27 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         records_path = rate_dir / "predictions.jsonl"
         metrics_path = rate_dir / "metrics.json"
         accuracy = Accuracy(expected_samples=len(samples))
+        measurements = []
+        warmups_done = 0
+
+        def current_metrics(complete):
+            metrics = accuracy.result(rate, complete=complete)
+            if benchmark_metrics:
+                metrics.update(measurement_summary(measurements, total_memory))
+                metrics["warmup_samples"] = warmups_done
+            return metrics
+
+        if benchmark_metrics:
+            for index in warmup_indices(len(samples), warmup):
+                backend.generate(
+                    samples[index], prompts[index][0], method, rate, roi_mode,
+                    capture_visualization=False, capture_attention=False,
+                    random_seed=seed + index, do_sample=False,
+                    include_pruning_time=True, benchmark_metrics=True,
+                )
+                warmups_done += 1
+                print(f"rate={rate:02d} warmup={warmups_done}/{min(warmup, len(samples))}", flush=True)
+            print(f"rate={rate:02d}: evaluating ALL {len(samples)} images with Lat/Mem measurement", flush=True)
         layer_path = rate_dir / "layer_tokens.csv"
         layer_fields = ("question_id", "method", "prune_rate", "layer", "image_tokens_in",
                         "image_tokens_out", "sequence_tokens_in", "sequence_tokens_out",
@@ -105,6 +168,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                     random_seed=seed + index,
                     do_sample=not no_sample,
                     include_pruning_time=include_pruning_time,
+                    **({"benchmark_metrics": True} if benchmark_metrics else {}),
                 )
                 if visualize:
                     method.visualize(
@@ -129,6 +193,9 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                 if not include_pruning_time:
                     record.update({key: result[key] for key in (
                         "generation_with_pruning_seconds", "pruning_seconds")})
+                if benchmark_metrics:
+                    measurement = {key: result[key] for key in BENCHMARK_SAMPLE_FIELDS}
+                    record.update(measurement)
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
                 stream.flush()
                 if result["stats"].get("layers"):
@@ -141,9 +208,15 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                             writer.writerow({"question_id": sample.sample_id, "method": method.name,
                                              "prune_rate": rate, **layer_row})
                 accuracy.add(sample.gt, result["answer"])
-                _write_metrics(metrics_path, accuracy.result(rate, complete=False))
-                print(f"rate={rate:02d} sample={index + 1}/{len(samples)} id={sample.sample_id}", flush=True)
-        metrics = accuracy.result(rate, complete=True)
+                if benchmark_metrics:
+                    measurements.append(measurement)
+                _write_metrics(metrics_path, current_metrics(complete=False))
+                progress = f"rate={rate:02d} sample={index + 1}/{len(samples)} id={sample.sample_id}"
+                if benchmark_metrics:
+                    progress += (f" Lat={measurement['lat_seconds'] * 1000:.2f} ms "
+                                 f"Mem={measurement['peak_allocated_bytes'] / 1024**3:.3f} GiB")
+                print(progress, flush=True)
+        metrics = current_metrics(complete=True)
         _write_metrics(metrics_path, metrics)
         with summary_path.open("a", encoding="utf-8", newline="") as summary_file:
             csv.writer(summary_file).writerow(metrics[field] for field in summary_fields)
@@ -154,4 +227,8 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         detail = " ".join(f"{name}={metrics[name]:.2%}" if metrics[name] is not None else f"{name}=N/A"
                           for name in ("precision", "recall", "tnr"))
         print(f"rate={rate:02d} {detail} (parsed labeled samples={metrics['parsed_samples']})", flush=True)
+        if benchmark_metrics:
+            print(f"rate={rate:02d} Lat(mean)={metrics['lat_mean_ms']:.2f} ms "
+                  f"Mem(peak allocated)={metrics['mem_peak_allocated_gib']:.3f} GiB "
+                  f"Mem(peak reserved)={metrics['mem_peak_reserved_gib']:.3f} GiB", flush=True)
     return output

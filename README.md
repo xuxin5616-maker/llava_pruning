@@ -80,6 +80,64 @@ For known MVTec categories, `--prompt-version v0|v1|v2|v3` selects the original 
 
 ## Run
 
+### Optional Lat / peak Mem in `run.py`
+
+Add `--benchmark-metrics --warmup 10` to use the **same first-token and memory
+measurement implementation as `runVisionZip.py` / `benchmark_fastv.py`**.
+The switch is opt-in; without it, existing runs still record full-answer
+`generation_seconds` only, not Lat or peak Mem. No model precision, attention
+implementation, ROI mode, pruning configuration, prompt, or answer budget is
+changed by the measurement switch.
+
+For the unpruned **AnyRes-only (no Base)** experiment:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run.py \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --prompt-version v0 \
+  --roi-mode anyres_only \
+  --method fastv \
+  --method-config configs/baseline.json \
+  --no-sample --no-plots \
+  --benchmark-metrics --warmup 10 --seed 42 \
+  --output-dir output/anyres_only_00_lat_mem_01
+```
+
+- **All input images** are evaluated, including images used for warmup. Before
+  each rate, `min(warmup, sample_count)` evenly spaced samples run through the
+  same measured path; their answers/timings are discarded. `--warmup 0` explicitly
+  disables warmup. The model is loaded once, not once per image/rate.
+- Requires one visible CUDA GPU with all model parameters resident on it, greedy
+  decoding, included pruning time, and no sample visualization/attention capture.
+  Incompatible options are rejected, not silently changed. `--no-plots` also
+  disables the final metric plot. The switch works with Base-only and the other
+  existing ROI modes and with FastV/ViCo; rates still come from the chosen config.
+- `summary.csv` and `prune_XX/metrics.json` retain ACC/PRE/Recall/TNR and add
+  `lat_mean_ms`, `lat_p50_ms`, `lat_p95_ms`, `lat_std_ms`,
+  `mem_peak_allocated_gib`, `mem_peak_reserved_gib`, `mem_peak_allocated_pct`,
+  `device_total_gib`, `generation_mean_ms`, `mean_generated_tokens`, `warmup_samples`.
+- `prune_XX/predictions.jsonl` adds per-image `lat_seconds`, `generated_tokens`,
+  `peak_allocated_bytes`, `peak_reserved_bytes`; `generation_seconds` remains the
+  **full-answer** duration. `run.json` records the protocol and effective warmup
+  request. Old result files cannot retrospectively provide missing Lat/Mem.
+- **Lat** starts immediately before synchronized `model.generate`, with inputs
+  already on GPU, and ends at the first selected token. It includes the vision
+  encoder/projector/packing/prefill/pruning but not model loading, disk I/O, CPU
+  preprocessing, H2D transfer, or result saving. Generation still runs to its
+  normal stopping condition to measure accuracy; it is not truncated to one token.
+- **Mem** is the maximum across samples of PyTorch's per-call peak during full
+  answer generation, including resident weights/inputs. It is not whole-board
+  usage or GPU compute utilization. Peaks reset before each call; reserved
+  memory includes allocator cache. This single-process rate sweep does not clear
+  cache/reload between rates, so reserved memory can reflect earlier rates.
+
+Sync **both `run.py` and `llava_pruning/runner.py`** to the server. This reuses
+the project's existing `benchmark_fastv.py`, `llava_pruning/backend.py` and
+`llava_pruning/benchmark_timing.py`; no dependency upgrade is required. The
+VisionZip-only padding audit is not added to `run.py` by this switch.
+
 Inference now matches the restored local LLaVA loader: **FP16 (`torch.float16`) + FlashAttention2**, greedy decoding, and at most **512 new tokens** using LLaVA's context-budget calculation. TF32 settings are left at the environment's values, as in LLaVA. Vision-tower loading follows the original loader (including its lazy-loading behavior); actual model/vision dtypes, attention implementation and library versions are recorded in `run.json`. There is no silent SDPA/BF16 fallback.
 
 Use the **same environment as the original LLaVA**, including its `flash-attn` build, Torch, Transformers, CUDA and image libraries. `requirements.txt` pins the shared Python dependencies but does not install the platform-specific FlashAttention extension. Run on one visible GPU for the initial comparison:
