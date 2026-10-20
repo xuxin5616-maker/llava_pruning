@@ -51,7 +51,7 @@ DEFAULT_INPUT = "/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.
 PRUNE_RATE = 70
 SOURCE_COMMIT = "8f86b55c6f000eb033e6912538af2dd7dcb30502"
 SOURCE_URL = f"https://github.com/JIA-Lab-research/VisionZip/tree/{SOURCE_COMMIT}"
-SCRIPT_VERSION = "3.3-all-rate-layout"
+SCRIPT_VERSION = "3.5-padding-grid-audit"
 
 
 # Reuse the project's loader, dataset protocol, metrics and passive TTFT timer.
@@ -279,11 +279,16 @@ def baseline_packed_count(original_size, grid, base_grid, merge_type):
     return base_grid ** 2 + rows * (cols + 1) + int(merge_type == "spatial_unpad_add_newl")
 
 
-def pack_sparse_views(features, decisions, grid, dominant_count):
-    """Algebraic equivalent of official restore_image_features_sorted, no CLS.
+def pack_sparse_views(features, decisions, grid, dominant_count, *,
+                      image_newline=None, merge_type="spatial_unpad"):
+    """Sparse order, optionally with checkpoint row separators (our adaptation).
 
     Global Base remains first. High-resolution dominants follow original global
     row-major coordinates; contextual tokens are appended in tile/anchor order.
+    When supplied, image_newline terminates EVERY original raw AnyRes row,
+    including rows with no dominant tokens. Base/contextual order is unchanged.
+    None retains the legacy no-newline path for a controlled comparison.
+    This does not restore unpadding/max9 resizing on sparse features.
     """
     import torch
     grid_width, grid_height = grid
@@ -301,9 +306,24 @@ def pack_sparse_views(features, decisions, grid, dominant_count):
     row, col = tiles // grid_width, tiles % grid_width
     positions = ((row * side + local // side) * (grid_width * side) + col * side + local % side).flatten()
     dominants = features[1:, :dominant_count].reshape(-1, features.shape[-1])
+    if image_newline is not None:
+        if (merge_type not in {"spatial_unpad", "spatial_unpad_add_newl"}
+                or image_newline.ndim != 1 or image_newline.shape[0] != features.shape[-1]):
+            raise ValueError("Sparse row newlines require spatial_unpad packing and one hidden-size vector")
+        # Insert by ORIGINAL global row/column, not every 27 retained tokens.
+        # Horizontal tiles share a row separator; an empty row retains its marker.
+        width, rows = grid_width * side, grid_height * side
+        positions = (positions // width) * (width + 1) + positions % width
+        row_ends = torch.arange(rows, device=features.device) * (width + 1) + width
+        newline = image_newline.to(device=features.device, dtype=features.dtype)
+        positions = torch.cat((positions, row_ends))
+        dominants = torch.cat((dominants, newline[None].expand(rows, -1)), dim=0)
     dominants = dominants[torch.argsort(positions)]
     contexts = features[1:, dominant_count:].reshape(-1, features.shape[-1])
-    return torch.cat((features[0], dominants, contexts), dim=0)
+    pieces = [features[0], dominants, contexts]
+    if image_newline is not None and merge_type == "spatial_unpad_add_newl":
+        pieces.append(newline[None])  # separate final marker, after contextual tokens
+    return torch.cat(pieces, dim=0)
 
 
 def pack_full_views(features, decisions, grid, original_size, image_newline, merge_type):
@@ -349,8 +369,11 @@ def pack_full_views(features, decisions, grid, original_size, image_newline, mer
 
 
 class VisionZipAdapter:
-    def __init__(self, core):
+    def __init__(self, core, *, sparse_row_newlines=True):
+        if type(sparse_row_newlines) is not bool:
+            raise ValueError("sparse_row_newlines must be a boolean")
         self.core = core
+        self.sparse_row_newlines = sparse_row_newlines
         self.tower = core.get_vision_tower()
         self.capture_decisions = False
         self.decisions = None
@@ -422,7 +445,7 @@ class VisionZipAdapter:
             "encoder_feature_stride": list(hidden.stride()),
             "projector_input_stride": list(zipped.stride()),
             "actual_encoder_prune_rate_percent": 100 * (1 - (dominant + contextual) / hidden.shape[1]),
-            "packing": "base_compressed + global_row_major_tile_dominants + tile_contextual; no row newlines",
+            "sparse_row_newlines": self.sparse_row_newlines,
             "budget_scope": "per_raw_encoder_view; ceil(remaining); 54:10 when compressed, all dominant when full",
         }
         return self.core.mm_projector(zipped)
@@ -440,8 +463,19 @@ class VisionZipAdapter:
                 self.core.config.mm_patch_merge_type)
             self.stats["packing"] = "complete selected grid: unpad + max9 resize + row newlines + Base first"
         else:
-            packed = pack_sparse_views(image_features[0], self.decisions, grid, self.dominant_count)
-            newlines = 0
+            packed = pack_sparse_views(
+                image_features[0], self.decisions, grid, self.dominant_count,
+                image_newline=self.core.image_newline if self.sparse_row_newlines else None,
+                merge_type=self.core.config.mm_patch_merge_type)
+            newlines = (grid[1] * self.tower.num_patches_per_side
+                        + int(self.core.config.mm_patch_merge_type == "spatial_unpad_add_newl")
+                        if self.sparse_row_newlines else 0)
+            self.stats["packing"] = (
+                "Base compressed + global-row-major tile dominants with original-row newlines + "
+                "tile contextual + optional final newline; no unpad/max9 resize"
+                if self.sparse_row_newlines else
+                "legacy Base compressed + global-row-major tile dominants + tile contextual; "
+                "no unpad/max9 resize/newlines")
         # Geometry from the same config used by process_images; no extra encoder pass.
         size = int(self.tower.image_size)
         self.crop_metadata = {
@@ -963,8 +997,8 @@ class SingleFileVisionZip:
     """No registry, external method module, JSON config, or vendor edits needed."""
     name = "visionzip"
 
-    def __init__(self, core):
-        self.adapter = VisionZipAdapter(core)
+    def __init__(self, core, *, sparse_row_newlines=True):
+        self.adapter = VisionZipAdapter(core, sparse_row_newlines=sparse_row_newlines)
 
     def configure(self, core, prune_rate, *, capture_attention=False, capture_visualization=True):
         prune_rate = validate_prune_rate(prune_rate)
@@ -984,7 +1018,7 @@ def validate_prune_rate(value):
     return value
 
 
-def source_metadata(prune_rate=PRUNE_RATE):
+def source_metadata(prune_rate=PRUNE_RATE, *, sparse_row_newlines=True):
     prune_rate = validate_prune_rate(prune_rate)
     dominant, contextual = token_budget(729, prune_rate / 100)
     return {
@@ -999,6 +1033,11 @@ def source_metadata(prune_rate=PRUNE_RATE):
                    f"{dominant + contextual}: dominant{dominant}/contextual{contextual}"),
         "requested_prune_rate_percent": prune_rate,
         "mode": "visionzip_siglip_adaptation",
+        "sparse_row_newlines": sparse_row_newlines,
+        "sparse_newline_policy": "Nonzero only: one checkpoint image_newline after every raw AnyRes "
+                                 "dominant spatial row, including empty rows; Base/context order unchanged. "
+                                 "spatial_unpad_add_newl also appends one final marker. "
+                                 "This is a local adaptation, not the upstream sparse packing.",
         "zero_policy": "Run the method: score/select all tokens in original order, no merge; "
                        "reuse the original feature tensor and strides for projector input; "
                        "complete-grid AnyRes packing preserves unpad/max9/newlines. No model-path bypass.",
@@ -1006,7 +1045,9 @@ def source_metadata(prune_rate=PRUNE_RATE):
                                    "no dtype change, full-length padding or change to merge/packing. "
                                    "Reduced shapes can still change numerical rounding.",
         "packing": ("complete selected grid with unpad/max9/newlines" if prune_rate == 0 else
-                    "official sparse Base + spatial tile dominants + tile contextual, no unpad/max9 resize/newlines"),
+                    "sparse Base + spatial tile dominants with row newlines + tile contextual; no unpad/max9 resize"
+                    if sparse_row_newlines else
+                    "legacy sparse Base + spatial tile dominants + tile contextual; no unpad/max9 resize/newlines"),
         "visualization": {"visibility_over_white": VISIBILITY,
                           "merged_sources": "information contributes to contextual features"},
     }
@@ -1074,6 +1115,8 @@ def build_parser():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-prune-vis", type=parse_bool, nargs="?", const=True, default=True,
                         metavar="{True,False}", help="Preserve source visualizations (default True); use False for Lat/Mem comparison")
+    parser.add_argument("--no-sparse-row-newlines", dest="sparse_row_newlines", action="store_false",
+                        help="Nonzero rates only: reproduce legacy sparse packing without row newlines; default restores them. Zero is unchanged.")
     parser.add_argument("--self-test", action="store_true", help="Synthetic geometry preview only; no weights or CUDA needed")
     parser.add_argument("--verify-zero", action="store_true",
                         help="With --prune-rate 0: verification-only paired runs against original packing; no performance report")
@@ -1124,7 +1167,8 @@ TIMING_FIELDS = ("lat_seconds", "generation_seconds", "generated_tokens",
                  "peak_allocated_bytes", "peak_reserved_bytes")
 TOKEN_FIELDS = ("encoder_views", "tokens_per_view_before", "tokens_per_view_after",
                 "dominant_per_view", "contextual_per_view", "actual_encoder_prune_rate_percent",
-                "baseline_packed_tokens", "final_llm_visual_tokens", "actual_packed_reduction_percent")
+                "baseline_packed_tokens", "final_llm_visual_tokens", "actual_packed_reduction_percent",
+                "newline_tokens_after")
 SUMMARY_FIELDS = (
     "dataset", "method", "prune_rate", "status", "complete", "expected_samples", "evaluated_samples",
     "labeled_samples", "correct", "incorrect", "unparsed", "parsed_samples",
@@ -1134,6 +1178,77 @@ SUMMARY_FIELDS = (
     "generation_mean_ms", "mean_generated_tokens", "warmup_samples",
     "capture_visualization_decisions", "model_load_seconds", "run_wall_seconds", "error",
 )
+
+
+@contextmanager
+def observe_anyres_padding():
+    """Observe the existing PIL padding call; do not replace its computation.
+
+    This standalone runner is single-threaded. Restore the module function even
+    on failure. No image copies, pixel scans, GPU work or extra encoder passes.
+    """
+    from llava import mm_utils
+    original = mm_utils.resize_and_pad_image
+    calls = []
+
+    def observe(image, target_resolution):
+        result = original(image, target_resolution)
+        calls.append((tuple(image.size), tuple(target_resolution), tuple(result.size)))
+        return result
+
+    mm_utils.resize_and_pad_image = observe
+    try:
+        yield calls
+    finally:
+        mm_utils.resize_and_pad_image = original
+
+
+GEOMETRY_FIELDS = (
+    "original_width", "original_height", "anyres_grid_width", "anyres_grid_height",
+    "anyres_tiles", "canvas_width", "canvas_height",
+    "padding_left", "padding_top", "padding_right", "padding_bottom",
+    "padding_required", "padding_call_observed", "padding_output_size_matches",
+    "padding_missing_or_mismatch", "baseline_unpad_tokens", "unpad_executed",
+    "unpad_required_but_skipped",
+)
+
+
+def audit_anyres_geometry(metadata, token_side, full_grid, padding_calls):
+    """Separate image padding from feature unpadding; count no GPU tensors.
+
+    padding_* is an operation/size audit of the checked-in preprocessing, not a
+    pixel-content test. baseline_unpad_tokens counts RAW grid positions removed
+    by the baseline unpad operation, not padding tokens surviving sparse merging.
+    """
+    original = tuple(metadata["original_size"])
+    grid = tuple(metadata["grid_patches"])
+    size = metadata["processed_view_sizes"][0][0]
+    geometry = ScoreGeometry.create(original, grid, size, 1)
+    target = (grid[0] * size, grid[1] * size)
+    left, top = geometry.paste_xy
+    right, bottom = (target[0] - left - geometry.resized_size[0],
+                     target[1] - top - geometry.resized_size[1])
+    required = any((left, top, right, bottom))
+    matching = [output for source, canvas, output in padding_calls
+                if source == original and canvas == target]
+    output_matches = (all(output == target for output in matching) if matching else None)
+    # Match vendor unpad_image's int/floor behavior, including odd remainders.
+    rows, cols = grid[1] * token_side, grid[0] * token_side
+    if original[0] / original[1] > cols / rows:
+        removed = 2 * ((rows - int(original[1] * (cols / original[0]))) // 2) * cols
+    else:
+        removed = 2 * ((cols - int(original[0] * (rows / original[1]))) // 2) * rows
+    return dict(
+        original_width=original[0], original_height=original[1],
+        anyres_grid_width=grid[0], anyres_grid_height=grid[1], anyres_tiles=grid[0] * grid[1],
+        canvas_width=target[0], canvas_height=target[1],
+        padding_left=left, padding_top=top, padding_right=right, padding_bottom=bottom,
+        padding_required=required, padding_call_observed=bool(matching),
+        padding_output_size_matches=output_matches,
+        padding_missing_or_mismatch=bool(required and not output_matches),
+        baseline_unpad_tokens=removed, unpad_executed=bool(full_grid),
+        unpad_required_but_skipped=bool(removed > 0 and not full_grid),
+    )
 
 
 def generate_sample(backend, method, sample, prompt, rate, seed, *, measure, capture, trace=None):
@@ -1146,14 +1261,21 @@ def generate_sample(backend, method, sample, prompt, rate, seed, *, measure, cap
     """
     method.adapter.capture_decisions = bool(capture)
     method.configure(backend.model.get_model(), rate)
-    with visionzip_generation(backend.model, method.adapter):
+    with observe_anyres_padding() as padding_calls, visionzip_generation(backend.model, method.adapter):
         with capture_generation_trace(backend.model, trace) if trace is not None else nullcontext():
-            return backend.generate(
+            result = backend.generate(
                 sample, prompt, method, rate, "anyres_max_9",
                 capture_visualization=False, capture_attention=False,
                 random_seed=seed, do_sample=False, include_pruning_time=True,
                 benchmark_metrics=measure,
             )
+    # Geometry/report work is AFTER the backend's synchronized generation timer.
+    # Missing metadata (e.g. a custom backend) stays unknown, never 'no padding'.
+    if method.adapter.crop_metadata is not None:
+        result["stats"]["geometry_audit"] = audit_anyres_geometry(
+            method.adapter.crop_metadata, method.adapter.tower.num_patches_per_side,
+            result["stats"]["full_grid_identity"], padding_calls)
+    return result
 
 
 @contextmanager
@@ -1359,7 +1481,9 @@ def load_backend_for_run(args, factory, spec, output):
     torch.cuda.synchronize()
     inference = dict(backend.inference_config)
     inference.update(attention_source="SigLIP block 26 native received attention",
-                     score_dtype=inference.get("vision_dtype"))
+                     score_dtype=inference.get("vision_dtype"),
+                     image_grid_pinpoints=getattr(backend.model.get_model().config,
+                                                  "image_grid_pinpoints", None))
     spec["inference"] = inference
     _write_json(output / "run.json", spec)
     return backend, time.perf_counter() - started
@@ -1386,20 +1510,26 @@ def run_experiment(args, *, backend_factory=LlavaBackend):
         "created_utc": datetime.now(timezone.utc).isoformat(), "script_version": SCRIPT_VERSION,
         "method": "visionzip_siglip_adaptation",
         "verification_only": args.verify_zero,
-        "method_details": source_metadata(rate),
+        "method_details": source_metadata(rate, sparse_row_newlines=args.sparse_row_newlines),
         "model_path": str(Path(args.model_path).expanduser().resolve()), **dataset_spec,
         "samples": len(samples), "prune_rate": rate, "roi_mode": "anyres_max_9",
         "image_token_order": "base_first", "seed": args.seed, "do_sample": False,
         "decoding": "greedy, max_new_tokens<=512, original LLaVA context budget",
         "warmup_requested": args.warmup, "save_prune_vis": save_prune_vis,
         "capture_visualization_decisions": capture, "include_pruning_time": True,
+        "sparse_row_newlines": args.sparse_row_newlines,
         "definitions": {key: DEFINITIONS[key] for key in
                         ("lat", "memory", "memory_percent", "generation", "accuracy", "units")},
         "rate_definition": "Nonzero rate is per RAW encoder view, NOT final packed LLM tokens. "
-                           "Sparse packing removes row newlines/unpadding/max9 resizing; "
+                           "Sparse packing skips unpadding/max9 resizing; row newlines follow sparse_row_newlines. "
                            "actual packed reduction is reported per sample and may be negative.",
         "visualization_timing": "PNG/JSON rendering/export is outside generate timing. "
                                 "Extra GPU decision capture is included when enabled; use False for comparison.",
+        "geometry_audit": "Per-image geometry_audit.csv separates preprocessing padding from feature unpad. "
+                          "Padding presence is checked by observing the existing resize_and_pad_image call "
+                          "and its output size, not a pixel scan. baseline_unpad_tokens is a dense-grid "
+                          "reference count, not the number of padding tokens retained after sparse merging. "
+                          "Audit/report work is outside generate timing; no image/feature values are changed.",
     }
     _write_json(output / "run.json", spec)
     if args.dataset == "visa":
@@ -1411,7 +1541,7 @@ def run_experiment(args, *, backend_factory=LlavaBackend):
         try:
             print(f"Verification only: {len(samples)} paired runs; no Lat/Mem benchmark or visualizations.", flush=True)
             backend, _ = load_backend_for_run(args, backend_factory, spec, output)
-            method = SingleFileVisionZip(backend.model.get_model())
+            method = SingleFileVisionZip(backend.model.get_model(), sparse_row_newlines=args.sparse_row_newlines)
             verify_zero_equivalence(backend, method, samples, prompts, args.seed, output)
         except BaseException as exc:
             if not (output / "zero_equivalence.json").exists():
@@ -1451,7 +1581,7 @@ def run_experiment(args, *, backend_factory=LlavaBackend):
         print(f"Loading model; {len(samples)} evaluation images, warmup={min(args.warmup, len(samples))}", flush=True)
         backend, model_load_seconds = load_backend_for_run(args, backend_factory, spec, output)
         total_memory = torch.cuda.get_device_properties(0).total_memory
-        method = SingleFileVisionZip(backend.model.get_model())
+        method = SingleFileVisionZip(backend.model.get_model(), sparse_row_newlines=args.sparse_row_newlines)
         for index in warmup_indices(len(samples), args.warmup):
             # Same instrumented path as evaluation/benchmark_fastv; discard ALL warmup metrics.
             generate_sample(backend, method, samples[index], prompts[index], rate, args.seed + index,
@@ -1462,9 +1592,12 @@ def run_experiment(args, *, backend_factory=LlavaBackend):
         fields = ("question_id", "image", "gt", "prediction", "prediction_label", "answer", "prune_rate",
                   *TIMING_FIELDS, *TOKEN_FIELDS)
         with (rate_dir / "predictions.jsonl").open("x", encoding="utf-8") as json_stream, \
-                (rate_dir / "classification_results.csv").open("x", encoding="utf-8-sig", newline="") as csv_stream:
+                (rate_dir / "classification_results.csv").open("x", encoding="utf-8-sig", newline="") as csv_stream, \
+                (rate_dir / "geometry_audit.csv").open("x", encoding="utf-8-sig", newline="") as geometry_stream:
             writer = csv.DictWriter(csv_stream, fieldnames=fields)
             writer.writeheader()
+            geometry_writer = csv.DictWriter(geometry_stream, fieldnames=("question_id", "image", *GEOMETRY_FIELDS))
+            geometry_writer.writeheader()
             for index, (sample, prompt) in enumerate(zip(samples, prompts)):
                 result = generate_sample(backend, method, sample, prompt, rate, args.seed + index,
                                          measure=True, capture=capture)
@@ -1488,6 +1621,9 @@ def run_experiment(args, *, backend_factory=LlavaBackend):
                 json_stream.flush()
                 writer.writerow({key: record.get(key, stats.get(key)) for key in fields})
                 csv_stream.flush()
+                geometry = stats.get("geometry_audit", {})
+                geometry_writer.writerow({"question_id": sample.sample_id, "image": str(sample.image), **geometry})
+                geometry_stream.flush()
                 measurements.append(timing)
                 accuracy.add(sample.gt, answer)
                 save_report()
@@ -1496,7 +1632,10 @@ def run_experiment(args, *, backend_factory=LlavaBackend):
                 print(f"[{index+1}/{len(samples)}] id={sample.sample_id} Pred={record['prediction_label']} "
                       f"Lat={timing['lat_seconds']*1000:.2f} ms "
                       f"Mem={timing['peak_allocated_bytes']/1024**3:.3f} GiB "
-                      f"LLM visual tokens={stats.get('final_llm_visual_tokens', 'original packing')}", flush=True)
+                      f"LLM visual tokens={stats.get('final_llm_visual_tokens', 'original packing')} "
+                      f"AnyRes={geometry.get('anyres_grid_width', '?')}x{geometry.get('anyres_grid_height', '?')} "
+                      f"padding_missing={geometry.get('padding_missing_or_mismatch', 'unknown')} "
+                      f"unpad_skipped={geometry.get('unpad_required_but_skipped', 'unknown')}", flush=True)
         status = "success"
     except BaseException as exc:
         status, error = "failed", f"{type(exc).__name__}: {exc}"
@@ -1507,6 +1646,7 @@ def run_experiment(args, *, backend_factory=LlavaBackend):
     print(f"Finished {len(samples)} images. ACC={acc}, unparsed={report['unparsed']}; "
           f"Lat={report['lat_mean_ms']:.2f} ms, Mem={report['mem_peak_allocated_gib']:.3f} GiB", flush=True)
     print(f"Summary: {output / 'summary.csv'}", flush=True)
+    print(f"Per-image grid/padding audit: {rate_dir / 'geometry_audit.csv'}", flush=True)
     return output
 
 
@@ -1525,6 +1665,8 @@ def main():
         dominant, contextual = token_budget(729, args.prune_rate / 100)
         print(f"VisionZip: each view retains {dominant+contextual}/729 = "
               f"{dominant} dominant + {contextual} contextual; requested {args.prune_rate}% pruning.", flush=True)
+        print(f"Sparse AnyRes row newlines: {'restored' if args.sparse_row_newlines else 'disabled (legacy)'}. "
+              "Base/contextual order and merge formula unchanged.", flush=True)
     else:
         print("0%: VisionZip scoring/select-all/projector/full-grid packing; NOT a bypass to original LLaVA.", flush=True)
     if args.save_prune_vis and not args.verify_zero:

@@ -31,6 +31,8 @@ class CompressionTests(unittest.TestCase):
     def test_defaults_and_zero_metadata(self):
         args = vz.build_parser().parse_args([])
         self.assertEqual(args.prune_rate, 70)
+        self.assertTrue(args.sparse_row_newlines)
+        self.assertFalse(vz.build_parser().parse_args(["--no-sparse-row-newlines"]).sparse_row_newlines)
         self.assertTrue(args.save_prune_vis)
         self.assertEqual(vz.build_parser().parse_args(["--save-prune-vis", "False"]).save_prune_vis, False)
         for rate, expected in ((1, (609, 113)), (50, (308, 57)), (70, (185, 34)),
@@ -489,6 +491,32 @@ class RunnerTests(unittest.TestCase):
                 with self.fake_cuda(), self.assertRaises(FileExistsError):
                     vz.run_experiment(args)
 
+    def test_sparse_row_newline_switch_reaches_adapter_and_saved_config(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as directory:
+                root, calls, observed = Path(directory).resolve(), [], []
+                args = self.fixture(root, rate=1, count=2)
+                args.sparse_row_newlines = enabled
+                parent = self.backend(calls)
+
+                class ObserveBackend(parent):
+                    def generate(self, sample, prompt, method, *positional, **kwargs):
+                        observed.append(method.adapter.sparse_row_newlines)
+                        result = super().generate(sample, prompt, method, *positional, **kwargs)
+                        result["stats"]["newline_tokens_after"] = 27 if enabled else 0
+                        return result
+
+                with self.fake_cuda(), contextlib.redirect_stdout(io.StringIO()):
+                    output = vz.run_experiment(args, backend_factory=ObserveBackend)
+                self.assertEqual(observed, [enabled] * 4)  # two warmups + all two samples
+                meta = json.loads((output / "run.json").read_text(encoding="utf-8"))
+                self.assertEqual(meta["sparse_row_newlines"], enabled)
+                self.assertEqual(meta["method_details"]["sparse_row_newlines"], enabled)
+                with (output / "prune_01/classification_results.csv").open(encoding="utf-8-sig") as stream:
+                    records = list(csv.DictReader(stream))
+                self.assertEqual([int(row["newline_tokens_after"]) for row in records],
+                                 [27 if enabled else 0] * 2)
+
     def test_visualization_is_after_generate_including_zero_but_not_warmup(self):
         for rate in (0, 70):
             with self.subTest(rate=rate), tempfile.TemporaryDirectory() as directory:
@@ -685,9 +713,19 @@ class ZeroVerificationTests(unittest.TestCase):
         self.assertEqual(layout["stride"], [8 * 722, 1, 722])
         self.assertFalse(layout["is_contiguous"])
         self.assertEqual(result["stats"]["tokens_per_view_after"], 722)
-        self.assertEqual(result["stats"]["final_llm_visual_tokens"], 1444)
+        self.assertEqual(result["stats"]["final_llm_visual_tokens"], 1471)
+        self.assertEqual(result["stats"]["newline_tokens_after"], 27)
         self.assertFalse(result["stats"]["full_grid_identity"])
         self.assertGreater(trace["generated_token_ids"].numel(), 0)
+
+        legacy_method = vz.SingleFileVisionZip(backend.model.get_model(), sparse_row_newlines=False)
+        legacy_trace = {}
+        legacy = vz.generate_sample(backend, legacy_method, types.SimpleNamespace(sample_id="legacy"),
+                                    "test", 1, 42, measure=False, capture=False, trace=legacy_trace)
+        self.assertEqual(legacy["stats"]["final_llm_visual_tokens"], 1444)
+        self.assertEqual(legacy["stats"]["newline_tokens_after"], 0)
+        for field in ("selected_features", "projected_features", "pixels", "input_ids"):
+            self.assertTrue(torch.equal(trace[field], legacy_trace[field]), field)
 
     def test_missing_shape_or_dtype_difference_cannot_pass(self):
         base = {key: torch.ones(2) for key in vz.TRACE_FIELDS}

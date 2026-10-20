@@ -8,6 +8,68 @@ FastV/ViCo、vendor 模型代码或现有配置。
 
 ## 运行
 
+### 3.5：逐张记录实际网格、padding 与 unpad
+
+当前版本 `3.5-padding-grid-audit` 保留下面 3.4 的 newline 修复，额外记录
+`prune_XX/geometry_audit.csv`（每张图一行，不依赖可视化开关）。同样的信息也在
+`predictions.jsonl` 的 `pruning.geometry_audit` 中。
+
+- `original_width/height`、`anyres_grid_width/height`：模型收到的原图尺寸和实际
+  AnyRes 网格；`anyres_tiles` 不包含 Base。`run.json` 另存实际 `image_grid_pinpoints`。
+- `padding_left/top/right/bottom`：预处理按比例缩放后，应补的四边像素数；
+  `padding_required` 表示至少一边需要补边。
+- `padding_call_observed`：是否实际执行了对应原图、目标尺寸的现有补边函数；
+  `padding_output_size_matches`：该函数的输出尺寸是否符合目标（未执行为 null）。
+  `padding_missing_or_mismatch=True` 标记需要补边但未观测到该调用，或输出尺寸不符。
+  这是调用与尺寸检查，不是通过黑色像素判断补边，也不重新处理图片。
+- `baseline_unpad_tokens`：原版在完整特征网格上会移除的位置数，不代表稀疏合并
+  后实际还剩多少 padding token。`unpad_executed` 记录本次是否执行特征去补边；
+  `unpad_required_but_skipped=True` 标记原版会移除位置，但本次非零率跳过了这一步。
+
+**padding 与 unpad 不是一回事**：当前非零率仍正常执行图片补边，只是跳过特征
+去补边。这次只记录，不更改它们、特征内容、剪枝公式、精度或 FlashAttention2。
+所有新增审计运算与 CSV 写入都在模型 generate 计时之外。
+
+`anyres_max_9` 不固定为 3×3；网格由原图尺寸和 checkpoint 候选分辨率选择。
+例如在此前 384 的 1～6 倍候选配置下，原图 384×384 选 1×1，1024×1024
+选 3×3。每个编码器图块都是 384×384，不能据此判断原图或总网格。
+
+### 3.4：恢复非零率的 AnyRes 行分隔 token
+
+从 `3.4-sparse-row-newlines` 起，默认在 AnyRes 主要 token 的每个
+**原始全局空间行**末尾插入 checkpoint 的 learned `image_newline`：
+横向相邻 tile 共用一行末尾的分隔，空行也保留分隔，不是每 27 个保留 token
+插入一次。Base 不额外逐行插入；contextual token 仍按原来的顺序放在空间
+主要 token 序列之后。若配置为 `spatial_unpad_add_newl`，还在整个序列末尾
+追加该配置要求的一个 newline。当前用户的 `spatial_unpad` 没有这个额外末尾项。
+
+只改分隔 token：选择预算、合并公式、主要/上下文 token 的相对顺序、
+projector 输入布局、FP16、FlashAttention2、Lat/Mem 计量均保持不变。
+0% 的完整网格处理与严格校验逻辑不变；非零率仍未恢复 unpad/max9 特征缩放。
+这是本地适配改动，不应称为上游原封不动的稀疏拼接。
+
+如果**磁盘原图**为 384×384，且候选分辨率包含用户配置中的 384×384，
+就会选择 1×1 AnyRes 网格；无几何补边，也不触发 max9 缩放。
+此时 Base 和 AnyRes 各有 729 个空间 token；0% 共 1485 个序列 token，
+1% 为 `722 + 722 + 27 = 1471`，恢复前为 1444。
+每个编码器视图都是 384×384，不代表磁盘原图也是这个尺寸。
+max9 是原版对拼接并 unpad 后的高分辨率特征网格进行条件双线性缩放，
+目标量级是 9×729 个空间 token（不含 Base/分隔），并非强制切成 9 个图块。
+
+沿用原路径，重新跑 1%，关闭图片并保留 ACC/PRE/Recall/TNR、Lat/Mem：
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python runVisionZip.py \
+  --prune-rate 1 \
+  --save-prune-vis False \
+  --output-dir output/visionzip_01_newline_01
+```
+
+新增 `--no-sparse-row-newlines` 可复现 3.3 的非零率无分隔拼接，方便只对比
+这一项变化；它不影响 0% 的原版 newline 处理。实验输出目录须为新/空目录。
+`run.json` 记录 `sparse_row_newlines`；逐样本 JSON/CSV 记录
+`newline_tokens_after`、最终 LLM token 数和实际减少比例。
+
 保持服务器原来的 Python 环境，无需为了此脚本升级 Torch/Transformers。
 使用 `CUDA_VISIBLE_DEVICES` 只暴露一张卡，模型需完全放得下，不支持计量时 CPU/disk offload。
 一次调用只跑一个剪枝率，处理全部输入图片，没有 100 张上限。
@@ -58,7 +120,7 @@ CSV 不完整或缺少正常测试样本会明确报错，不会偷偷从训练�
 FP16 线性层的计算分支；不是绕回参考模型，也没有放宽逐元素相等检查。
 完整网格的拼接保留去 padding、
 max9 特征缩放、每行分隔 token 和可选的末尾分隔 token，与模型的原输入契约一致。
-非零率仍使用原来的稀疏拼接，算法没有改变。
+选择与合并算法不变；3.4 默认给非零率稀疏序列补回行分隔，详见上方说明。
 50%、90% 同理分别传入 `--prune-rate 50`、`90`。
 只支持整数 0～99，默认值已修正为 **70**。
 
@@ -109,7 +171,8 @@ CUDA_VISIBLE_DEVICES=5 python runVisionZip.py \
 
 ### 比较布局修复后的 0% 与 1%
 
-更新脚本后，`python runVisionZip.py --version` 应显示 `3.3-all-rate-layout`。
+当前脚本 `python runVisionZip.py --version` 应显示 `3.5-padding-grid-audit`。
+3.3 的布局修复继续保留；可加 `--no-sparse-row-newlines` 单独复现旧拼接对照。
 先按上面的方式运行 0% 严格校验（输出目录换成新的，例如
 `output/visionzip_layout_zero_check_01`）。验证模式没有分类汇总 CSV。
 如果要对比 ACC/PRE/Recall/TNR 和 Lat/Mem，再顺序运行以下两个正常实验：
@@ -186,7 +249,8 @@ output/visionzip_70_01/
 - 保留原脚本的 K 跨头平均后 L2 归一化、等间隔 anchor、
   `anchor hidden + mean(assigned OTHER hidden)` 聚合和稀疏 AnyRes 排序；
   未把聚合偷偷改为包含 anchor 的均值。
-- 非零率使用稀疏拼接，取消原版行分隔 token、unpad 和 max9 特征缩放。
+- 非零率使用稀疏拼接；3.4 默认按原始空间行恢复分隔 token，
+  但仍不执行 unpad 和 max9 特征缩放。contextual token 仍保留在末尾。
   因此 `--prune-rate 70` **不等于最终 LLM 视觉序列恰好减少 70%**。
   每张图单独记录原版 packed 数量、最终数量和实际减少比例。
   很低的名义剪枝率甚至可能让最终序列比原版更长。
