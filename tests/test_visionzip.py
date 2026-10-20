@@ -103,9 +103,16 @@ class CompressionTests(unittest.TestCase):
         torch.manual_seed(31)
         features, scores, metric = torch.randn(3, 729, 8), torch.rand(3, 729), torch.zeros(3, 729, 4)
         counts = vz.token_budget(729, 0)
-        with patch.object(torch, "cat", wraps=torch.cat) as concatenate:
+        selected_counts = []
+        original_topk = torch.Tensor.topk
+        def observe_topk(tensor, k, **kwargs):
+            selected_counts.append(k)
+            return original_topk(tensor, k, **kwargs)
+        with patch.object(torch.Tensor, "topk", observe_topk), \
+                patch.object(torch, "cat", side_effect=AssertionError("Identity must preserve original storage")):
             output, decisions = vz.compress_tokens(features, scores, metric, *counts, capture=True)
-        self.assertGreater(concatenate.call_count, 0)  # Real selection/concat, not return-input bypass.
+        self.assertEqual(selected_counts, [729])  # Still run scoring-based selection at full budget.
+        self.assertIs(output, features)
         self.assertTrue(torch.equal(output, features))
         self.assertEqual(output.dtype, features.dtype)
         self.assertTrue(torch.equal(decisions.dominant_indices, torch.arange(729).expand(3, -1)))
@@ -113,6 +120,26 @@ class CompressionTests(unittest.TestCase):
             self.assertEqual(view["contextual_indices"], [])
             self.assertEqual(view["merged_indices"], [])
             self.assertTrue((vz.token_visibility(view, 729) == 1).all())
+
+    def test_full_budget_preserves_noncontiguous_storage_and_offset(self):
+        # SigLIP residuals can retain [views, channels, tokens] storage with an
+        # exposed [views, tokens, channels] shape. Equal values alone are not
+        # sufficient: Linear dispatch also depends on input contiguity.
+        for dtype in (torch.float32, torch.float16):
+            for capture in (False, True):
+                with self.subTest(dtype=dtype, capture=capture):
+                    features = torch.randn(3, 8, 733).to(dtype).transpose(1, 2)[:, 2:731]
+                    self.assertFalse(features.is_contiguous())
+                    self.assertGreater(features.storage_offset(), 0)
+                    output, decisions = vz.compress_tokens(
+                        features, torch.rand(3, 729), torch.zeros(3, 729, 4),
+                        729, 0, capture=capture)
+                    self.assertIs(output, features)
+                    self.assertEqual(output.stride(), features.stride())
+                    self.assertEqual(output.storage_offset(), features.storage_offset())
+                    self.assertEqual(output.data_ptr(), features.data_ptr())
+                    self.assertEqual(decisions.retained_count, 729)
+                    self.assertEqual(decisions.audit is not None, capture)
 
     def test_complete_grid_packing_matches_actual_reference_for_geometry_and_dtypes(self):
         from test_reference import ToyPacking
@@ -511,7 +538,11 @@ class ZeroVerificationTests(unittest.TestCase):
                 self.register_buffer("features", torch.randn(1, 729, 8))
 
             def forward(self, pixels):
-                return self.attention(self.features.expand(pixels.shape[0], -1, -1).contiguous())[0]
+                hidden = self.features.expand(pixels.shape[0], -1, -1)
+                # Match SigLIP's noncontiguous embedding/residual layout rather
+                # than testing only contiguous attention outputs.
+                hidden = hidden.transpose(1, 2).contiguous().transpose(1, 2)
+                return hidden + self.attention(hidden)[0]
 
         config = tiny_config("sdpa")
         config.num_hidden_layers = 1
@@ -522,7 +553,9 @@ class ZeroVerificationTests(unittest.TestCase):
         model = LlavaQwenForCausalLM(config)
         core = model.get_model()
         core.vision_tower = TinyTower()
-        core.mm_projector = torch.nn.Linear(8, config.hidden_size)
+        core.mm_projector = torch.nn.Sequential(
+            torch.nn.Linear(8, config.hidden_size), torch.nn.GELU(),
+            torch.nn.Linear(config.hidden_size, config.hidden_size))
         core.image_newline = torch.nn.Parameter(torch.randn(config.hidden_size))
         model.eval()
 
@@ -564,6 +597,11 @@ class ZeroVerificationTests(unittest.TestCase):
         self.assertEqual(backend.calls, ["SingleFileVisionZip", "ReferenceOnlyMethod"] * 2)
         self.assertTrue(all(len(row["stages"]) == len(vz.TRACE_FIELDS) for row in rows))
         self.assertTrue(all(all(stage["equal"] for stage in row["stages"].values()) for row in rows))
+        for row in rows:
+            selected = row["stages"]["selected_features"]
+            self.assertFalse(selected["reference_layout"]["is_contiguous"])
+            self.assertFalse(selected["candidate_layout"]["is_contiguous"])
+            self.assertTrue(selected["layout_equal"])
         self.assertEqual(backend.model.prepare_inputs_labels_for_multimodal, original_prepare)
         self.assertEqual(backend.model.generate, original_generate)
         self.assertFalse(backend.model.get_model().mm_projector._forward_hooks)
@@ -597,6 +635,25 @@ class ZeroVerificationTests(unittest.TestCase):
         for other in ({}, {**base, "input_ids": torch.ones(3)},
                       {**base, "input_ids": torch.ones(2, dtype=torch.float64)}):
             self.assertFalse(all(row["equal"] for row in vz.compare_traces(base, other).values()))
+
+    def test_trace_records_original_layout_before_cpu_snapshot(self):
+        features = torch.arange(24.).view(2, 3, 4).transpose(1, 2)
+        projector = torch.nn.Linear(3, 5)
+        model = types.SimpleNamespace(
+            get_model=lambda: types.SimpleNamespace(mm_projector=projector),
+            prepare_inputs_labels_for_multimodal=Mock(), generate=Mock())
+        reference, candidate = {}, {}
+        with vz.capture_generation_trace(model, reference):
+            projector(features)
+        with vz.capture_generation_trace(model, candidate):
+            projector(features.contiguous())
+        stages = vz.compare_traces(reference, candidate)
+        selected = stages["selected_features"]
+        self.assertTrue(selected["equal"])  # Layout is diagnostic, not a new tolerance rule.
+        self.assertFalse(selected["layout_equal"])
+        self.assertEqual(selected["reference_layout"]["stride"], [12, 1, 4])
+        self.assertEqual(selected["candidate_layout"]["stride"], [12, 3, 1])
+        self.assertFalse(projector._forward_hooks)
 
     def test_verification_mode_writes_no_benchmark_report(self):
         backend = self.backend()

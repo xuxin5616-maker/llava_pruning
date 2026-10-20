@@ -52,7 +52,11 @@ CSV 不完整或缺少正常测试样本会明确报错，不会偷偷从训练�
 0% 对照：改为 `--prune-rate 0`，同时换一个新输出目录。
 **0% 仍执行 VisionZip 的 attention 捕获、评分、选择、projector 和拼接，不再绕过方法。**
 完整预算对应全部 729 个 token 均为 dominant、contextual 为 0。选取函数照常执行，
-输出保持原 token 数值和空间顺序，无需合并。完整网格的拼接保留去 padding、
+输出保持原 token 数值和空间顺序，无需合并。版本 `3.2-zero-layout` 在全部 token
+原序保留时直接复用原特征张量，保留其 stride、连续性和存储偏移，不再通过
+`masked_select`/`cat` 重建 projector 输入。这样避免仅因内存布局变化而改变
+FP16 线性层的计算分支；不是绕回参考模型，也没有放宽逐元素相等检查。
+完整网格的拼接保留去 padding、
 max9 特征缩放、每行分隔 token 和可选的末尾分隔 token，与模型的原输入契约一致。
 非零率仍使用原来的稀疏拼接，算法没有改变。
 50%、90% 同理分别传入 `--prune-rate 50`、`90`。
@@ -81,7 +85,10 @@ CUDA_VISIBLE_DEVICES=5 python runVisionZip.py \
 - `zero_equivalence.json`：只有 `status="passed"`、`complete=true` 且检查数量等于
   输入数量，才说明这批服务器实验全部通过。
 - `zero_equivalence.jsonl`：逐样本检查结果；首次不一致会记录对应阶段并停止，
-  总报告标为 failed，不会假装验证通过。
+  总报告标为 failed，不会假装验证通过。每个阶段另附 CPU 快照前的
+  `reference_layout`、`candidate_layout`（stride、连续性、存储偏移、设备）和
+  `layout_equal`，用于定位“输入数值相同但计算结果不同”的问题；布局字段仅用于
+  诊断，是否通过仍严格检查 shape/dtype/逐元素值和生成结果。终端会列出不一致阶段。
 - CPU 快照和额外推理会增加耗时，所以不产生 `summary.csv` 性能统计；
   去掉 `--verify-zero` 可正常统计 VisionZip 0% 的指标。
 - 0% 仍有评分、选择等开销，所以即使答案完全一致，Lat/Mem **不必等于原版**。
@@ -168,4 +175,5 @@ python -m unittest discover -s tests -p test_visionzip.py -v
 7B checkpoint 的准确率、CUDA 兼容性或真实 Lat/Mem。
 0% 已测试：不调用参考 prefill 的情况下执行选择与拼接；不同长宽比、padding、
 max9 缩放、分隔 token 配置和 dtype 的拼接与参考一致；真实 SigLIP attention 模块
-搭配小 Qwen 的完整配对检查通过。FP16 CUDA/7B 完整数据仍需上面的 `--verify-zero` 实测。
+搭配非连续残差特征、MLP projector 和小 Qwen 的完整配对检查；FP16/FP32 特征的
+原存储及非零偏移保留。FP16 CUDA/7B 完整数据仍需上面的 `--verify-zero` 实测。

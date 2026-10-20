@@ -51,7 +51,7 @@ DEFAULT_INPUT = "/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.
 PRUNE_RATE = 70
 SOURCE_COMMIT = "8f86b55c6f000eb033e6912538af2dd7dcb30502"
 SOURCE_URL = f"https://github.com/JIA-Lab-research/VisionZip/tree/{SOURCE_COMMIT}"
-SCRIPT_VERSION = "3.1-zero-identity"
+SCRIPT_VERSION = "3.2-zero-layout"
 
 
 # Reuse the project's loader, dataset protocol, metrics and passive TTFT timer.
@@ -162,6 +162,9 @@ def compress_tokens(features, scores, metric, dominant_count, contextual_count, 
 
     Feature computation never casts or moves tensors, preserving source FP16
     arithmetic. Source has no key-norm epsilon: invalid norms fail clearly.
+    A full dominant budget still runs selection, but returns the original
+    feature tensor: materializing equal values in contiguous storage can change
+    Linear's dispatch/rounding relative to the original SigLIP residual layout.
     """
     dominant_count, contextual_count = _validate_inputs(
         features, scores, metric, dominant_count, contextual_count
@@ -172,7 +175,9 @@ def compress_tokens(features, scores, metric, dominant_count, contextual_count, 
     mask.scatter_(1, ranked, False)
     spatial = torch.arange(token_count, device=features.device).expand(batch, -1)
     dominant_indices = spatial[~mask].view(batch, dominant_count)
-    dominant_features = features.masked_select(~mask.unsqueeze(-1)).view(batch, dominant_count, feature_dim)
+    full_selection = dominant_count == token_count and contextual_count == 0
+    dominant_features = (features if full_selection else
+                         features.masked_select(~mask.unsqueeze(-1)).view(batch, dominant_count, feature_dim))
     remaining_count = token_count - dominant_count
     remaining_indices = spatial[mask].view(batch, remaining_count)
     filtered_features = features.masked_select(mask.unsqueeze(-1)).view(batch, remaining_count, feature_dim)
@@ -211,7 +216,9 @@ def compress_tokens(features, scores, metric, dominant_count, contextual_count, 
             assignments.scatter_(1, contextual_indices, torch.arange(contextual_count, device=features.device).expand(batch, -1))
             assignments.scatter_(1, merged_indices, cluster)
 
-    compressed = torch.cat((dominant_features, contextual_features), dim=1)
+    # No reduction/merge: preserve the tensor itself, including strides and
+    # storage offset, not just its values. Scoring/selection/audit still run.
+    compressed = features if full_selection else torch.cat((dominant_features, contextual_features), dim=1)
     if not bool(torch.isfinite(compressed).all()):
         raise ValueError("VisionZip feature aggregation produced non-finite values")
     # No .cpu()/.tolist() here: packing consumes GPU indices directly.
@@ -973,6 +980,7 @@ def source_metadata(prune_rate=PRUNE_RATE):
         "requested_prune_rate_percent": prune_rate,
         "mode": "visionzip_siglip_adaptation",
         "zero_policy": "Run the method: score/select all tokens in original order, no merge; "
+                       "reuse the original feature tensor and strides for projector input; "
                        "complete-grid AnyRes packing preserves unpad/max9/newlines. No model-path bypass.",
         "packing": ("complete selected grid with unpad/max9/newlines" if prune_rate == 0 else
                     "official sparse Base + spatial tile dominants + tile contextual, no unpad/max9 resize/newlines"),
@@ -1141,6 +1149,22 @@ def capture_generation_trace(model, trace):
             raise TypeError("Verification expected a tensor/None or list of tensors")
         return value.detach().cpu().clone()
 
+    def layout(value):
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            return [layout(item) for item in value]
+        if not torch.is_tensor(value):
+            raise TypeError("Verification expected a tensor/None or list of tensors")
+        return {"stride": list(value.stride()), "is_contiguous": value.is_contiguous(),
+                "storage_offset": value.storage_offset(), "device": str(value.device)}
+
+    def record(name, value):
+        # Snapshot copies can change strides/offsets. Capture the live tensor's
+        # layout first; these small metadata records are diagnostic only.
+        trace.setdefault("tensor_layouts", {})[name] = layout(value)
+        trace[name] = snapshot(value)
+
     original_prepare = model.prepare_inputs_labels_for_multimodal
     original_generate = model.generate
     names = ("prepare_inputs_labels_for_multimodal", "generate")
@@ -1150,24 +1174,24 @@ def capture_generation_trace(model, trace):
     def observe_projector(module, args, output):
         if "selected_features" in trace:
             raise RuntimeError("Verification expects exactly one projector call per image")
-        trace["selected_features"] = snapshot(args[0])
-        trace["projected_features"] = snapshot(output)
+        record("selected_features", args[0])
+        record("projected_features", output)
 
     def prepare(*args, **kwargs):
         result = original_prepare(*args, **kwargs)
         if result[4] is not None:
             if "llm_inputs_embeds" in trace:
                 raise RuntimeError("Verification expects exactly one image prefill")
-            trace["input_ids"] = snapshot(args[0])
-            trace["pixels"] = snapshot(args[5] if len(args) > 5 else kwargs["images"])
-            trace["position_ids"] = snapshot(result[1])
-            trace["attention_mask"] = snapshot(result[2])
-            trace["llm_inputs_embeds"] = snapshot(result[4])
+            record("input_ids", args[0])
+            record("pixels", args[5] if len(args) > 5 else kwargs["images"])
+            record("position_ids", result[1])
+            record("attention_mask", result[2])
+            record("llm_inputs_embeds", result[4])
         return result
 
     def generate(*args, **kwargs):
         result = original_generate(*args, **kwargs)
-        trace["generated_token_ids"] = snapshot(result)
+        record("generated_token_ids", result)
         return result
 
     try:
@@ -1208,9 +1232,15 @@ def compare_traces(reference, candidate):
             result["max_abs_diff"] = maximum if math.isfinite(maximum) else None
         return result
 
-    return {name: (compare(reference[name], candidate[name])
-                   if name in reference and name in candidate else {"equal": False, "reason": "missing capture"})
-            for name in TRACE_FIELDS}
+    stages = {name: (compare(reference[name], candidate[name])
+                    if name in reference and name in candidate else {"equal": False, "reason": "missing capture"})
+              for name in TRACE_FIELDS}
+    reference_layouts, candidate_layouts = reference.get("tensor_layouts", {}), candidate.get("tensor_layouts", {})
+    for name, stage in stages.items():
+        if name in reference_layouts and name in candidate_layouts:
+            stage.update(reference_layout=reference_layouts[name], candidate_layout=candidate_layouts[name],
+                         layout_equal=reference_layouts[name] == candidate_layouts[name])
+    return stages
 
 
 class ReferenceOnlyMethod:
@@ -1225,6 +1255,7 @@ class ReferenceOnlyMethod:
 def verify_zero_equivalence(backend, method, samples, prompts, seed, output):
     """Run both paths for every selected sample; stop/report on first mismatch."""
     summary = {
+        "script_version": SCRIPT_VERSION,
         "status": "running", "complete": False, "expected_samples": len(samples),
         "checked_samples": 0, "matched_samples": 0, "error": None,
         "comparison": "Exact dtype/shape/value equality for all trace stages AND full generated token IDs/answer",
@@ -1259,7 +1290,12 @@ def verify_zero_equivalence(backend, method, samples, prompts, seed, output):
                 # Release large CPU snapshots before the next sample.
                 del candidate_trace, reference_trace
                 if not match:
-                    raise RuntimeError(f"Zero-rate mismatch at {sample.sample_id}; see {output}/zero_equivalence.jsonl")
+                    failed = [name for name, stage in stages.items() if not stage["equal"]]
+                    if candidate["answer"] != reference["answer"]:
+                        failed.append("answer")
+                    raise RuntimeError(f"Zero-rate mismatch at {sample.sample_id}; "
+                                       f"mismatched stages: {', '.join(failed)}; "
+                                       f"see {output}/zero_equivalence.jsonl")
                 print(f"[{index+1}/{len(samples)}] id={sample.sample_id}: EXACT MATCH (features, inputs, token IDs, answer)", flush=True)
         summary.update(status="passed", complete=summary["checked_samples"] == len(samples))
     except BaseException as exc:
