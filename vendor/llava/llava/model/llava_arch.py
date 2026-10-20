@@ -227,6 +227,13 @@ class LlavaMetaForCausalLM(ABC):
         image_token_order = getattr(self.config, "image_token_order", "base_first")
         if image_token_order not in ("base_first", "anyres_first"):
             raise ValueError(f"Unknown image_token_order: {image_token_order}")
+        if getattr(self.config, "image_aspect_ratio", "square") == "base_only":
+            if (image_token_order != "base_first"
+                    or any(modality != "image" for modality in modalities)
+                    or not isinstance(images, torch.Tensor) or images.ndim != 4
+                    or images.shape[0] != input_ids.shape[0]):
+                raise ValueError("base_only requires one image per sample as [batch,C,H,W] "
+                                 "and default base_first order")
         if getattr(self.config, "image_aspect_ratio", "square") == "anyres_only":
             if (image_token_order != "base_first"
                     or getattr(self.config, "mm_patch_merge_type", "flat") not in

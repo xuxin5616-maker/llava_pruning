@@ -26,6 +26,16 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
     if type(include_pruning_time) is not bool:
         raise ValueError("include_pruning_time must be a boolean")
     validate_image_token_order(image_token_order, roi_mode)
+    if roi_mode == "base_only" and method_config is None and method_name == "fastv":
+        method_config = Path(__file__).resolve().parents[1] / "configs" / "baseline.json"
+    method_config = resolve_method_config(method_name, method_config)
+    method = load_method(method_name, method_config)
+    if roi_mode == "base_only":
+        if tuple(method.rates) != (0,):
+            raise ValueError("base_only is an unpruned baseline: prune_rates must be [0]. "
+                             "Use --method fastv --method-config configs/baseline.json.")
+        if save_prune_vis or save_attention_vis:
+            raise ValueError("base_only is results-only; disable sample visualization")
     samples = load_samples(input_json, data_root)
     if not samples:
         raise ValueError("Input JSON has no samples")
@@ -34,8 +44,6 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         seed = secrets.randbelow(2**31)
     if not 0 <= seed <= 2**32 - len(samples):
         raise ValueError("--seed must keep seed + sample index within NumPy's 32-bit range")
-    method_config = resolve_method_config(method_name, method_config)
-    method = load_method(method_name, method_config)
     # Validate all prompts before the expensive model load.
     prompts = [resolve_prompt(prompt_version, item.category, item.text) for item in samples]
     output = Path(output_dir).resolve()

@@ -30,10 +30,14 @@ def validate_image_token_order(order, roi_mode, merge_type=None):
 
 def configure_image_mode(config, roi_mode, image_token_order="base_first"):
     """Configure preprocessing/packing without changing model precision or attention."""
-    if roi_mode not in {"randomroi", "randompatch", "anyres_max_9", "ex_base_copy", "anyres_only"}:
+    if roi_mode not in {"randomroi", "randompatch", "anyres_max_9", "ex_base_copy", "anyres_only", "base_only"}:
         raise ValueError(f"Unknown ROI mode: {roi_mode}")
     validate_image_token_order(image_token_order, roi_mode)
-    if roi_mode == "ex_base_copy":
+    if roi_mode == "base_only":
+        config.image_aspect_ratio = "base_only"
+        # Preserve checkpoint initialization/weights. A 4-D single-view image
+        # uses native encode_images directly, without spatial merging/newlines.
+    elif roi_mode == "ex_base_copy":
         config.image_aspect_ratio = "ex_base_copy"
         # 'unpad' ensures the checkpoint's learned image_newline is loaded.
         # The dedicated packing branch does NOT unpad or pool the Base copies.
@@ -150,7 +154,14 @@ class LlavaBackend:
             "cuda": torch.version.cuda,
             "gpu": torch.cuda.get_device_name(),
         }
-        if roi_mode == "ex_base_copy":
+        if roi_mode == "base_only":
+            self.inference_config.update(
+                base_view_count=1, anyres_view_count=0,
+                visual_packing="one complete row-major Base grid; no added newline",
+                visual_tokens_per_image=int(self.vision_tower.num_patches),
+                attention_source="disabled_no_pruning",
+            )
+        elif roi_mode == "ex_base_copy":
             self.inference_config.update(base_view_count=3,
                                          visual_packing="base1 + base2 + base3 + one final newline")
         elif roi_mode == "anyres_only":
@@ -179,6 +190,8 @@ class LlavaBackend:
                  random_seed: int, do_sample: bool = False,
                  include_pruning_time: bool = True,
                  benchmark_metrics: bool = False) -> dict:
+        if roi_mode == "base_only" and (rate != 0 or capture_visualization or capture_attention):
+            raise ValueError("base_only requires rate 0 and no visualization/attention capture")
         if benchmark_metrics and (not include_pruning_time or do_sample
                                   or capture_visualization or capture_attention):
             raise ValueError("Benchmark requires greedy decoding, included pruning time, and no visualization")

@@ -28,6 +28,46 @@ For a baseline-only ViCo run, copy `configs/vico.json`, set `prune_rates` to `[0
 
 ## Inputs
 
+### Base-only, unpruned, results-only experiment
+
+`--roi-mode base_only` inputs exactly **one global Base view**. It uses the
+same full-image square resize and vision preprocessing as the Base in AnyRes,
+but creates/encodes no AnyRes tiles or ROI crops. Native single-image packing
+passes the full row-major Base grid through unchanged, without pooling,
+unpadding, or adding image newline tokens. The current 384px / patch14 SigLIP
+tower produces **729 visual tokens**, all retained. Masks/bboxes do not select
+views; normal input JSON/path validation still applies.
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python run.py \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --prompt-version v0 \
+  --roi-mode base_only \
+  --method fastv \
+  --method-config configs/baseline.json \
+  --no-sample \
+  --no-plots \
+  --output-dir output/base_only_00_01
+```
+
+For this mode only, default FastV with no explicit method config automatically
+selects `configs/baseline.json` (`prune_rates: [0]`). Nonzero rates are rejected
+before model loading. FastV is disabled at 0%: no attention ranking is performed.
+FP16, FlashAttention2, prompts, generation settings, and the other image modes
+are unchanged. This is a **different-input baseline** from Base+AnyRes at 0%;
+their predictions need not match.
+
+All input records are evaluated (no 100-sample cap). Results are
+`prune_00/predictions.jsonl` (answers and generation times),
+`prune_00/metrics.json`, `summary.csv` (ACC/PRE/Recall/TNR and counts), and
+`run.json` (effective configuration). Base-only automatically disables all
+plots, including the final metric curve, even if sample visualization flags
+are supplied. In other modes, `--no-plots` provides the same results-only
+output without changing rates. It skips Matplotlib dependency checks; omitting
+it preserves the existing plotting behavior. Use a new/empty output directory.
+
 The CLI accepts a JSON list (`.json`) or one object per line (`.jsonl`). For example:
 
 ```json

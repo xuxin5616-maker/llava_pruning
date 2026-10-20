@@ -9,6 +9,8 @@ from .data import Sample
 
 
 def choose_roi(sample: Sample, mode: str):
+    if mode == "base_only":
+        return "base_only", None, None
     if mode == "anyres_only":
         return "anyres_only", None, None
     if mode == "ex_base_copy":

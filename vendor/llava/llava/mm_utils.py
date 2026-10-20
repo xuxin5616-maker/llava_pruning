@@ -304,18 +304,23 @@ def process_anyres_image(image, processor, grid_pinpoints, *, include_base=True)
     return torch.stack(image_patches, dim=0)
 
 
+def process_base_image(image, processor):
+    """One Base [C,H,W], with exactly the resize/preprocess used by AnyRes."""
+    if isinstance(processor.size, dict):
+        shortest_edge = processor.size["shortest_edge"]
+    else:
+        shortest_edge = min(processor.size)
+    base = image.resize((shortest_edge, shortest_edge))
+    return processor.preprocess(base, return_tensors="pt")["pixel_values"][0]
+
+
 def process_ex_base_copy_image(image, processor):
     """Three identical Base pixels, each encoded independently (not tiled pixels).
 
     Match process_anyres_image's global-view resize/preprocess exactly. No grid
     selection, annotation, padding removal, pooling, or random crop is involved.
     """
-    if isinstance(processor.size, dict):
-        shortest_edge = processor.size["shortest_edge"]
-    else:
-        shortest_edge = min(processor.size)
-    base = image.resize((shortest_edge, shortest_edge))
-    pixels = processor.preprocess(base, return_tensors="pt")["pixel_values"][0]
+    pixels = process_base_image(image, processor)
     return torch.stack((pixels, pixels, pixels), dim=0)
 
 
@@ -551,7 +556,20 @@ def process_images(images, image_processor, model_cfg, masks=None, boxes_list=No
         print(f"process image with {image_aspect_ratio} from model config")
     new_images = []
     pro_datas=[]
-    if image_aspect_ratio == "ex_base_copy":
+    if image_aspect_ratio == "base_only":
+        for image in images:
+            pixels = process_base_image(image, image_processor)
+            # Stack to [batch,C,H,W], NOT [batch,views,C,H,W]: native single-image
+            # encoding retains only Base tokens, with no AnyRes spatial packing.
+            new_images.append(pixels)
+            if return_pro_data:
+                pro_datas.append({
+                    "mode": "base_only", "image_token_order": "base_first",
+                    "base_view_count": 1, "anyres_view_count": 0, "final_newline": False,
+                    "original_size": list(image.size), "roi_boxes": [],
+                    "processed_view_sizes": [[pixels.shape[-1], pixels.shape[-2]]],
+                })
+    elif image_aspect_ratio == "ex_base_copy":
         for image in images:
             pixels = process_ex_base_copy_image(image, image_processor)
             new_images.append(pixels)
