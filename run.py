@@ -28,6 +28,8 @@ def build_parser():
                         help="Anyres view order; anyres_first keeps the final newline at the end")
     parser.add_argument("--save-prune-vis", action="store_true")
     parser.add_argument("--save-attention-vis", action="store_true")
+    parser.add_argument("--visualize-samples", nargs="+", default=None,
+                        help="Save sample images only for these question_id/id values; sample_ prefix accepted. Evaluation still uses ALL inputs")
     parser.add_argument("--no-plots", action="store_true",
                         help="Disable ALL sample visualizations and the final metric plot (automatic for base_only)")
     decoding = parser.add_mutually_exclusive_group()
@@ -66,6 +68,7 @@ def main():
         save_attention_vis=args.save_attention_vis and not no_plots, output_dir=args.output_dir,
         seed=args.seed, no_sample=args.no_sample, include_pruning_time=args.include_pruning_time,
         benchmark_metrics=args.benchmark_metrics, warmup=args.warmup,
+        visualize_samples=args.visualize_samples,
     )
     print(f"Saved results to {output}")
     if no_plots:

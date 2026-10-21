@@ -35,6 +35,7 @@ class FastVMethod:
     min_tokens: int
     preserve_image_newline: bool
     name: str = "fastv"
+    budget_mode: str = "joint"
 
     @classmethod
     def from_config(cls, path: str | Path) -> "FastVMethod":
@@ -56,8 +57,13 @@ class FastVMethod:
         min_tokens = config.get("min_tokens", 1)
         if type(layer) is not int or layer < 1 or type(min_tokens) is not int or min_tokens < 1:
             raise ValueError("FastV layer and min_tokens must be positive integers")
-        return cls(layer, rates, visualize, min_tokens,
-                   bool(config.get("preserve_image_newline", True)))
+        budget_mode = config.get("budget_mode", "joint")
+        preserve = bool(config.get("preserve_image_newline", True))
+        if budget_mode not in {"joint", "base_anyres"}:
+            raise ValueError("FastV budget_mode must be joint or base_anyres")
+        if budget_mode == "base_anyres" and not preserve:
+            raise ValueError("base_anyres budgets require preserve_image_newline=True")
+        return cls(layer, rates, visualize, min_tokens, preserve, budget_mode=budget_mode)
 
     def configure(self, core, prune_rate: int | float, *, capture_attention: bool,
                   capture_visualization: bool = False) -> None:
@@ -70,6 +76,7 @@ class FastVMethod:
             min_tokens=self.min_tokens,
             preserve_image_newline=self.preserve_image_newline,
             capture_attention=capture_attention and prune_rate != 0,
+            **({"budget_mode": self.budget_mode} if self.budget_mode != "joint" else {}),
         )
 
     def stats(self, core, prune_rate: int | float) -> dict:

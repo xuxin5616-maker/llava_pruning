@@ -56,10 +56,12 @@ class LlavaQwenModel(PyramidDropMixin, ViCoMixin, LlavaMetaModel, Qwen2Model):
         self.fastv_min_tokens = 1
         self.fastv_preserve_image_newline = True
         self.fastv_capture_attention = False
+        self.fastv_budget_mode = "joint"
         self._fastv_image_spans = []
         self._fastv_keep_mask = None
         self._fastv_image_attentions = []
         self._fastv_stats = {}
+        self._fastv_view_groups = []
         self.init_vico()
         self.init_pyramiddrop()
 
@@ -71,6 +73,7 @@ class LlavaQwenModel(PyramidDropMixin, ViCoMixin, LlavaMetaModel, Qwen2Model):
         min_tokens=1,
         preserve_image_newline=True,
         capture_attention=False,
+        budget_mode="joint",
     ):
         """Configure FastV mask evaluation for subsequent ``generate`` calls.
 
@@ -91,6 +94,10 @@ class LlavaQwenModel(PyramidDropMixin, ViCoMixin, LlavaMetaModel, Qwen2Model):
             raise ValueError(f"fastv_keep_ratio must be in (0, 1], got {keep_ratio}")
         if min_tokens < 1:
             raise ValueError(f"fastv_min_tokens must be >= 1, got {min_tokens}")
+        if budget_mode not in {"joint", "base_anyres"}:
+            raise ValueError("FastV budget_mode must be joint or base_anyres")
+        if budget_mode == "base_anyres" and not preserve_image_newline:
+            raise ValueError("base_anyres budgets require preserve_image_newline=True")
 
         self.vico_enabled = False
         self.vico_configured = False
@@ -102,6 +109,7 @@ class LlavaQwenModel(PyramidDropMixin, ViCoMixin, LlavaMetaModel, Qwen2Model):
         self.fastv_min_tokens = min_tokens
         self.fastv_preserve_image_newline = bool(preserve_image_newline)
         self.fastv_capture_attention = bool(capture_attention)
+        self.fastv_budget_mode = budget_mode
         self.reset_fastv_state()
 
     def reset_fastv_state(self):
@@ -110,6 +118,7 @@ class LlavaQwenModel(PyramidDropMixin, ViCoMixin, LlavaMetaModel, Qwen2Model):
         self._fastv_keep_mask = None
         self._fastv_image_attentions = []
         self._fastv_stats = {}
+        self._fastv_view_groups = []
         self.reset_vico_state()
         self.reset_pyramiddrop_state()
 
@@ -123,6 +132,10 @@ class LlavaQwenModel(PyramidDropMixin, ViCoMixin, LlavaMetaModel, Qwen2Model):
 
     def get_fastv_stats(self):
         return dict(self._fastv_stats)
+
+    def set_fastv_view_groups(self, groups):
+        """Batch -> image -> spatial indices relative to each packed image span."""
+        self._fastv_view_groups = groups
 
     def get_fastv_image_masks(self):
         """Copy the actual per-image decisions to CPU, only when requested.
@@ -177,11 +190,47 @@ class LlavaQwenModel(PyramidDropMixin, ViCoMixin, LlavaMetaModel, Qwen2Model):
             image_tokens = 0
             kept_image_tokens = 0
             normalized_spans = []
+            group_stats = []
 
-            for raw_start, raw_end in spans:
+            for image_index, (raw_start, raw_end) in enumerate(spans):
                 start = max(0, min(int(raw_start), key_length))
                 end = max(start, min(int(raw_end), key_length))
                 if end <= start:
+                    continue
+
+                if self.fastv_budget_mode == "base_anyres":
+                    if (len(self._fastv_view_groups) != batch_size
+                            or len(self._fastv_view_groups[batch_index]) != len(spans)):
+                        raise RuntimeError("Separate FastV budgets require actual packed Base/AnyRes groups")
+                    layout = self._fastv_view_groups[batch_index][image_index]
+                    if end - start > layout["packed_tokens"]:
+                        raise RuntimeError("Packed FastV span exceeds its Base/AnyRes layout")
+                    spatial_total = spatial_kept = 0
+                    for group in layout["groups"]:
+                        relative = [i for i in group["indices"] if i < end - start]
+                        count = len(relative)
+                        if count == 0:
+                            raise ValueError("Separate FastV budget has an empty spatial group after truncation")
+                        positions = torch.tensor(relative, device=scores.device, dtype=torch.long) + start
+                        # Avoid ceil(10 * .30000000000000004) spuriously keeping 4.
+                        retained = min(count, max(self.fastv_min_tokens,
+                                                 math.ceil(count * self.fastv_keep_ratio - 1e-10)))
+                        keep_mask[batch_index, positions] = False
+                        selected = token_scores.index_select(0, positions).topk(retained, sorted=False).indices
+                        keep_mask[batch_index, positions.index_select(0, selected)] = True
+                        spatial_total += count
+                        spatial_kept += retained
+                        group_stats.append({"image_index": image_index, "name": group["name"],
+                                            "candidate_tokens": count, "kept_tokens": retained,
+                                            "masked_tokens": count - retained,
+                                            "actual_prune_rate": 100 * (1 - retained / count)})
+                    protected = end - start - spatial_total
+                    image_tokens += end - start
+                    kept_image_tokens += spatial_kept + protected
+                    normalized_spans.append([start, end])
+                    if self.fastv_capture_attention:
+                        captured_images.append({"span": [start, end],
+                                                "scores": token_scores[start:end].detach().cpu().tolist()})
                     continue
 
                 # LLaVA randomroi with add_newl appends one global image-newline
@@ -223,6 +272,10 @@ class LlavaQwenModel(PyramidDropMixin, ViCoMixin, LlavaMetaModel, Qwen2Model):
                 }
             )
             captured_attention.append(captured_images)
+            if self.fastv_budget_mode == "base_anyres":
+                batch_stats[-1]["groups"] = group_stats
+                batch_stats[-1]["protected_newline_tokens"] = (
+                    image_tokens - sum(group["candidate_tokens"] for group in group_stats))
 
         self._fastv_keep_mask = keep_mask
         self._fastv_image_attentions = captured_attention if getattr(self, "fastv_capture_attention", False) else []
@@ -235,6 +288,9 @@ class LlavaQwenModel(PyramidDropMixin, ViCoMixin, LlavaMetaModel, Qwen2Model):
             "prompt_tokens": key_length,
             "batch": batch_stats,
         }
+        if self.fastv_budget_mode == "base_anyres":
+            self._fastv_stats["budget_mode"] = "base_anyres"
+            self._fastv_stats["budget_scope"] = "spatial tokens per Base/AnyRes group; all newlines protected"
 
     def _apply_fastv_mask(self, causal_mask, key_length):
         if self._fastv_keep_mask is None:

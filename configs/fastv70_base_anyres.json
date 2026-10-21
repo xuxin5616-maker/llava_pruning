@@ -1,0 +1,8 @@
+{
+  "layer": 2,
+  "prune_rates": [70],
+  "visualize_rates": [70],
+  "min_tokens": 1,
+  "preserve_image_newline": true,
+  "budget_mode": "base_anyres"
+}

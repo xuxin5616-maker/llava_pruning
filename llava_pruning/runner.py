@@ -12,6 +12,7 @@ from .methods import load_method, resolve_method_config
 from .metrics import Accuracy, METRIC_RULE
 from .prompts import resolve_prompt
 from .rates import format_prune_rate
+from .selection import resolve_visualization_ids, visualization_key
 
 
 BENCHMARK_SAMPLE_FIELDS = ("lat_seconds", "generation_seconds", "generated_tokens",
@@ -32,7 +33,8 @@ def _write_metrics(path, metrics):
 def run(*, model_path, input_json, data_root, prompt_version, method_name,
         method_config, roi_mode, save_prune_vis, save_attention_vis,
         output_dir, seed=None, no_sample=True, include_pruning_time=True,
-        image_token_order="base_first", benchmark_metrics=False, warmup=10):
+        image_token_order="base_first", benchmark_metrics=False, warmup=10,
+        visualize_samples=None):
     if type(include_pruning_time) is not bool:
         raise ValueError("include_pruning_time must be a boolean")
     if type(benchmark_metrics) is not bool:
@@ -48,6 +50,8 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         method_config = Path(__file__).resolve().parents[1] / "configs" / "baseline.json"
     method_config = resolve_method_config(method_name, method_config)
     method = load_method(method_name, method_config)
+    if getattr(method, "budget_mode", "joint") == "base_anyres" and roi_mode != "anyres_max_9":
+        raise ValueError("FastV base_anyres budget requires --roi-mode anyres_max_9")
     if roi_mode == "base_only":
         if tuple(method.rates) != (0,):
             raise ValueError("base_only is an unpruned baseline: prune_rates must be [0]. "
@@ -57,6 +61,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
     samples = load_samples(input_json, data_root)
     if not samples:
         raise ValueError("Input JSON has no samples")
+    visualization_ids = resolve_visualization_ids(visualize_samples, samples)
     generated_seed = seed is None
     if generated_seed:
         seed = secrets.randbelow(2**31)
@@ -105,6 +110,8 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         "inference": getattr(backend, "inference_config", {}),
         "metric_rule": METRIC_RULE,
     }
+    if visualization_ids is not None:
+        metadata["visualize_samples"] = sorted(visualization_ids)
     if benchmark_metrics:
         metadata.update(
             warmup_requested=warmup,
@@ -162,7 +169,9 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                         "removed_after_layer", "cumulative_prune_rate")
         with records_path.open("w", encoding="utf-8") as stream:
             for index, (sample, (prompt, _)) in enumerate(zip(samples, prompts)):
-                visualize = rate in method.visualize_rates and (save_prune_vis or save_attention_vis)
+                visualize = (rate in method.visualize_rates and (save_prune_vis or save_attention_vis)
+                             and (visualization_ids is None
+                                  or visualization_key(sample.sample_id) in visualization_ids))
                 result = backend.generate(
                     sample, prompt, method, rate, roi_mode,
                     capture_visualization=visualize,
@@ -200,6 +209,19 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                     record.update(measurement)
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
                 stream.flush()
+                if result["stats"].get("budget_mode") == "base_anyres":
+                    budget_path = rate_dir / "view_budgets.csv"
+                    budget_fields = ("question_id", "fastv_layer", "prune_rate", "image_index", "name",
+                                     "candidate_tokens", "kept_tokens", "masked_tokens", "actual_prune_rate")
+                    header = not budget_path.exists()
+                    with budget_path.open("a", encoding="utf-8", newline="") as budget_file:
+                        writer = csv.DictWriter(budget_file, fieldnames=budget_fields)
+                        if header:
+                            writer.writeheader()
+                        for batch in result["stats"]["batch"]:
+                            for group in batch["groups"]:
+                                writer.writerow({"question_id": sample.sample_id, "fastv_layer": method.layer,
+                                                 "prune_rate": rate, **group})
                 if result["stats"].get("layers"):
                     write_header = not layer_path.exists()
                     with layer_path.open("a", encoding="utf-8", newline="") as layer_file:
