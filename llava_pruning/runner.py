@@ -11,6 +11,7 @@ from .data import load_samples
 from .methods import load_method, resolve_method_config
 from .metrics import Accuracy, METRIC_RULE
 from .prompts import resolve_prompt
+from .rates import format_prune_rate
 
 
 BENCHMARK_SAMPLE_FIELDS = ("lat_seconds", "generation_seconds", "generated_tokens",
@@ -128,7 +129,8 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
     with summary_path.open("w", encoding="utf-8", newline="") as summary_file:
         csv.writer(summary_file).writerow(summary_fields)
     for rate in method.rates:
-        rate_dir = output / f"prune_{rate:02d}"
+        rate_label = format_prune_rate(rate)
+        rate_dir = output / f"prune_{rate_label}"
         rate_dir.mkdir()
         records_path = rate_dir / "predictions.jsonl"
         metrics_path = rate_dir / "metrics.json"
@@ -152,8 +154,8 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                     include_pruning_time=True, benchmark_metrics=True,
                 )
                 warmups_done += 1
-                print(f"rate={rate:02d} warmup={warmups_done}/{min(warmup, len(samples))}", flush=True)
-            print(f"rate={rate:02d}: evaluating ALL {len(samples)} images with Lat/Mem measurement", flush=True)
+                print(f"rate={rate_label} warmup={warmups_done}/{min(warmup, len(samples))}", flush=True)
+            print(f"rate={rate_label}: evaluating ALL {len(samples)} images with Lat/Mem measurement", flush=True)
         layer_path = rate_dir / "layer_tokens.csv"
         layer_fields = ("question_id", "method", "prune_rate", "layer", "image_tokens_in",
                         "image_tokens_out", "sequence_tokens_in", "sequence_tokens_out",
@@ -211,7 +213,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                 if benchmark_metrics:
                     measurements.append(measurement)
                 _write_metrics(metrics_path, current_metrics(complete=False))
-                progress = f"rate={rate:02d} sample={index + 1}/{len(samples)} id={sample.sample_id}"
+                progress = f"rate={rate_label} sample={index + 1}/{len(samples)} id={sample.sample_id}"
                 if benchmark_metrics:
                     progress += (f" Lat={measurement['lat_seconds'] * 1000:.2f} ms "
                                  f"Mem={measurement['peak_allocated_bytes'] / 1024**3:.3f} GiB")
@@ -221,14 +223,14 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         with summary_path.open("a", encoding="utf-8", newline="") as summary_file:
             csv.writer(summary_file).writerow(metrics[field] for field in summary_fields)
         score = "N/A" if metrics["accuracy"] is None else f"{metrics['accuracy']:.2%}"
-        print(f"rate={rate:02d} accuracy={score} "
+        print(f"rate={rate_label} accuracy={score} "
               f"({metrics['correct']}/{metrics['labeled_samples']}, "
               f"unparsed={metrics['unparsed']})", flush=True)
         detail = " ".join(f"{name}={metrics[name]:.2%}" if metrics[name] is not None else f"{name}=N/A"
                           for name in ("precision", "recall", "tnr"))
-        print(f"rate={rate:02d} {detail} (parsed labeled samples={metrics['parsed_samples']})", flush=True)
+        print(f"rate={rate_label} {detail} (parsed labeled samples={metrics['parsed_samples']})", flush=True)
         if benchmark_metrics:
-            print(f"rate={rate:02d} Lat(mean)={metrics['lat_mean_ms']:.2f} ms "
+            print(f"rate={rate_label} Lat(mean)={metrics['lat_mean_ms']:.2f} ms "
                   f"Mem(peak allocated)={metrics['mem_peak_allocated_gib']:.3f} GiB "
                   f"Mem(peak reserved)={metrics['mem_peak_reserved_gib']:.3f} GiB", flush=True)
     return output

@@ -5,6 +5,8 @@ import math
 import warnings
 from pathlib import Path
 
+from .rates import is_prune_rate
+
 
 SERIES = (
     ("accuracy", "ACC", "#0876B9", "o", "-"),
@@ -32,9 +34,11 @@ def load_metric_rows(summary_path):
             raise ValueError(f"summary.csv lacks the new metric columns: {sorted(missing)}")
         rows = []
         for record in reader:
-            rate = int(record["prune_rate"])
-            if not 0 <= rate < 100:
+            rate = float(record["prune_rate"])
+            if not is_prune_rate(rate):
                 raise ValueError(f"Invalid pruning rate: {rate}")
+            if rate.is_integer():
+                rate = int(rate)
             row = {"prune_rate": rate, "complete": record["complete"].lower() == "true"}
             for key, *_ in SERIES:
                 raw = record[key].strip()

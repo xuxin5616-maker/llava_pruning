@@ -7,18 +7,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .rates import is_prune_rate
+
 
 class PruningMethod(Protocol):
     name: str
-    rates: tuple[int, ...]
-    visualize_rates: frozenset[int]
+    rates: tuple[int | float, ...]
+    visualize_rates: frozenset[int | float]
 
-    def configure(self, core, prune_rate: int, *, capture_attention: bool,
+    def configure(self, core, prune_rate: int | float, *, capture_attention: bool,
                   capture_visualization: bool = False) -> None: ...
 
     def visualization_data(self, core, *, capture_attention: bool) -> dict: ...
 
-    def stats(self, core, prune_rate: int) -> dict: ...
+    def stats(self, core, prune_rate: int | float) -> dict: ...
 
     def visualize(self, *, result: dict, vision_tower, output_dir: Path,
                   sample_id: str, save_prune: bool, save_attention: bool,
@@ -28,8 +30,8 @@ class PruningMethod(Protocol):
 @dataclass(frozen=True)
 class FastVMethod:
     layer: int
-    rates: tuple[int, ...]
-    visualize_rates: frozenset[int]
+    rates: tuple[int | float, ...]
+    visualize_rates: frozenset[int | float]
     min_tokens: int
     preserve_image_newline: bool
     name: str = "fastv"
@@ -39,10 +41,13 @@ class FastVMethod:
         with Path(path).open("r", encoding="utf-8") as stream:
             config = json.load(stream)
         rates = tuple(config["prune_rates"])
-        visualize = frozenset(config.get("visualize_rates", []))
-        if (not rates or len(set(rates)) != len(rates) or
-                any(type(rate) is not int or not 0 <= rate < 100 for rate in rates)):
-            raise ValueError("FastV prune_rates must be distinct integers from 0 to 99")
+        if (not rates or any(not is_prune_rate(rate) for rate in rates)
+                or len(set(rates)) != len(rates)):
+            raise ValueError("FastV prune_rates must be distinct finite percentages in [0, 100); decimals are supported")
+        raw_visualize = tuple(config.get("visualize_rates", []))
+        if any(not is_prune_rate(rate) for rate in raw_visualize):
+            raise ValueError("FastV visualize_rates must contain finite percentages in [0, 100)")
+        visualize = frozenset(raw_visualize)
         if not visualize.issubset(rates):
             raise ValueError("FastV visualize_rates must be a subset of prune_rates")
         if 0 in visualize:
@@ -54,7 +59,7 @@ class FastVMethod:
         return cls(layer, rates, visualize, min_tokens,
                    bool(config.get("preserve_image_newline", True)))
 
-    def configure(self, core, prune_rate: int, *, capture_attention: bool,
+    def configure(self, core, prune_rate: int | float, *, capture_attention: bool,
                   capture_visualization: bool = False) -> None:
         if prune_rate not in self.rates:
             raise ValueError(f"Prune rate {prune_rate} is not configured")
@@ -67,7 +72,7 @@ class FastVMethod:
             capture_attention=capture_attention and prune_rate != 0,
         )
 
-    def stats(self, core, prune_rate: int) -> dict:
+    def stats(self, core, prune_rate: int | float) -> dict:
         if prune_rate == 0:
             return {"mode": "disabled_baseline", "keep_ratio": 1.0,
                     "fastv_layer": None, "batch": []}

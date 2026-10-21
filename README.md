@@ -61,6 +61,44 @@ For a baseline-only ViCo run, copy `configs/vico.json`, set `prune_rates` to `[0
 
 ## Inputs
 
+### FastV decimal pruning rates
+
+FastV configs accept finite percentages in `[0, 100)`, including decimal values.
+`configs/fastv_decimal.json` evaluates **53.85%, 75.38%, 96.92%** at layer 2,
+with no sample visualization. The existing `configs/fastv.json` is unchanged.
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python run.py \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --prompt-version v0 \
+  --roi-mode anyres_max_9 \
+  --method fastv \
+  --method-config configs/fastv_decimal.json \
+  --no-sample \
+  --no-plots \
+  --benchmark-metrics \
+  --warmup 10 \
+  --seed 42 \
+  --output-dir output/fastv_decimal_layer2_01
+```
+
+One model load runs the three rates sequentially. Each rate has a separate
+warmup, followed by all input records. `summary.csv` includes ACC, precision,
+recall, TNR, first-token Lat and peak Mem under the existing benchmark protocol.
+Outputs are `prune_53.85/`, `prune_75.38/`, and `prune_96.92/`; numeric rates
+remain unrounded in CSV/JSON and plotting. Integer folders such as `prune_00/`
+and `prune_50/` retain their original names. Omit `--no-plots` to draw the final
+metric curves; sample visualization remains off unless configured and enabled.
+
+The requested percentages map to keep ratios 0.4615, 0.2462, and 0.0308.
+Actual kept counts follow the existing `ceil(candidate_tokens * keep_ratio)`,
+minimum-token rule and optional protected final newline. These percentages do
+not imply fractional token counts or exactly the same achieved reduction for
+every image. FP16, FlashAttention2 and FastV's mask implementation are unchanged.
+This custom sweep uses `run.py`; `benchmark_fastv.py` retains its fixed schedule.
+
 ### Base-only, unpruned, results-only experiment
 
 `--roi-mode base_only` inputs exactly **one global Base view**. It uses the
