@@ -684,6 +684,8 @@ class LlavaMetaForCausalLM(ABC):
             fastv_model.set_fastv_image_spans(fastv_padded_spans)
         if getattr(fastv_model, "vico_configured", False):
             fastv_model.set_vico_image_spans(fastv_padded_spans, new_input_embeds.shape[1])
+        if getattr(fastv_model, "pyramiddrop_configured", False):
+            fastv_model.set_pyramiddrop_image_spans(fastv_padded_spans, new_input_embeds.shape[1])
         # rank0_print("tokenizer padding")
 
         if _labels is None:

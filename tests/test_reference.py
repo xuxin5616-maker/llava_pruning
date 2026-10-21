@@ -85,11 +85,24 @@ class ReferenceTests(unittest.TestCase):
                           {"message": message})
             self.assertEqual(actual, state.get_prompt())
 
-    def test_causal_lm_wrapper_matches_original_except_state_reset(self):
+    def test_causal_lm_wrapper_matches_original_except_state_reset_and_mode_guards(self):
         relative = Path("llava/model/language_model/llava_qwen.py")
         original = methods(REFERENCE / "LLaVA-NeXT" / relative, "LlavaQwenForCausalLM")
         current = methods(PROJECT / "vendor/llava" / relative, "LlavaQwenForCausalLM")
+        # Permit only these exact new guards; all remaining wrapper operations
+        # must still match the downloaded original's AST statement for statement.
+        guards = {
+            "forward": ast.parse(
+                'if self.get_model().pyramiddrop_enabled and (labels is not None or dpo_forward):\n'
+                '    raise ValueError("PyramidDrop is inference-only; labels and dpo_forward are unsupported")'
+            ).body[0],
+            "generate": ast.parse(
+                'self.get_model().validate_pyramiddrop_generation(kwargs, self.generation_config)'
+            ).body[0],
+        }
         for name in ("__init__", "forward", "prepare_inputs_for_generation", "generate"):
+            if name in guards:
+                self.assertEqual(ast.dump(current[name].body.pop(0)), ast.dump(guards[name]))
             if name == "generate":
                 current[name].body = [node for node in current[name].body
                                       if not (isinstance(node, ast.Expr)

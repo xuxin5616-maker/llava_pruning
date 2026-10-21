@@ -32,6 +32,7 @@ from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
 from .fastv_attention import last_prompt_attention
 from .pruning_timing import measure_pruning
 from .vico import ViCoMixin
+from .pyramiddrop import PyramidDropMixin
 
 # from .qwen.modeling_qwen import QWenLMHeadModel, QWenModel
 # from .qwen.configuration_qwen import QWenConfig
@@ -41,7 +42,7 @@ class LlavaQwenConfig(Qwen2Config):
     model_type = "llava_qwen"
 
 
-class LlavaQwenModel(ViCoMixin, LlavaMetaModel, Qwen2Model):
+class LlavaQwenModel(PyramidDropMixin, ViCoMixin, LlavaMetaModel, Qwen2Model):
     config_class = LlavaQwenConfig
 
     def __init__(self, config: Qwen2Config):
@@ -60,6 +61,7 @@ class LlavaQwenModel(ViCoMixin, LlavaMetaModel, Qwen2Model):
         self._fastv_image_attentions = []
         self._fastv_stats = {}
         self.init_vico()
+        self.init_pyramiddrop()
 
     def configure_fastv(
         self,
@@ -92,6 +94,8 @@ class LlavaQwenModel(ViCoMixin, LlavaMetaModel, Qwen2Model):
 
         self.vico_enabled = False
         self.vico_configured = False
+        self.pyramiddrop_enabled = False
+        self.pyramiddrop_configured = False
         self.fastv_enabled = bool(enabled)
         self.fastv_layer = layer
         self.fastv_keep_ratio = keep_ratio
@@ -107,6 +111,7 @@ class LlavaQwenModel(ViCoMixin, LlavaMetaModel, Qwen2Model):
         self._fastv_image_attentions = []
         self._fastv_stats = {}
         self.reset_vico_state()
+        self.reset_pyramiddrop_state()
 
     def set_fastv_image_spans(self, image_spans):
         """Receive dynamic image-token spans produced by multimodal packing.
@@ -283,6 +288,13 @@ class LlavaQwenModel(ViCoMixin, LlavaMetaModel, Qwen2Model):
         sequence itself is not shortened, which keeps DynamicCache generation
         correct and makes this implementation suitable for accuracy evaluation.
         """
+        if self.pyramiddrop_enabled:
+            return self.pyramiddrop_forward(
+                input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
+                past_key_values=past_key_values, inputs_embeds=inputs_embeds, use_cache=use_cache,
+                output_attentions=output_attentions, output_hidden_states=output_hidden_states,
+                return_dict=return_dict, cache_position=cache_position,
+            )
         if self.vico_enabled:
             return self.vico_forward(
                 input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
@@ -453,6 +465,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
+        if self.get_model().pyramiddrop_enabled and (labels is not None or dpo_forward):
+            raise ValueError("PyramidDrop is inference-only; labels and dpo_forward are unsupported")
         if inputs_embeds is None:
             (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes)
 
@@ -497,6 +511,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         modalities: Optional[List[str]] = ["image"],
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
+        self.get_model().validate_pyramiddrop_generation(kwargs, self.generation_config)
         position_ids = kwargs.pop("position_ids", None)
         attention_mask = kwargs.pop("attention_mask", None)
         if "inputs_embeds" in kwargs:

@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/Cooperx521/PyramidDrop",
+  "commit": "6444f304aee4b7edcb022839fb9e8cd07859704a",
+  "paper": "https://arxiv.org/abs/2410.17247",
+  "upstream_path": "llava/model/modeling_llama_pdrop.py",
+  "sha256_lf": "096c324dff27819f225406a7e60d3e6f61063e84b1ed2d0179c8c8a4e26dde5c",
+  "use": "unmodified reference snapshot; not imported at runtime",
+  "adaptation": "vendor/llava/llava/model/language_model/pyramiddrop.py"
+}

@@ -2,6 +2,39 @@
 
 A small, single-image inference scaffold for LLaVA OneVision/Qwen2 checkpoints. Choose **FastV** (`--method fastv`, the default) or **ViCo / PyramidDrop** (`--method vico`). It loads the model once and evaluates the configured rates sequentially on the same GPU. Both methods use the original decoder forward at rate 0. Project and Python package names are now `llava_pruning`; import and redraw commands use this new name.
 
+## Independent PyramidDrop runner
+
+The supplied OneVision patch is integrated as `runPyramidDrop.py`, with its own
+core and pinned source snapshot. Existing `run.py --method vico` keeps its
+previous implementation/configuration. See [PyramidDrop details](docs/pyramiddrop.md).
+
+For the same **final cumulative removal** convention used by earlier experiments:
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python runPyramidDrop.py \
+  --prune-rates 0 50 70 90 --rate-semantics final_cumulative \
+  --roi-mode anyres_max_9 --benchmark-metrics --warmup 10 \
+  --output-dir output/pyramiddrop_final_lat_mem_01
+```
+
+Model/input/data defaults are the existing server MVTec paths; override with
+`--model-path`, `--input-json`, `--data-root`. All input samples run unless `--limit`
+is explicitly supplied. Greedy decoding is fixed; no `--no-sample` is needed.
+Default boundaries for 28 decoder layers are 7/14/21, with independent next-layer
+Q/K ranking, native model precision and FlashAttention2 for decoder attention.
+
+`--benchmark-metrics` writes ACC/PRE/Recall/TNR, first-token `lat_mean_ms` and full-answer
+peak allocated/reserved Mem (GiB and allocated percentage) to `summary.csv` and
+each setting's `metrics.json`, using the same protocol as existing benchmarks.
+It requires one visible GPU and visualization disabled. For images, omit that
+flag and add `--save-prune-vis --save-attention-vis`: each sample gets the two
+multi-stage PNG types, with one row per pruning boundary.
+
+The patch's unchanged default sweep is `--average-keep-rates 100 50 70 90`:
+those numbers mean **layer-average retention**, not final removal. Use explicit
+budget options when comparing methods. `--stage-keep-ratio 0.5` selects the
+reference 50%/25%/12.5% stage retention schedule.
+
 ## ViCo quick start
 
 ```bash

@@ -564,7 +564,8 @@ def _stack_stage_panels(panels, *, max_width=1920):
 
 def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
                              base_grid, patch_size, output_dir, sample_id,
-                             save_prune=True, save_attention=False, prediction_label=None):
+                             save_prune=True, save_attention=False, prediction_label=None,
+                             method_name="ViCo"):
     """Two multi-stage PNGs in original token coordinates, plus compact counts.
 
     Each row corresponds to an actual pruning boundary. Scores are PRE-drop
@@ -584,7 +585,7 @@ def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
         if int(keep.sum()) != stage["image_tokens_after"]:
             raise ValueError("ViCo stage token count disagrees with its cumulative mask")
         previous_keep = keep
-        title = (f"ViCo - after layer {stage['after_layer']} | visual tokens: "
+        title = (f"{method_name} - after layer {stage['after_layer']} | visual tokens: "
                  f"{stage['image_tokens_before']} -> {stage['image_tokens_after']} | "
                  f"removed now: {stage['removed_this_stage']} | "
                  f"cumulative removed: {stage['cumulative_prune_rate']:.2f}%")
@@ -643,7 +644,7 @@ def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
         _add_prediction_header(comparison, prediction_label).save(directory / "comparison.png")
     if attention is not None:
         _add_prediction_header(attention, prediction_label).save(directory / "attention_overlay.png")
-    metadata = {"sample_id": str(sample_id), "method": "vico", "stages": decisions,
+    metadata = {"sample_id": str(sample_id), "method": method_name.lower(), "stages": decisions,
                 "image_token_order": pro_data.get("image_token_order", "base_first")}
     (directory / "decisions.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return [{"image_index": 0, "directory": str(directory.resolve()),
