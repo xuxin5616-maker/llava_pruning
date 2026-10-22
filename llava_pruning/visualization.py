@@ -299,6 +299,13 @@ def build_attention_overlay(original, image_attention, image_mask, prepared):
         raise ValueError("Attention validity mask does not match original token coordinates")
     maximum = float(patch_scores.max()) if patch_scores.size else 0.0
     scale = maximum if maximum > 0 else 1.0
+    if image_attention.get("score_kind") == "priortr":
+        active_scores = scores[spatial_indices[valid[spatial_indices]]]
+        low = float(active_scores.min()) if active_scores.size else 0.
+        high = float(active_scores.max()) if active_scores.size else 0.
+        display_scores = ((scores - low) / (high - low) if high > low else np.zeros_like(scores))
+    else:
+        display_scores = np.maximum(scores, 0) / scale
     columns = []
     for view in prepared["views"]:
         layout = view["metadata"]
@@ -307,7 +314,7 @@ def build_attention_overlay(original, image_attention, image_mask, prepared):
         source = source.resize((width, height), Image.Resampling.BILINEAR)
         indices = _spatial_indices(layout)
         rows, cols = layout["grid_shape"]
-        grid = (np.maximum(scores[indices], 0) / scale).reshape(rows, cols)
+        grid = display_scores[indices].reshape(rows, cols)
         heat = Image.fromarray(grid.astype(np.float32), mode="F")
         heat_width, heat_height = width, height
         if layout.get("projection") == "base_copy":
@@ -565,7 +572,7 @@ def _stack_stage_panels(panels, *, max_width=1920):
 def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
                              base_grid, patch_size, output_dir, sample_id,
                              save_prune=True, save_attention=False, prediction_label=None,
-                             method_name="ViCo"):
+                             method_name="ViCo", score_caption=None):
     """Two multi-stage PNGs in original token coordinates, plus compact counts.
 
     Each row corresponds to an actual pruning boundary. Scores are PRE-drop
@@ -615,7 +622,8 @@ def save_vico_visualizations(original, pro_data, stages, *, layer_stats,
             if "attention" not in stage:
                 raise ValueError("ViCo attention images require captured independent ranking scores")
             row = build_attention_overlay(original, stage["attention"], mask, prepared)
-            attentions.append((title + "\nPRE-drop ranking attention; gray = removed BEFORE this stage; scale normalized per stage.", row))
+            attentions.append((title + "\n" + (score_caption or
+                               "PRE-drop ranking attention; gray = removed BEFORE this stage; scale normalized per stage."), row))
         # Whitelist scalar settings/results; never serialize stage masks or scores.
         stage_fields = ("after_layer", "scoring_layer", "target_keep_ratio", "image_tokens_before",
                         "image_tokens_after", "removed_this_stage", "cumulative_prune_rate")

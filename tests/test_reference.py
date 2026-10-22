@@ -94,15 +94,19 @@ class ReferenceTests(unittest.TestCase):
         guards = {
             "forward": ast.parse(
                 'if self.get_model().pyramiddrop_enabled and (labels is not None or dpo_forward):\n'
-                '    raise ValueError("PyramidDrop is inference-only; labels and dpo_forward are unsupported")'
-            ).body[0],
+                '    raise ValueError("PyramidDrop is inference-only; labels and dpo_forward are unsupported")\n'
+                'if self.get_model().priortr_enabled and (labels is not None or dpo_forward):\n'
+                '    raise ValueError("PriorTR is inference-only; labels and dpo_forward are unsupported")'
+            ).body,
             "generate": ast.parse(
-                'self.get_model().validate_pyramiddrop_generation(kwargs, self.generation_config)'
-            ).body[0],
+                'self.get_model().validate_pyramiddrop_generation(kwargs, self.generation_config)\n'
+                'self.get_model().validate_priortr_generation(kwargs, self.generation_config)'
+            ).body,
         }
         for name in ("__init__", "forward", "prepare_inputs_for_generation", "generate"):
             if name in guards:
-                self.assertEqual(ast.dump(current[name].body.pop(0)), ast.dump(guards[name]))
+                for guard in guards[name]:
+                    self.assertEqual(ast.dump(current[name].body.pop(0)), ast.dump(guard))
             if name == "generate":
                 current[name].body = [node for node in current[name].body
                                       if not (isinstance(node, ast.Expr)

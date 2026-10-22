@@ -2,6 +2,44 @@
 
 A small, single-image inference scaffold for LLaVA OneVision/Qwen2 checkpoints. Choose **FastV** (`--method fastv`, the default) or **ViCo / PyramidDrop** (`--method vico`). It loads the model once and evaluates the configured rates sequentially on the same GPU. Both methods use the original decoder forward at rate 0. Project and Python package names are now `llava_pruning`; import and redraw commands use this new name.
 
+## PriorTR quick start
+
+PriorTR is now selectable as `--method priortr --method-config configs/priortr.json`.
+It uses independent causal Q/K prior/posterior scoring with the existing FP16 +
+FlashAttention2 decoder, physically prunes hidden states and all existing KV
+caches, and **preserves original position IDs**. Default `layer=2` is 1-based:
+score block 2 and prune after it. The default config uses
+`rate_semantics: "layer_average"`, with **average pruning targets 50/70/90%**.
+For 28 layers these resolve to boundary removal 53.84615385/75.38461538/96.92307692%.
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python run.py \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --prompt-version v0 --roi-mode anyres_max_9 \
+  --method priortr --method-config configs/priortr.json \
+  --no-sample --no-plots --benchmark-metrics --warmup 10 --seed 42 \
+  --output-dir output/priortr_avg50_70_90_layer2_01
+```
+
+This evaluates all input records and reports ACC/PRE/Recall/TNR and first-token
+Lat/full-answer peak Mem using the shared benchmark protocol. For the two
+sample PNG types, replace `--no-plots --benchmark-metrics --warmup 10` with
+`--save-prune-vis --save-attention-vis` and set `visualize_rates` to `[50,70,90]`;
+`--visualize-samples` is supported. The default config disables sample export.
+The score overlay is signed PriorTR S (display-only min-max), not a raw attention
+probability. Existing FastV/ViCo configs are unchanged. The default PriorTR budget
+is the whole packed image span jointly, including newlines; it does not inherit
+the FastV-specific separate Base/AnyRes experiment. See [PriorTR details](docs/priortr.md)
+for pinned source, paper/code differences, aggregation options and validation.
+`summary.csv`, `metrics.json` and per-answer records distinguish the target
+`prune_rate`/`target_average_prune_rate`, resolved `requested_layer_prune_rate`,
+and measured `actual_layer_prune_rate`/`actual_average_prune_rate`. All rates
+are percentages. Measured averages use actual per-layer visual input counts
+and are averaged over evaluated samples. Legacy configs without `rate_semantics`
+still mean final cumulative removal; use that explicit value for the old convention.
+
 ## Independent PyramidDrop runner
 
 The supplied OneVision patch is integrated as `runPyramidDrop.py`, with its own

@@ -231,6 +231,8 @@ class LlavaBackend:
             pixels = pixels.to(self.model.device, dtype=self.model.dtype)
 
         message = prompt if DEFAULT_IMAGE_TOKEN in prompt else f"{DEFAULT_IMAGE_TOKEN}\n{prompt}"
+        if hasattr(method, "validate_prompt"):
+            method.validate_prompt(message, rate)
         if len(prompt) > 4096:
             raise ValueError("reference LLaVA's single-image prompt limit is 4096 characters")
         if message.count(DEFAULT_IMAGE_TOKEN) != 1:
@@ -243,6 +245,9 @@ class LlavaBackend:
                                 DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN)
         tokens = tokenizer_image_token(text, self.tokenizer, IMAGE_TOKEN_INDEX,
                                        return_tensors="pt").unsqueeze(0).to(self.model.device)
+        if hasattr(method, "validate_token_boundary"):
+            method.validate_token_boundary(tokens, self.tokenizer, IMAGE_TOKEN_INDEX, rate,
+                                           use_im_end=getattr(self.model.config, "mm_use_im_start_end", False))
 
         # Match SimpleModelWorker's context budget, including its base-view
         # patch count approximation (not a newly chosen anyres token budget).

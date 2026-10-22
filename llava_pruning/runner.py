@@ -22,6 +22,8 @@ BENCHMARK_SUMMARY_FIELDS = (
     "mem_peak_allocated_gib", "mem_peak_reserved_gib", "mem_peak_allocated_pct",
     "device_total_gib", "generation_mean_ms", "mean_generated_tokens", "warmup_samples",
 )
+PRIORTR_BUDGET_FIELDS = ("rate_semantics", "pruning_layer", "target_average_prune_rate",
+                        "requested_layer_prune_rate", "actual_layer_prune_rate", "actual_average_prune_rate")
 
 
 def _write_metrics(path, metrics):
@@ -82,6 +84,10 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
             raise RuntimeError("--benchmark-metrics requires exactly one visible CUDA GPU; "
                                "set CUDA_VISIBLE_DEVICES=0 (or another single GPU ID)")
     backend = LlavaBackend(model_path, roi_mode=roi_mode, image_token_order=image_token_order)
+    resolved_budgets = {}
+    if hasattr(method, "resolve_budgets"):
+        resolved_budgets = {item["prune_rate"]: item for item in
+                            method.resolve_budgets(len(backend.model.get_model().layers))}
     if benchmark_metrics:
         validate_single_gpu(backend.model, torch)
         total_memory = torch.cuda.get_device_properties(0).total_memory
@@ -112,6 +118,13 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
     }
     if visualization_ids is not None:
         metadata["visualize_samples"] = sorted(visualization_ids)
+    if hasattr(method, "details"):
+        metadata["method_details"] = method.details()
+    if method.name == "priortr":
+        metadata["resolved_budgets"] = list(resolved_budgets.values())
+        metadata["inference"] = dict(metadata["inference"],
+                                     attention_source="independent_causal_qk_prior_and_task",
+                                     score_dtype="native QK/aggregation and final scores; FP32 softmax/normalization/log")
     if benchmark_metrics:
         metadata.update(
             warmup_requested=warmup,
@@ -133,6 +146,8 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                       "parsed_samples", "tp", "fp", "tn", "fn", "precision", "recall", "tnr")
     if benchmark_metrics:
         summary_fields += BENCHMARK_SUMMARY_FIELDS
+    if resolved_budgets:
+        summary_fields += PRIORTR_BUDGET_FIELDS
     with summary_path.open("w", encoding="utf-8", newline="") as summary_file:
         csv.writer(summary_file).writerow(summary_fields)
     for rate in method.rates:
@@ -144,12 +159,18 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         accuracy = Accuracy(expected_samples=len(samples))
         measurements = []
         warmups_done = 0
+        sample_budgets = []
 
         def current_metrics(complete):
             metrics = accuracy.result(rate, complete=complete)
             if benchmark_metrics:
                 metrics.update(measurement_summary(measurements, total_memory))
                 metrics["warmup_samples"] = warmups_done
+            if resolved_budgets:
+                metrics.update(resolved_budgets[rate])
+                for field in ("actual_layer_prune_rate", "actual_average_prune_rate"):
+                    values = [item[field] for item in sample_budgets if item.get(field) is not None]
+                    metrics[field] = sum(values) / len(values) if values else None
             return metrics
 
         if benchmark_metrics:
@@ -207,6 +228,11 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                 if benchmark_metrics:
                     measurement = {key: result[key] for key in BENCHMARK_SAMPLE_FIELDS}
                     record.update(measurement)
+                if resolved_budgets:
+                    budget = {key: result["stats"].get(key, resolved_budgets[rate].get(key))
+                              for key in PRIORTR_BUDGET_FIELDS}
+                    record.update(budget)
+                    sample_budgets.append(budget)
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
                 stream.flush()
                 if result["stats"].get("budget_mode") == "base_anyres":
@@ -251,6 +277,12 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         detail = " ".join(f"{name}={metrics[name]:.2%}" if metrics[name] is not None else f"{name}=N/A"
                           for name in ("precision", "recall", "tnr"))
         print(f"rate={rate_label} {detail} (parsed labeled samples={metrics['parsed_samples']})", flush=True)
+        if resolved_budgets:
+            actual = metrics["actual_average_prune_rate"]
+            actual_text = f"{actual:.4f}%" if actual is not None else "N/A"
+            print(f"rate={rate_label} target-average={metrics['target_average_prune_rate']:.4f}% "
+                  f"requested-layer-prune={metrics['requested_layer_prune_rate']:.6f}% "
+                  f"actual-average={actual_text}", flush=True)
         if benchmark_metrics:
             print(f"rate={rate_label} Lat(mean)={metrics['lat_mean_ms']:.2f} ms "
                   f"Mem(peak allocated)={metrics['mem_peak_allocated_gib']:.3f} GiB "

@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/CodeChildCZJ/PriorTR",
+  "commit": "e442a4c14af1b333067a6b8310c9111cad922033",
+  "paper": "https://arxiv.org/abs/2606.24156",
+  "snapshot_use": "Unmodified reference sources; never imported by production inference",
+  "upstream_directory": "image/LLaVA/llava/vtr",
+  "sha256_lf": {
+    "base.py": "f6c31d6925c1b0e1e4d8032825fc7197ffb3b9b10e1440433aecad460092f174",
+    "priortr.py": "4480637ce12cbf7a1d7e4ab4b611cf1ba0485d704d29f90d204aeb2d05e10ffa",
+    "prunable_llama.py": "d87bf651689803d0ae84a77fc1c682f8f115d3763d5eede9f0af1abab6518be1",
+    "config.py": "ebdf4541f686eb4977e781b824d957d349b4ca71f187e07f9b0ec18c9771a319",
+    "vtr_llava.py": "9f23a881771778829cb808f1d6eddf3ef30e3dde99b9e4abd430d18f876b3dd8",
+    "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  },
+  "adaptation": "vendor/llava/llava/model/language_model/priortr.py"
+}

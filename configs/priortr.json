@@ -1,0 +1,9 @@
+{
+  "layer": 2,
+  "rate_semantics": "layer_average",
+  "prune_rates": [50, 70, 90],
+  "visualize_rates": [],
+  "query_aggregation": "last",
+  "head_aggregation": "mean",
+  "epsilon": 1e-10
+}

@@ -184,7 +184,11 @@ class ViCoMethod:
         )
 
 
-METHODS = {"fastv": FastVMethod.from_config, "vico": ViCoMethod.from_config}
+from .priortr import PriorTRMethod
+
+
+METHODS = {"fastv": FastVMethod.from_config, "vico": ViCoMethod.from_config,
+           "priortr": PriorTRMethod.from_config}
 
 
 def resolve_method_config(name: str, config_path=None) -> Path:
