@@ -227,15 +227,16 @@ class LlavaMetaForCausalLM(ABC):
         budget_core = self.get_model()
         separate_fastv = (getattr(budget_core, "fastv_enabled", False)
                           and getattr(budget_core, "fastv_budget_mode", "joint") == "base_anyres")
+        clse_active = getattr(budget_core, "clse_enabled", False)
         fastv_view_groups = []
-        if separate_fastv:
+        if separate_fastv or clse_active:
             if (getattr(self.config, "image_aspect_ratio", "square") != "anyres_max_9"
                     or getattr(self.config, "mm_patch_merge_type", "flat") not in
                     {"spatial_unpad", "spatial_unpad_add_newl"}
                     or input_ids.shape[0] != 1 or modalities != ["image"]
                     or int((input_ids == IMAGE_TOKEN_INDEX).sum()) != 1
                     or not (type(images) is list or images.ndim == 5)):
-                raise ValueError("base_anyres FastV budget requires one anyres_max_9 image, "
+                raise ValueError("CLSE / base_anyres FastV budget requires one anyres_max_9 image, "
                                  "batch=1 and spatial_unpad packing")
 
         image_token_order = getattr(self.config, "image_token_order", "base_first")
@@ -508,7 +509,7 @@ class LlavaMetaForCausalLM(ABC):
                             if times > 1.1:
                                 image_feature = image_feature[None]
                                 image_feature = nn.functional.interpolate(image_feature, [int(h // times), int(w // times)], mode="bilinear")[0]
-                            if separate_fastv:
+                            if separate_fastv or clse_active:
                                 anyres_budget_shape = tuple(image_feature.shape[-2:])
                             image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
                             image_feature = image_feature.flatten(1, 2).transpose(0, 1)
@@ -540,7 +541,7 @@ class LlavaMetaForCausalLM(ABC):
                             #print(image_feature.shape)
                         if "add_newl" in mm_patch_merge_type:
                             image_feature = torch.cat((image_feature, self.model.image_newline[None].to(device=image_feature.device, dtype=image_feature.dtype)), dim=0)
-                        if separate_fastv:
+                        if separate_fastv or clse_active:
                             from .language_model.fastv_budget import base_anyres_groups
                             if anyres_budget_shape is None:
                                 raise RuntimeError("Missing actual AnyRes grid for separate FastV budgets")
@@ -549,6 +550,11 @@ class LlavaMetaForCausalLM(ABC):
                                 order=image_token_order, final_newline="add_newl" in mm_patch_merge_type)
                             if layout["packed_tokens"] != image_feature.shape[0]:
                                 raise RuntimeError("Separate FastV group layout disagrees with actual image packing")
+                            if clse_active:
+                                layout["grids"] = [
+                                    dict(group, rows=height if group["name"] == "base" else anyres_budget_shape[0],
+                                         cols=width if group["name"] == "base" else anyres_budget_shape[1])
+                                    for group in layout["groups"]]
                             fastv_view_groups.append(layout)
                         ######################### END ############################
                     else:  # single image operations
@@ -719,6 +725,11 @@ class LlavaMetaForCausalLM(ABC):
             fastv_model.set_pyramiddrop_image_spans(fastv_padded_spans, new_input_embeds.shape[1])
         if getattr(fastv_model, "priortr_configured", False):
             fastv_model.set_priortr_image_spans(fastv_padded_spans, new_input_embeds.shape[1])
+        if getattr(fastv_model, "clse_configured", False):
+            if clse_active and len(fastv_view_groups) != 1:
+                raise ValueError("CLSE requires Base and AnyRes grids from one complete image")
+            fastv_model.set_clse_image_layout(fastv_padded_spans, new_input_embeds.shape[1],
+                                               fastv_view_groups[0] if clse_active else None)
         # rank0_print("tokenizer padding")
 
         if _labels is None:

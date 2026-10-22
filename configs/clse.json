@@ -1,0 +1,11 @@
+{
+  "layer": 1,
+  "score_type": "clse",
+  "rate_semantics": "layer_average",
+  "prune_rates": [1,50, 70, 90],
+  "visualize_rates": [50, 70, 90],
+  "cutoff_ratio": 0.1,
+  "temperature": 0.1,
+  "epsilon": 0.000001,
+  "channel_chunk": 128
+}

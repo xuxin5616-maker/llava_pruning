@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/zjubinchen/CLSE",
+  "commit": "cfc9710abe4a1bd5480e521f3acd86ded4855ff3",
+  "paper": "https://arxiv.org/abs/2606.24165v1",
+  "upstream_directory": "LLaVA1.5/llava/model/language_model",
+  "license": "Apache-2.0 (LLaVA1.5/LICENSE)",
+  "sha256_lf": {
+    "clse_model.py": "66b17176316f9ea385bd7aa99d57170140e098684763f0be8e337a8caba75e88",
+    "tools.py": "a9a5b494e333f3d937e65caa1753f511a8d8d7ef2f4df88ff8f7835ae77b0c99",
+    "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  }
+}

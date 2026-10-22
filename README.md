@@ -1,6 +1,47 @@
 # llava_pruning — LLaVA visual-token pruning
 
-A small, single-image inference scaffold for LLaVA OneVision/Qwen2 checkpoints. Choose **FastV** (`--method fastv`, the default) or **ViCo / PyramidDrop** (`--method vico`). It loads the model once and evaluates the configured rates sequentially on the same GPU. Both methods use the original decoder forward at rate 0. Project and Python package names are now `llava_pruning`; import and redraw commands use this new name.
+A small, single-image inference scaffold for LLaVA OneVision/Qwen2 checkpoints. Choose **FastV** (`--method fastv`, the default), **ViCo / PyramidDrop** (`--method vico`), **PriorTR** (`--method priortr`), or **CLSE** (`--method clse`). It loads the model once and evaluates the configured rates sequentially on the same GPU. All methods use the original decoder forward at rate 0. Project and Python package names are now `llava_pruning`; import and redraw commands use this new name.
+
+## CLSE quick start
+
+Pure CLSE compares the input visual embeddings to the **first LLM block output**
+and physically prunes once after that block. No attention is requested or
+recomputed. The native FP16 + FlashAttention2 decoder is unchanged; spectral
+scoring alone uses FP32. Base and the actual packed AnyRes grid have separate
+spatial FFTs, then joint evolution calibration and **one joint top-k budget**.
+All image newlines are protected; original position IDs are preserved and all
+existing KV caches are compacted.
+
+`configs/clse.json` defaults to **layer-average pruning 50/70/90%**. With 28 LLM
+blocks the boundary removal targets are 51.85185185/72.59259259/93.33333333%.
+These use the whole packed visual sequence, including protected newlines, to
+make actual layer-average token accounting comparable. Integer rounding is
+reported separately; infeasible small-grid budgets raise rather than silently
+changing the target. Evaluate ALL input records, without sample images, with:
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python run.py \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --prompt-version v0 --roi-mode anyres_max_9 \
+  --method clse --method-config configs/clse.json \
+  --no-sample --no-plots --benchmark-metrics --warmup 10 --seed 42 \
+  --output-dir output/clse_avg50_70_90_01
+```
+
+Outputs include ACC/PRE/Recall/TNR, first-token Lat, full-answer peak Mem and
+target/resolved/actual pruning rates in `summary.csv`, `metrics.json` and lean
+answer records; `layer_tokens.csv` gives actual per-block counts. For sample
+images instead, replace `--no-plots --benchmark-metrics --warmup 10` with
+`--save-prune-vis --save-attention-vis` and choose a new output directory.
+Optional `--visualize-samples` restricts image export, not evaluation. Only
+`comparison.png` and `attention_overlay.png` PNG types are saved; the latter
+shows **pure CLSE scores**, not attention or defect probabilities. See
+[CLSE details](docs/clse.md) for source provenance and paper/code differences.
+
+Zero is not in the default sweep. Add `0` to `prune_rates` (not `visualize_rates`)
+for a native unpruned baseline; no FFT or modified decoder loop runs at zero.
 
 ## PriorTR quick start
 

@@ -96,11 +96,14 @@ class ReferenceTests(unittest.TestCase):
                 'if self.get_model().pyramiddrop_enabled and (labels is not None or dpo_forward):\n'
                 '    raise ValueError("PyramidDrop is inference-only; labels and dpo_forward are unsupported")\n'
                 'if self.get_model().priortr_enabled and (labels is not None or dpo_forward):\n'
-                '    raise ValueError("PriorTR is inference-only; labels and dpo_forward are unsupported")'
+                '    raise ValueError("PriorTR is inference-only; labels and dpo_forward are unsupported")\n'
+                'if self.get_model().clse_enabled and (labels is not None or dpo_forward):\n'
+                '    raise ValueError("CLSE is inference-only; labels and dpo_forward are unsupported")'
             ).body,
             "generate": ast.parse(
                 'self.get_model().validate_pyramiddrop_generation(kwargs, self.generation_config)\n'
-                'self.get_model().validate_priortr_generation(kwargs, self.generation_config)'
+                'self.get_model().validate_priortr_generation(kwargs, self.generation_config)\n'
+                'self.get_model().validate_clse_generation(kwargs, self.generation_config)'
             ).body,
         }
         for name in ("__init__", "forward", "prepare_inputs_for_generation", "generate"):

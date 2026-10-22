@@ -22,7 +22,7 @@ BENCHMARK_SUMMARY_FIELDS = (
     "mem_peak_allocated_gib", "mem_peak_reserved_gib", "mem_peak_allocated_pct",
     "device_total_gib", "generation_mean_ms", "mean_generated_tokens", "warmup_samples",
 )
-PRIORTR_BUDGET_FIELDS = ("rate_semantics", "pruning_layer", "target_average_prune_rate",
+LAYER_AVERAGE_BUDGET_FIELDS = ("rate_semantics", "pruning_layer", "target_average_prune_rate",
                         "requested_layer_prune_rate", "actual_layer_prune_rate", "actual_average_prune_rate")
 
 
@@ -52,6 +52,11 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         method_config = Path(__file__).resolve().parents[1] / "configs" / "baseline.json"
     method_config = resolve_method_config(method_name, method_config)
     method = load_method(method_name, method_config)
+    if method.name == "clse" and any(rate != 0 for rate in method.rates):
+        if roi_mode != "anyres_max_9":
+            raise ValueError("CLSE nonzero rates require --roi-mode anyres_max_9")
+        if not no_sample:
+            raise ValueError("CLSE supports greedy decoding only; use --no-sample")
     if getattr(method, "budget_mode", "joint") == "base_anyres" and roi_mode != "anyres_max_9":
         raise ValueError("FastV base_anyres budget requires --roi-mode anyres_max_9")
     if roi_mode == "base_only":
@@ -120,11 +125,15 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         metadata["visualize_samples"] = sorted(visualization_ids)
     if hasattr(method, "details"):
         metadata["method_details"] = method.details()
-    if method.name == "priortr":
+    if resolved_budgets:
         metadata["resolved_budgets"] = list(resolved_budgets.values())
+    if method.name == "priortr":
         metadata["inference"] = dict(metadata["inference"],
                                      attention_source="independent_causal_qk_prior_and_task",
                                      score_dtype="native QK/aggregation and final scores; FP32 softmax/normalization/log")
+    if method.name == "clse":
+        metadata["inference"] = dict(metadata["inference"], attention_source="none; pure CLSE spectral evolution",
+                                     score_dtype="FP32 scoring branch; native decoder dtype/backend unchanged")
     if benchmark_metrics:
         metadata.update(
             warmup_requested=warmup,
@@ -147,7 +156,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
     if benchmark_metrics:
         summary_fields += BENCHMARK_SUMMARY_FIELDS
     if resolved_budgets:
-        summary_fields += PRIORTR_BUDGET_FIELDS
+        summary_fields += LAYER_AVERAGE_BUDGET_FIELDS
     with summary_path.open("w", encoding="utf-8", newline="") as summary_file:
         csv.writer(summary_file).writerow(summary_fields)
     for rate in method.rates:
@@ -230,7 +239,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                     record.update(measurement)
                 if resolved_budgets:
                     budget = {key: result["stats"].get(key, resolved_budgets[rate].get(key))
-                              for key in PRIORTR_BUDGET_FIELDS}
+                              for key in LAYER_AVERAGE_BUDGET_FIELDS}
                     record.update(budget)
                     sample_budgets.append(budget)
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
