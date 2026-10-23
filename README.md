@@ -26,7 +26,7 @@ CUDA_VISIBLE_DEVICES=5 python train_attention_predictor.py \
   --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
   --data-root /home/yz/xxy/data/datasets/VisA \
   --visa-split-csv /home/yz/xxy/data/datasets/VisA/split_csv/1cls.csv \
-  --epochs 5 --output-dir output/attention_predictor_copied_train_01
+  --epochs 1 --output-dir output/attention_predictor_copied_train_01
 
 CUDA_VISIBLE_DEVICES=5 python run.py \
   --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
@@ -38,6 +38,15 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
   --no-sample --no-plots --benchmark-metrics --warmup 10 --seed 42 \
   --output-dir output/attention_predictor_copied_mvtec_01
 ```
+
+Training optimizer defaults follow **original TwigVLM ICCV2025 Appendix A Table5**:
+1 epoch, AdamW betas=(0.9,0.98), peak LR=5e-5, weight_decay=0, effective batch128
+(one-image microbatches accumulated128 times on one GPU), 3% linear warmup then
+cosine decay to zero. Scheduling counts optimizer updates including each epoch's
+partial tail, not images; validation never advances it. The objective remains
+attention KL on VisA, not TwigVLM's answer loss. Existing `--epochs 5` arguments
+override the new default and must be changed/removed. Logs include loss, used LR,
+optimizer-step progress and ETA; `train_run.json` records the resolved schedule.
 
 The training entry writes `best.pt`, `last.pt`, `history.csv`, fixed split lists
 and the portable `method.json`. VisA images used for distillation are **not** an

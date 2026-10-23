@@ -13,6 +13,7 @@ import time
 from llava_pruning.predictor_data import load_visa_distillation, split_samples
 from llava_pruning.prompts import GENERIC_PROMPT_V0
 from llava_pruning.training_progress import TrainingETA, format_duration
+from llava_pruning.training_schedule import training_step_plan
 
 
 def build_parser():
@@ -25,10 +26,14 @@ def build_parser():
                         help="Optional teacher H2 cache. Can consume hundreds of GB; omitted = recompute teacher each epoch")
     parser.add_argument("--validation-fraction", type=float, default=.1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=.01)
-    parser.add_argument("--gradient-accumulation", type=int, default=4, help="Batch size is 1; effective images per optimizer step")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--learning-rate", type=float, default=5e-5, help="Peak LR after linear warmup; then cosine decay to zero")
+    parser.add_argument("--weight-decay", type=float, default=0.)
+    parser.add_argument("--adam-beta1", type=float, default=.9)
+    parser.add_argument("--adam-beta2", type=float, default=.98)
+    parser.add_argument("--warmup-ratio", type=float, default=.03, help="Fraction of total optimizer updates, rounded up")
+    parser.add_argument("--gradient-accumulation", type=int, default=128,
+                        help="One image per microbatch, one visible GPU: default effective batch=128")
     parser.add_argument("--max-grad-norm", type=float, default=1.)
     parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false",
                         help="Disable training recomputation of the first two copied blocks (uses more VRAM)")
@@ -47,6 +52,7 @@ def main():
     if (not math.isfinite(args.learning_rate) or args.learning_rate <= 0
             or not math.isfinite(args.weight_decay) or args.weight_decay < 0
             or not math.isfinite(args.max_grad_norm) or args.max_grad_norm <= 0
+            or any(not math.isfinite(beta) or not 0 <= beta < 1 for beta in (args.adam_beta1, args.adam_beta2))
             or not 0 <= args.seed < 2**32):
         raise ValueError("Invalid optimizer settings or seed")
     output = args.output_dir.resolve()
@@ -54,6 +60,7 @@ def main():
         raise FileExistsError(f"Training output must be empty: {output}")
     samples, data_info = load_visa_distillation(args.data_root, args.visa_split_csv)
     train, validation = split_samples(samples, args.validation_fraction, args.seed)
+    plan = training_step_plan(len(train), args.epochs, args.gradient_accumulation, args.warmup_ratio)
     import numpy as np
     import torch
     from benchmark_fastv import validate_single_gpu
@@ -82,7 +89,14 @@ def main():
     student = CopiedAttentionPredictor.from_backbone(core, gradient_checkpointing=args.gradient_checkpointing).to(device)
     architecture = student.config
     optimizer = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad),
-                                 lr=args.learning_rate, weight_decay=args.weight_decay, foreach=False)
+                                 lr=args.learning_rate, weight_decay=args.weight_decay,
+                                 betas=(args.adam_beta1, args.adam_beta2), foreach=False)
+    from transformers import get_cosine_schedule_with_warmup
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=plan["warmup_steps"],
+                                               num_training_steps=plan["total_steps"])
+    optimization = dict(reference="TwigVLM ICCV2025 Appendix A Table5 (optimizer recipe only, not AR objective)",
+                        optimizer="AdamW", peak_learning_rate=args.learning_rate, weight_decay=args.weight_decay,
+                        betas=[args.adam_beta1, args.adam_beta2], schedule=plan)
     signature = architecture_signature(core)
     file_identity = backbone_file_identity(args.model_path, getattr(core.config, "mm_vision_tower", None))
     identity = dict(backbone_files=file_identity, backbone_signature=signature,
@@ -105,6 +119,7 @@ def main():
                     original_visa_test_is_training_source=True, final_test_dataset="independent MVTec",
                     cache_policy="optional H2 + target; keys include prompt/layers/backbone+image file identity and inference config",
                     initialization="independent pretrained copies of original Qwen2 decoder blocks 3, 4, 5; no LM head",
+                    optimization=optimization,
                     frozen_student_parts="block5 V/O/MLP/post-attention norm: downstream of the attention loss, never executed",
                     student_parameters=sum(p.numel() for p in student.parameters()),
                     student_trainable_parameters=sum(p.numel() for p in student.parameters() if p.requires_grad))
@@ -119,11 +134,16 @@ def main():
           f"student={metadata['student_parameters']:,} parameters "
           f"(trainable={metadata['student_trainable_parameters']:,}); "
           f"gradient_checkpointing={args.gradient_checkpointing}", flush=True)
+    print(f"AdamW: epochs={args.epochs}, peak_lr={args.learning_rate:g}, weight_decay={args.weight_decay:g}, "
+          f"betas=({args.adam_beta1:g}, {args.adam_beta2:g}), effective_batch={args.gradient_accumulation} "
+          f"(microbatch=1); updates/epoch={plan['steps_per_epoch']}, total_updates={plan['total_steps']}; "
+          f"linear warmup={plan['warmup_steps']} updates ({args.warmup_ratio:.1%}), then cosine to zero. "
+          f"Epoch-tail batch={plan['last_batch_size']}.", flush=True)
     print("Cache disabled: teacher is recomputed each epoch." if not args.cache_dir else
           f"Teacher cache: {args.cache_dir}. H2 is large; monitor disk space (potentially hundreds of GB).", flush=True)
     print("ETA: estimating after the first image; updates use recent train/validation speeds. "
           "Approximate, especially during cache warm-up; future checkpoint-save overhead is not estimated.", flush=True)
-    fieldnames = ["epoch", "split", "samples", "seconds", "kl"]
+    fieldnames = ["epoch", "split", "samples", "seconds", "kl", "optimizer_steps", "global_step", "lr_next"]
     fieldnames += [f"{metric}_prune{rate}" for rate in (50, 70, 90) for metric in ("topk_overlap", "teacher_mass")]
     best = float("inf")
     eta = TrainingETA(args.epochs, {"train": len(train), "validation": len(validation)})
@@ -138,9 +158,11 @@ def main():
                     estimate = eta.update(index)
                     if index == 1 or index % args.log_every == 0 or index == total:
                         approximate = " (provisional)" if estimate["provisional"] else ""
+                        lr = f"{metrics['lr_used']:.3e}" if metrics["lr_used"] is not None else "--"
                         print(f"epoch={epoch}/{args.epochs} {name} {index}/{total} "
                               f"({estimate['phase_percent']:.1f}%, overall={estimate['overall_percent']:.1f}%) "
                               f"id={sample_id} loss={metrics['kl']:.6f}(KL) "
+                              f"lr={lr} step={scheduler.last_epoch}/{plan['total_steps']} "
                               f"elapsed={format_duration(estimate['elapsed'])} "
                               f"phase_ETA={format_duration(estimate['phase_eta'])} "
                               f"total_ETA={format_duration(estimate['total_eta'])}{approximate}", flush=True)
@@ -149,10 +171,12 @@ def main():
                 eta.begin(epoch, name)
                 metrics = epoch_pass(student, examples, split, device=device, precision=args.student_precision,
                                      optimizer=optimizer if training else None, accumulation=args.gradient_accumulation,
-                                     max_grad_norm=args.max_grad_norm, progress=progress)
+                                     max_grad_norm=args.max_grad_norm, progress=progress,
+                                     scheduler=scheduler if training else None)
                 torch.cuda.synchronize()
                 seconds = time.perf_counter() - started
-                writer.writerow(dict(epoch=epoch, split=name, samples=len(split), seconds=seconds, **metrics))
+                writer.writerow(dict(epoch=epoch, split=name, samples=len(split), seconds=seconds,
+                                     global_step=scheduler.last_epoch, lr_next=optimizer.param_groups[0]["lr"], **metrics))
                 stream.flush()
                 print(f"epoch={epoch} {name}: mean_loss={metrics['kl']:.6f}(KL), seconds={seconds:.2f}", flush=True)
                 if not training:
@@ -160,12 +184,15 @@ def main():
                                    teacher_layer=args.teacher_layer, signature=signature, provenance=dict(
                                        source_sha256=data_info["source_sha256"], split_sha256=split_hashes,
                                        backbone_path=str(Path(args.model_path).resolve()), prompt=GENERIC_PROMPT_V0,
-                                       image_token_order="base_first"), epoch=epoch, validation_kl=metrics["kl"])
+                                       image_token_order="base_first", optimization=optimization,
+                                       global_step=scheduler.last_epoch), epoch=epoch, validation_kl=metrics["kl"])
                     save_student(output / "last.pt", student, **options)
                     if metrics["kl"] < best:
                         best = metrics["kl"]
                         save_student(output / "best.pt", student, **options)
                     (output / "training_status.json").write_text(json.dumps(dict(completed_epochs=epoch, best_validation_kl=best,
+                                                                                global_step=scheduler.last_epoch,
+                                                                                total_steps=plan["total_steps"],
                                                                                 complete=epoch == args.epochs), indent=2), encoding="utf-8")
     print(f"Done. Best validation loss={best:.6f}(KL); evaluate MVTec with --method attention_predictor --method-config {output / 'method.json'}", flush=True)
 

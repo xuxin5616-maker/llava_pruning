@@ -15,16 +15,39 @@ CUDA_VISIBLE_DEVICES=5 python train_attention_predictor.py \
   --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
   --data-root /home/yz/xxy/data/datasets/VisA \
   --visa-split-csv /home/yz/xxy/data/datasets/VisA/split_csv/1cls.csv \
-  --epochs 5 \
+  --epochs 1 \
   --output-dir output/attention_predictor_copied_train_01
 ```
 
 只使用一个可见 GPU。宽度、Q/KV heads、FFN、激活函数、RMSNorm epsilon、RoPE 和 attention 后端
 全部继承当前主模型。你的 Qwen2-7B 配置对应宽度3584、28个Q heads/4个KV heads、FFN18944；
 不再接受 `--hidden-size`、`--num-heads`、`--intermediate-size`、`--dropout`，以免误把原尺寸模型改小。
-默认 AdamW lr=1e-4、weight_decay=.01，每张图一个 microbatch，累计4张再更新，梯度裁剪1。
-优化器只接收有效路径的可训练参数，foreach=False 以降低临时显存。这些仍是项目起始值，**不是
-TWIG 的答案训练配方**。`--learning-rate`、`--gradient-accumulation` 等可调，`--help` 可查看。
+优化器默认对齐 **原版 TwigVLM ICCV2025 附录A、表5**（不是2026年的 TwigVLM++ 扩展版）：
+
+| 参数 | 新默认值 |
+| --- | --- |
+| epochs | 1 |
+| optimizer | AdamW，betas=(0.9, 0.98) |
+| 峰值 learning rate | 5e-5 |
+| weight decay | 0 |
+| 有效 batch size | 128，单卡 microbatch=1 × gradient_accumulation=128 |
+| warmup | 总优化器更新步数前3%，线性预热，步数向上取整 |
+| decay | warmup之后 cosine 衰减至0 |
+
+损失仍是 **attention KL**，数据仍是 VisA，不引入论文的答案预测训练。只对齐优化参数，不能把它
+称作完整 TWIG 复现，也不能保证1轮是此数据与目标下的最优轮数。梯度裁剪保持本项目原有的1；
+优化器只接收有效路径的可训练参数，foreach=False 以降低临时显存。
+可用 `--epochs`、`--learning-rate`、`--weight-decay`、`--adam-beta1`、`--adam-beta2`、
+`--warmup-ratio`、`--gradient-accumulation` 修改，`--help` 可查看。命令行显式参数会覆盖默认值，
+所以旧命令中的 `--epochs 5` 需要删掉或改成1。
+
+学习率使用项目已安装 Transformers 的 `get_cosine_schedule_with_warmup`，不升级依赖。
+步数为 `epochs * ceil(train_images / gradient_accumulation)`；仅在每次 `optimizer.step()` 后
+推进一次 scheduler，不按图片推进，不在验证时推进，跨epoch不重置。最后不足128张的组按实际
+张数取平均、更新一次，不丢样本或强行补齐。梯度累计不会同时存128张的计算图。
+warmup从0学习率开始，因此首组日志 `lr=0` 是调度定义，不是卡住；以后逐步上升。极小测试集
+如果 warmup 覆盖了全部更新步数会在加载主模型前报错；可显式减小累计张数或设
+`--warmup-ratio 0` 做 smoke test，不会默默跳过训练。
 
 原始模型始终 FP16，只有学生使用默认 BF16 autocast（独立 FP32参数和优化器状态）；最后一行
 attention 的 QK、softmax、KL 为 FP32。学生前两层使用复制的原生 FlashAttention2，默认启用
@@ -81,7 +104,8 @@ Layer2/22 都指 **1-based 完成的 block / block 内部 attention**。本版�
 用 `--log-every 1` 可每张打印。估计使用最近样本速度，并区分训练/验证；未见过的阶段暂借当前
 速度，标注 provisional。缓存首次提取和随后命中速度不同，ETA 会动态修正；不是准确承诺，
 不计尚未知的未来 checkpoint 保存开销。日志不增加额外 CUDA 同步，不改训练或 Lat/Mem 协议。
-每条进度还显示当前 `loss=...(KL)`；阶段结束显示 `mean_loss`，训练结束显示最佳验证 loss。
+每条进度还显示当前 `loss=...(KL)`、`lr`（该图所在累计组实际使用的学习率，验证时为 --）以及
+`step=已完成优化器更新/计划总更新数`；阶段结束显示 `mean_loss`，训练结束显示最佳验证 loss。
 这些均为原有 KL 蒸馏损失，没有新增损失项或改变优化目标；history.csv 中仍使用 `kl` 列。
 
 有充足磁盘时可以加：
@@ -98,14 +122,17 @@ Layer2/22 都指 **1-based 完成的 block / block 内部 attention**。本版�
 
 ## 输出
 
-- `train_run.json`：配置、架构、教师层、推理模式、来源和划分哈希，不导出完整 attention 数组。
+- `train_run.json`：配置、架构、教师层、推理模式、来源和划分哈希，以及优化器betas、峰值LR、
+  有效batch、cosine/warmup计划与准确更新步数，不导出完整 attention 数组。
 - `train.jsonl`、`validation.jsonl`：固定图片名单，没有 GT/mask 字段。
 - `history.csv`：每轮训练/验证 KL、耗时、Top-k 重合率、保留的教师 attention 总质量。
   这里 Top-k 指空间 token 移除50/70/90的拟合诊断，**不是最终含 newline 的层平均预算**。
+  另含 `optimizer_steps`（该阶段实际更新数；验证为0）、`global_step`（累计更新数）、
+  `lr_next`（该阶段结束后下一次更新将使用的学习率，不是该阶段平均LR；最终为0）。
 - `best.pt`：以内部 validation KL 选择的最佳旁路；`last.pt`：最后一轮旁路。
   包含架构、精度、教师层、主模型结构签名和来源，不保存主模型权重。
 - `method.json`：相对路径指向同目录 `best.pt`，可直接交给 `run.py`。
-- `training_status.json`：已完成 epoch、最佳 validation KL 和是否全部完成。
+- `training_status.json`：已完成 epoch、最佳 validation KL、实际/计划优化器更新步数和是否全部完成。
 
 不使用 MVTec 测试准确率挑选 checkpoint。当前不实现优化器恢复；中断后可保留 best/last 做评估，
 新训练请使用空输出目录。指定相同 cache-dir 时可复用通过身份校验的教师特征。

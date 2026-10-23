@@ -73,6 +73,9 @@ class PredictorEntrypointTests(unittest.TestCase):
             self.assertIn("mean_loss=", logs.getvalue())
             self.assertIn("Best validation loss=", logs.getvalue())
             self.assertIn("copied native blocks 3/4/5", logs.getvalue())
+            self.assertIn("lr=", logs.getvalue())
+            self.assertIn("total_updates=3", logs.getvalue())
+            self.assertIn("linear warmup=1", logs.getvalue())
             trained = root / "trained"
             self.assertTrue((trained / "best.pt").is_file())
             self.assertTrue((trained / "last.pt").is_file())
@@ -88,6 +91,9 @@ class PredictorEntrypointTests(unittest.TestCase):
                 rows = list(csv.DictReader(stream))
             self.assertEqual([row["split"] for row in rows], ["train", "validation"])
             self.assertEqual([int(row["samples"]) for row in rows], [9, 1])
+            self.assertEqual([int(row["optimizer_steps"]) for row in rows], [3, 0])
+            self.assertEqual([int(row["global_step"]) for row in rows], [3, 3])
+            self.assertEqual([float(row["lr_next"]) for row in rows], [0, 0])
             self.assertTrue(all(math.isfinite(float(row["kl"])) for row in rows))
             train = [json.loads(line) for line in (trained / "train.jsonl").read_text(encoding="utf-8").splitlines()]
             validation = [json.loads(line) for line in (trained / "validation.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -96,6 +102,15 @@ class PredictorEntrypointTests(unittest.TestCase):
             self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
             status = json.loads((trained / "training_status.json").read_text(encoding="utf-8"))
             self.assertTrue(status["complete"])
+            self.assertEqual((status["global_step"], status["total_steps"]), (3, 3))
+            metadata = json.loads((trained / "train_run.json").read_text(encoding="utf-8"))
+            optimization = metadata["optimization"]
+            self.assertEqual(optimization["betas"], [.9, .98])
+            self.assertEqual(optimization["peak_learning_rate"], 5e-5)
+            self.assertEqual(optimization["weight_decay"], 0)
+            self.assertEqual(optimization["schedule"]["type"], "cosine")
+            self.assertEqual(optimization["schedule"]["total_steps"], 3)
+            self.assertEqual(saved["provenance"]["optimization"], optimization)
 
     def test_public_evaluation_cli_uses_layer2_average_and_existing_lat_mem_protocol(self):
         fixture = common.RunBenchmarkTests(methodName="runTest")

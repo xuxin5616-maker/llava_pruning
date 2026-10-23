@@ -189,11 +189,15 @@ def overlap_metrics(log_prob, target):
 
 
 def epoch_pass(student, examples, samples, *, device, precision, optimizer=None,
-               accumulation=1, max_grad_norm=1., progress=None):
+               accumulation=1, max_grad_norm=1., progress=None, scheduler=None):
     from llava.model.language_model.attention_predictor import student_autocast
     training = optimizer is not None
+    if type(accumulation) is not int or accumulation < 1:
+        raise ValueError("Gradient accumulation must be a positive integer")
+    if scheduler is not None and (not training or scheduler.optimizer is not optimizer):
+        raise ValueError("Training scheduler must belong to the supplied optimizer; no validation stepping")
     student.train(training)
-    totals, pending = {}, 0
+    totals, pending, updates = {}, 0, 0
     if training:
         optimizer.zero_grad(set_to_none=True)
     for index, sample in enumerate(samples):
@@ -207,6 +211,9 @@ def epoch_pass(student, examples, samples, *, device, precision, optimizer=None,
         metrics = dict(kl=float(loss.detach()), **overlap_metrics(predicted.detach(), example["target"]))
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.) + value
+        # Snapshot the LR actually used by this accumulation group, not the
+        # scheduler's NEXT LR after a possible optimizer update below.
+        lr_used = optimizer.param_groups[0]["lr"] if training else None
         if training:
             (loss / accumulation).backward()
             pending += 1
@@ -219,14 +226,17 @@ def epoch_pass(student, examples, samples, *, device, precision, optimizer=None,
                 if not torch.isfinite(norm):
                     raise FloatingPointError("Non-finite student gradient; optimizer step refused")
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+                updates += 1
                 optimizer.zero_grad(set_to_none=True)
                 pending = 0
         if progress is not None:
-            progress(index + 1, len(samples), sample.sample_id, metrics)
+            progress(index + 1, len(samples), sample.sample_id, dict(metrics, lr_used=lr_used))
         del example, predicted, loss
     if not samples:
         raise ValueError("Training/validation split must not be empty")
-    return {key: value / len(samples) for key, value in totals.items()}
+    return dict({key: value / len(samples) for key, value in totals.items()}, optimizer_steps=updates)
 
 
 def save_student(path, student, *, student_precision, backbone_depth, teacher_layer=22,
