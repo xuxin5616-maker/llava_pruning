@@ -227,7 +227,8 @@ class LlavaMetaForCausalLM(ABC):
         budget_core = self.get_model()
         separate_fastv = (getattr(budget_core, "fastv_enabled", False)
                           and getattr(budget_core, "fastv_budget_mode", "joint") == "base_anyres")
-        clse_active = getattr(budget_core, "clse_enabled", False)
+        clse_active = (getattr(budget_core, "clse_enabled", False)
+                       or getattr(budget_core, "_attention_teacher_capture", False))
         fastv_view_groups = []
         if separate_fastv or clse_active:
             if (getattr(self.config, "image_aspect_ratio", "square") != "anyres_max_9"

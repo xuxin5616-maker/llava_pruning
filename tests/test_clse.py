@@ -283,7 +283,7 @@ class CLSETests(unittest.TestCase):
 
     def test_config_average_targets_and_mutual_exclusion(self):
         method = load_method("clse")
-        self.assertEqual(method.rates, (50, 70, 90))
+        self.assertTrue({50, 70, 90}.issubset(method.rates))  # Preserve user-added rate experiments.
         self.assertEqual(method.layer, 1)
         for rate in method.rates:
             self.assertAlmostEqual(method.resolve_budget(rate, 28)["requested_layer_prune_rate"] * 27 / 28, rate)

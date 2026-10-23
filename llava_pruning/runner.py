@@ -52,11 +52,11 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         method_config = Path(__file__).resolve().parents[1] / "configs" / "baseline.json"
     method_config = resolve_method_config(method_name, method_config)
     method = load_method(method_name, method_config)
-    if method.name == "clse" and any(rate != 0 for rate in method.rates):
+    if method.name in {"clse", "attention_predictor"} and any(rate != 0 for rate in method.rates):
         if roi_mode != "anyres_max_9":
-            raise ValueError("CLSE nonzero rates require --roi-mode anyres_max_9")
+            raise ValueError(f"{method.name} nonzero rates require --roi-mode anyres_max_9")
         if not no_sample:
-            raise ValueError("CLSE supports greedy decoding only; use --no-sample")
+            raise ValueError(f"{method.name} supports greedy decoding only; use --no-sample")
     if getattr(method, "budget_mode", "joint") == "base_anyres" and roi_mode != "anyres_max_9":
         raise ValueError("FastV base_anyres budget requires --roi-mode anyres_max_9")
     if roi_mode == "base_only":
@@ -134,6 +134,9 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
     if method.name == "clse":
         metadata["inference"] = dict(metadata["inference"], attention_source="none; pure CLSE spectral evolution",
                                      score_dtype="FP32 scoring branch; native decoder dtype/backend unchanged")
+    if method.name == "attention_predictor":
+        metadata["inference"] = dict(metadata["inference"], attention_source="trained three-layer side Transformer",
+                                     score_dtype="FP32 final QK/softmax; student precision in checkpoint; backbone untouched")
     if benchmark_metrics:
         metadata.update(
             warmup_requested=warmup,

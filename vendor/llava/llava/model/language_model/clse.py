@@ -77,6 +77,24 @@ def select_joint_tokens(scores, spatial_indices, original, keep_ratio):
 
 
 class CLSEMixin:
+    # Shared physical-drop engine hooks. The learned scorer overrides only these;
+    # existing pure-CLSE scoring/precision/geometry remain unchanged.
+    def _clse_boundary(self):
+        return 1
+
+    def _clse_reference(self, hidden, start, end):
+        return self._clse_energy(hidden[:, start:end])
+
+    def _clse_rank(self, hidden, start, end, ids, reference):
+        energy, _ = self._clse_energy(hidden[:, start:end])
+        return evolution_scores(reference, energy, epsilon=self.clse_epsilon, temperature=self.clse_temperature)
+
+    def _clse_extra_stats(self):
+        return {}
+
+    def _clse_score_kind(self):
+        return "clse"
+
     def init_clse(self):
         self.clse_enabled = self.clse_configured = False
         self.reset_clse_state()
@@ -176,7 +194,7 @@ class CLSEMixin:
         stage = dict(item["stats"], mask={"span": [start, end], "keep": keep.tolist()})
         if "scores" in item:
             stage["attention"] = {"span": [start, end], "scores": item["scores"].detach().cpu().tolist(),
-                                  "score_kind": "clse"}
+                                  "score_kind": self._clse_score_kind()}
         return [stage]
 
     @torch.no_grad()
@@ -220,13 +238,14 @@ class CLSEMixin:
             original = current = end - start
             self._clse_next_position = hidden.shape[1]
             self._clse_stats = dict(mode="physical_drop", original_image_tokens=original,
-                                    original_prompt_tokens=hidden.shape[1], layers=[], pruning_layer=1,
+                                    original_prompt_tokens=hidden.shape[1], layers=[], pruning_layer=self._clse_boundary(),
                                     position_policy="preserve_original", attention_source="none_pure_spectral",
                                     score="clse", budget_scope="joint Base + AnyRes; structural newlines protected",
                                     rounding="floor packed target, reserve newlines", min_spatial_tokens=1)
+            self._clse_stats.update(self._clse_extra_stats())
             self._clse_stage = None
             with measure_pruning(self, hidden.device):
-                reference, spatial_indices = self._clse_energy(hidden[:, start:end])
+                reference, spatial_indices = self._clse_reference(hidden, start, end)
                 # Check feasibility BEFORE running the decoder, not by silently clamping.
                 target = max(1, math.floor(original * self.clse_keep_ratio + 1e-10))
                 protected = original - len(spatial_indices)
@@ -252,12 +271,10 @@ class CLSEMixin:
             if not prefill:
                 continue
             before, seq_before = current, hidden.shape[1]
-            if index == 0:
+            if index + 1 == self._clse_boundary():
                 with measure_pruning(self, hidden.device):
-                    energy, _ = self._clse_energy(hidden[:, start:end])
-                    ranking = evolution_scores(reference, energy, epsilon=self.clse_epsilon,
-                                               temperature=self.clse_temperature)
-                    del reference, energy
+                    ranking = self._clse_rank(hidden, start, end, ids, reference)
+                    reference = None
                     selected, retained, protected = select_joint_tokens(ranking, spatial_indices, original, self.clse_keep_ratio)
                     selection = torch.cat((torch.arange(start, device=hidden.device), selected + start,
                                            torch.arange(end, hidden.shape[1], device=hidden.device)))
@@ -270,7 +287,7 @@ class CLSEMixin:
                     current = retained
                     self._clse_stats.update(protected_newline_tokens=protected, spatial_tokens=original - protected,
                                             kept_spatial_tokens=retained - protected)
-                    stage = dict(after_layer=1, scoring_layer=1, target_keep_ratio=self.clse_keep_ratio,
+                    stage = dict(after_layer=index + 1, scoring_layer=index + 1, target_keep_ratio=self.clse_keep_ratio,
                                  image_tokens_before=before, image_tokens_after=retained,
                                  removed_this_stage=before - retained, cumulative_prune_rate=100 * (1 - retained / original))
                     if self.clse_capture:

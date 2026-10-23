@@ -2,6 +2,45 @@
 
 A small, single-image inference scaffold for LLaVA OneVision/Qwen2 checkpoints. Choose **FastV** (`--method fastv`, the default), **ViCo / PyramidDrop** (`--method vico`), **PriorTR** (`--method priortr`), or **CLSE** (`--method clse`). It loads the model once and evaluates the configured rates sequentially on the same GPU. All methods use the original decoder forward at rate 0. Project and Python package names are now `llava_pruning`; import and redraw commands use this new name.
 
+## Learned block2 -> block22 attention predictor
+
+`--method attention_predictor` adds a **trained** side Transformer; it is not a
+training-free method or a MAP reproduction. The frozen original backbone stays
+FP16 + FlashAttention2. A 512-wide/8-head side branch reads raw block2 features;
+two full small causal blocks followed by the Q/K attention path of block3 predict
+the fixed block22 teacher attention. Only the side parameters are trained with
+KL loss; the original H2, not side features, is pruned and sent to block3 onward.
+
+Train on ALL rows of the user's full VisA CSV (no GT/masks), internally split
+90/10 by category and seed42, then evaluate on independent MVTec:
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python train_attention_predictor.py \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --data-root /home/yz/xxy/data/datasets/VisA \
+  --visa-split-csv /home/yz/xxy/data/datasets/VisA/split_csv/1cls.csv \
+  --epochs 5 --output-dir output/attention_predictor_train_01
+
+CUDA_VISIBLE_DEVICES=5 python run.py \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --prompt-version v0 --roi-mode anyres_max_9 \
+  --method attention_predictor \
+  --method-config output/attention_predictor_train_01/method.json \
+  --no-sample --no-plots --benchmark-metrics --warmup 10 --seed 42 \
+  --output-dir output/attention_predictor_mvtec_01
+```
+
+The training entry writes `best.pt`, `last.pt`, `history.csv`, fixed split lists
+and the portable `method.json`. VisA images used for distillation are **not** an
+independent VisA test set. No H2 disk cache is created by default; optional
+`--cache-dir` can save repeated teacher computation but may use hundreds of GB.
+The evaluation config defaults to layer-average removal 50/70/90%, one joint
+Base+AnyRes budget with protected newlines, original positions and physical KV
+compaction. Lat/Mem includes side computation/weights. Full usage, precision,
+limitations and validation: [attention predictor details](docs/attention_predictor.md).
+
 ## CLSE quick start
 
 Pure CLSE compares the input visual embeddings to the **first LLM block output**

@@ -1,0 +1,7 @@
+{
+  "checkpoint": "../output/attention_predictor_train_01/best.pt",
+  "layer": 2,
+  "rate_semantics": "layer_average",
+  "prune_rates": [50, 70, 90],
+  "visualize_rates": [50, 70, 90]
+}

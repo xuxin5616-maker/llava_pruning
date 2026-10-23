@@ -35,6 +35,7 @@ from .vico import ViCoMixin
 from .pyramiddrop import PyramidDropMixin
 from .priortr import PriorTRMixin
 from .clse import CLSEMixin
+from .attention_predictor import AttentionPredictorMixin
 
 # from .qwen.modeling_qwen import QWenLMHeadModel, QWenModel
 # from .qwen.configuration_qwen import QWenConfig
@@ -44,7 +45,7 @@ class LlavaQwenConfig(Qwen2Config):
     model_type = "llava_qwen"
 
 
-class LlavaQwenModel(CLSEMixin, PriorTRMixin, PyramidDropMixin, ViCoMixin, LlavaMetaModel, Qwen2Model):
+class LlavaQwenModel(AttentionPredictorMixin, CLSEMixin, PriorTRMixin, PyramidDropMixin, ViCoMixin, LlavaMetaModel, Qwen2Model):
     config_class = LlavaQwenConfig
 
     def __init__(self, config: Qwen2Config):
@@ -68,6 +69,7 @@ class LlavaQwenModel(CLSEMixin, PriorTRMixin, PyramidDropMixin, ViCoMixin, Llava
         self.init_pyramiddrop()
         self.init_priortr()
         self.init_clse()
+        self.init_attention_predictor()
 
     def configure_fastv(
         self,
@@ -111,6 +113,8 @@ class LlavaQwenModel(CLSEMixin, PriorTRMixin, PyramidDropMixin, ViCoMixin, Llava
         self.priortr_configured = False
         self.clse_enabled = False
         self.clse_configured = False
+        if not getattr(self, "_preserve_predictor_weights", False):
+            self.clear_attention_predictor()
         self.fastv_enabled = bool(enabled)
         self.fastv_layer = layer
         self.fastv_keep_ratio = keep_ratio
