@@ -12,6 +12,7 @@ import time
 
 from llava_pruning.predictor_data import load_visa_distillation, split_samples
 from llava_pruning.prompts import GENERIC_PROMPT_V0
+from llava_pruning.training_progress import TrainingETA, format_duration
 
 
 def build_parser():
@@ -36,7 +37,8 @@ def build_parser():
     parser.add_argument("--student-precision", choices=("bfloat16", "float32"), default="bfloat16",
                         help="Affects ONLY student autocast; frozen backbone stays FP16 + FlashAttention2")
     parser.add_argument("--teacher-layer", type=int, default=22, help="1-based teacher attention block; default22, student source fixed block2")
-    parser.add_argument("--log-every", type=int, default=20)
+    parser.add_argument("--log-every", type=int, default=20,
+                        help="Print progress, phase ETA and total ETA every N images (first/last always printed)")
     return parser
 
 
@@ -113,9 +115,12 @@ def main():
     print(f"Frozen teacher block{args.teacher_layer}; H2 side student: {metadata['student_parameters']:,} parameters", flush=True)
     print("Cache disabled: teacher is recomputed each epoch." if not args.cache_dir else
           f"Teacher cache: {args.cache_dir}. H2 is large; monitor disk space (potentially hundreds of GB).", flush=True)
+    print("ETA: estimating after the first image; updates use recent train/validation speeds. "
+          "Approximate, especially during cache warm-up; future checkpoint-save overhead is not estimated.", flush=True)
     fieldnames = ["epoch", "split", "samples", "seconds", "kl"]
     fieldnames += [f"{metric}_prune{rate}" for rate in (50, 70, 90) for metric in ("topk_overlap", "teacher_mass")]
     best = float("inf")
+    eta = TrainingETA(args.epochs, {"train": len(train), "validation": len(validation)})
     with (output / "history.csv").open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
@@ -124,10 +129,18 @@ def main():
             random.Random(args.seed + epoch).shuffle(order)
             for name, split, training in (("train", order, True), ("validation", validation, False)):
                 def progress(index, total, sample_id, metrics):
+                    estimate = eta.update(index)
                     if index == 1 or index % args.log_every == 0 or index == total:
-                        print(f"epoch={epoch}/{args.epochs} {name} {index}/{total} id={sample_id} KL={metrics['kl']:.6f}", flush=True)
+                        approximate = " (provisional)" if estimate["provisional"] else ""
+                        print(f"epoch={epoch}/{args.epochs} {name} {index}/{total} "
+                              f"({estimate['phase_percent']:.1f}%, overall={estimate['overall_percent']:.1f}%) "
+                              f"id={sample_id} loss={metrics['kl']:.6f}(KL) "
+                              f"elapsed={format_duration(estimate['elapsed'])} "
+                              f"phase_ETA={format_duration(estimate['phase_eta'])} "
+                              f"total_ETA={format_duration(estimate['total_eta'])}{approximate}", flush=True)
                 torch.cuda.synchronize()
                 started = time.perf_counter()
+                eta.begin(epoch, name)
                 metrics = epoch_pass(student, examples, split, device=device, precision=args.student_precision,
                                      optimizer=optimizer if training else None, accumulation=args.gradient_accumulation,
                                      max_grad_norm=args.max_grad_norm, progress=progress)
@@ -135,7 +148,7 @@ def main():
                 seconds = time.perf_counter() - started
                 writer.writerow(dict(epoch=epoch, split=name, samples=len(split), seconds=seconds, **metrics))
                 stream.flush()
-                print(f"epoch={epoch} {name}: mean KL={metrics['kl']:.6f}, seconds={seconds:.2f}", flush=True)
+                print(f"epoch={epoch} {name}: mean_loss={metrics['kl']:.6f}(KL), seconds={seconds:.2f}", flush=True)
                 if not training:
                     options = dict(student_precision=args.student_precision, backbone_depth=len(core.layers),
                                    teacher_layer=args.teacher_layer, signature=signature, provenance=dict(
@@ -148,7 +161,7 @@ def main():
                         save_student(output / "best.pt", student, **options)
                     (output / "training_status.json").write_text(json.dumps(dict(completed_epochs=epoch, best_validation_kl=best,
                                                                                 complete=epoch == args.epochs), indent=2), encoding="utf-8")
-    print(f"Done. Best validation KL={best:.6f}; evaluate MVTec with --method attention_predictor --method-config {output / 'method.json'}", flush=True)
+    print(f"Done. Best validation loss={best:.6f}(KL); evaluate MVTec with --method attention_predictor --method-config {output / 'method.json'}", flush=True)
 
 
 if __name__ == "__main__":

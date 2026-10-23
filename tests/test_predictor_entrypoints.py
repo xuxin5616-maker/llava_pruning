@@ -60,8 +60,14 @@ class PredictorEntrypointTests(unittest.TestCase):
                     patch("benchmark_fastv.validate_single_gpu"), patch("torch.cuda.is_available", return_value=True), \
                     patch("torch.cuda.device_count", return_value=1), patch("torch.cuda.manual_seed_all"), \
                     patch("torch.cuda.synchronize"), patch("llava_pruning.predictor_training.prepare_teacher_example", side_effect=example), \
-                    contextlib.redirect_stdout(io.StringIO()):
+                    contextlib.redirect_stdout(io.StringIO()) as logs:
                 training_cli.main()
+            self.assertIn("phase_ETA=", logs.getvalue())
+            self.assertIn("total_ETA=", logs.getvalue())
+            self.assertIn("overall=100.0%", logs.getvalue())
+            self.assertIn("loss=", logs.getvalue())
+            self.assertIn("mean_loss=", logs.getvalue())
+            self.assertIn("Best validation loss=", logs.getvalue())
             trained = root / "trained"
             self.assertTrue((trained / "best.pt").is_file())
             self.assertTrue((trained / "last.pt").is_file())
