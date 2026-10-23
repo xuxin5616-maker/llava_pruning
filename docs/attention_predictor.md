@@ -1,8 +1,12 @@
 # 第2层旁路预测第22层 attention
 
-这是本项目的可训练实验方法，**不是 MAP 的复现**。沿用 attention 蒸馏思路，但按照本实验选择：
-固定第22个 LLM block 作为教师，读取第2个 block 的原始输出，以三层轻量 Transformer 的
-第三层 attention 评分，在第2层后对原始特征做物理剪枝。主模型权重、FP16、FlashAttention2 均不改。
+这是本项目的可训练实验方法，**不是 MAP 或完整 TwigVLM 的复现**。结构初始化参考
+[TwigVLM 原论文 §3.1](https://arxiv.org/html/2503.14075v2#S3.SS1)：K=2、T=3 时，
+从当前主模型**第3、4、5个 decoder block**复制三层独立旁路，保留原尺寸、预训练权重和原生
+RMSNorm/GQA/RoPE/FFN。主干与旁路不共享可训练参数；不是从第20～22层初始化。
+仍固定第22个 LLM block 作为 attention 教师，读取第2个 block 的原始输出，以旁路第三层
+attention 评分，在第2层后对原始特征做物理剪枝。不使用 LM head、答案监督、FinalWipe 或
+推测解码。主模型权重、FP16、FlashAttention2 均不改。
 
 ## 先训练：VisA 全部 CSV 图片，内部训练/验证
 
@@ -12,15 +16,23 @@ CUDA_VISIBLE_DEVICES=5 python train_attention_predictor.py \
   --data-root /home/yz/xxy/data/datasets/VisA \
   --visa-split-csv /home/yz/xxy/data/datasets/VisA/split_csv/1cls.csv \
   --epochs 5 \
-  --output-dir output/attention_predictor_train_01
+  --output-dir output/attention_predictor_copied_train_01
 ```
 
-只使用一个可见 GPU。默认宽度512、8 heads、FFN2048、dropout0、AdamW lr=1e-4、weight_decay=.01、
-每张图一个 microbatch，累计4张再更新，梯度裁剪1。以上是可调的项目起始值，**不是论文公开超参**。
-用 `--hidden-size`、`--num-heads`、`--intermediate-size`、`--learning-rate`、`--gradient-accumulation`
-等修改；`--help` 可查看。原始模型始终 FP16，只有学生使用默认 BF16 autocast（FP32参数和优化器状态）；
-最后一行 attention 的 QK、softmax、KL 为 FP32。无 BF16 GPU 时显式选 `--student-precision float32`，
-可能更慢、占用更多显存，不会自动改主模型的 dtype/backend。
+只使用一个可见 GPU。宽度、Q/KV heads、FFN、激活函数、RMSNorm epsilon、RoPE 和 attention 后端
+全部继承当前主模型。你的 Qwen2-7B 配置对应宽度3584、28个Q heads/4个KV heads、FFN18944；
+不再接受 `--hidden-size`、`--num-heads`、`--intermediate-size`、`--dropout`，以免误把原尺寸模型改小。
+默认 AdamW lr=1e-4、weight_decay=.01，每张图一个 microbatch，累计4张再更新，梯度裁剪1。
+优化器只接收有效路径的可训练参数，foreach=False 以降低临时显存。这些仍是项目起始值，**不是
+TWIG 的答案训练配方**。`--learning-rate`、`--gradient-accumulation` 等可调，`--help` 可查看。
+
+原始模型始终 FP16，只有学生使用默认 BF16 autocast（独立 FP32参数和优化器状态）；最后一行
+attention 的 QK、softmax、KL 为 FP32。学生前两层使用复制的原生 FlashAttention2，默认启用
+非重入梯度检查点（仅训练时重算这两层以节省激活显存）；用 `--no-gradient-checkpointing` 关闭，
+占用会更高。主模型不启用训练/梯度检查点，也不改变推理计算。
+**原尺寸旁路比旧512维版更占显存，best/last checkpoint 也明显更大**；40GB显卡能否容纳仍需按实际
+AnyRes序列长度实测，不能凭CPU测试保证。非 BF16 显卡或指定 float32 时不会静默更换后端；复制的
+FlashAttention2 学生明确要求 BF16 autocast。float32 选项仅用于已有非Flash后端的调试/CPU测试。
 
 CSV 至少包含 `object,image`，`image` 为相对 `--data-root` 的真实图片路径。
 使用本地**完整** CSV 所有行（原来的 train 和 test 合并为训练数据源），不读取 label、gt、mask。
@@ -46,13 +58,15 @@ Answer with the option's letter from the given choices directly.
   block22 的输出**；没有运行答案生成，也没有保留 teacher KV 或请求 native attention 输出。
 - 教师按原 FastV 口径：先对所有 prompt keys softmax，再 mean heads，取空间视觉 tokens，
   排除结构 newline 后 L1 归一化为目标分布。Base 和 AnyRes 联合，不各自归一化。
-- 学生：LayerNorm＋降维投影，前两层为完整小型 pre-norm causal Transformer（QKV/O、残差、FFN）；
-  第三层只执行自身的 norm、Q/K、RoPE、最后 query 的 attention。它的 V/O/FFN 位于目标 attention
-  之后，不会影响该分数，故不实例化、不浪费训练。**不是额外 MLP 评分头，也不是三层原尺寸 Qwen2。**
-- 旁路使用原始序列 position IDs 和 causal mask，教师和学生 heads 数可以不同，都是先 mean heads。
+- 学生：没有额外输入 LayerNorm 或降维投影，直接输入完整 H2。旁路前两层完整执行复制的原生
+  block3、block4；第三层保留完整 block5 副本，但只执行自身 input RMSNorm、Q/K、RoPE 和最后
+  query 的 attention。第三层 V/O/FFN/post-attention norm 位于该 attention 之后，不影响这个
+  损失，故**冻结、不执行，但仍随完整层副本保存**。其余旁路参数可训练；不复制答案预测头。
+- 旁路使用原始序列 position IDs 和 causal mask；新版复制原生 Q/KV heads 数，教师和学生都先 mean Q heads。
   损失为 `KL(teacher || student)`，在所有空间视觉 token 上计算，只反传到旁路。
-- 前两层 side attention 用 PyTorch SDPA，第三层仅一行 QK，避免主动构造完整 attention 矩阵。
-  主干仍使用原有 FlashAttention2。
+- 前两层使用与主模型相同的原生 decoder/attention 类，不请求 attention 输出，不创建 KV。
+  第三层独立计算可微分的一行 QK，处理原生 GQA 与 Q/K bias，避免请求或构造完整 attention 矩阵；
+  未使用教师评分函数的 no_grad 装饰器。主干仍使用原有 FlashAttention2。
 
 Layer2/22 都指 **1-based 完成的 block / block 内部 attention**。本版本输入位置固定2；教师默认22，
 可用 `--teacher-layer` 做独立教师层实验，实际值保存在 checkpoint。
@@ -96,6 +110,10 @@ Layer2/22 都指 **1-based 完成的 block / block 内部 attention**。本版�
 不使用 MVTec 测试准确率挑选 checkpoint。当前不实现优化器恢复；中断后可保留 best/last 做评估，
 新训练请使用空输出目录。指定相同 cache-dir 时可复用通过身份校验的教师特征。
 
+新训练写 **version=2** checkpoint，包含完整三层副本及原生 Qwen2 架构/后端和初始化层号。
+旧512维 **version=1** checkpoint 仍可用于旧方法评估，不会被伪装成新版；新版必须重新训练，
+不支持将旧权重直接转换或恢复优化器。教师 H2/attention 的口径没有变，身份一致的旧教师缓存可复用。
+
 ## 再评估：MVTec 平均剪枝率50/70/90
 
 ```bash
@@ -105,9 +123,9 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
   --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
   --prompt-version v0 --roi-mode anyres_max_9 \
   --method attention_predictor \
-  --method-config output/attention_predictor_train_01/method.json \
+  --method-config output/attention_predictor_copied_train_01/method.json \
   --no-sample --no-plots --benchmark-metrics --warmup 10 --seed 42 \
-  --output-dir output/attention_predictor_mvtec_01
+  --output-dir output/attention_predictor_copied_mvtec_01
 ```
 
 评估用与训练一致的 backbone 权重，不是把旁路用于另一个同尺寸但不同权重的模型。
@@ -142,7 +160,8 @@ Lat 包含视觉、projector、packing、主干 prefill、旁路评分与剪枝�
 
 ## 本地验证范围
 
-覆盖可微分第三层真实 QK、全部学生参数梯度、冻结教师无梯度、H2及教师层位置、真实 eager attention
+覆盖原生第3/4/5层权重精确复制且无参数别名、完整结构/GQA/RoPE/预训练初始化、第三层真实可微QK、
+有效学生路径梯度/无效尾部冻结、梯度检查点前向反向等价、冻结教师无梯度、H2及教师层位置、真实 eager attention
 oracle、KL 小样本拟合、尾部梯度累计、真实预处理和打包、不生成教师答案、checkpoint/缓存身份、
 VisA全行无GT读取与内部划分、真实 generate/原始位置/KV压缩、0%身份、跨模式清理、完整训练 CLI
 与共享评估统计接线。可选 native CUDA FP16 + FlashAttention2 / BF16 学生训练测试需要服务器：

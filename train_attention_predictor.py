@@ -1,4 +1,4 @@
-"""Train only a three-layer attention side predictor on all-VisA, no GT loss."""
+"""Distill attention into independently copied Qwen2 blocks 3/4/5; no GT loss."""
 
 import argparse
 import csv
@@ -20,7 +20,7 @@ def build_parser():
     parser.add_argument("--model-path", default="/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/")
     parser.add_argument("--data-root", default="/home/yz/xxy/data/datasets/VisA")
     parser.add_argument("--visa-split-csv", default=None, help="FULL CSV, not test-only list; defaults to data-root/split_csv/1cls.csv")
-    parser.add_argument("--output-dir", type=Path, default=Path("output/attention_predictor_train_01"))
+    parser.add_argument("--output-dir", type=Path, default=Path("output/attention_predictor_copied_train_01"))
     parser.add_argument("--cache-dir", type=Path, default=None,
                         help="Optional teacher H2 cache. Can consume hundreds of GB; omitted = recompute teacher each epoch")
     parser.add_argument("--validation-fraction", type=float, default=.1)
@@ -30,12 +30,10 @@ def build_parser():
     parser.add_argument("--weight-decay", type=float, default=.01)
     parser.add_argument("--gradient-accumulation", type=int, default=4, help="Batch size is 1; effective images per optimizer step")
     parser.add_argument("--max-grad-norm", type=float, default=1.)
-    parser.add_argument("--hidden-size", type=int, default=512)
-    parser.add_argument("--num-heads", type=int, default=8)
-    parser.add_argument("--intermediate-size", type=int, default=2048)
-    parser.add_argument("--dropout", type=float, default=0.)
+    parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false",
+                        help="Disable training recomputation of the first two copied blocks (uses more VRAM)")
     parser.add_argument("--student-precision", choices=("bfloat16", "float32"), default="bfloat16",
-                        help="Affects ONLY student autocast; frozen backbone stays FP16 + FlashAttention2")
+                        help="Affects ONLY student autocast; copied FlashAttention2 blocks require bfloat16. Backbone stays FP16")
     parser.add_argument("--teacher-layer", type=int, default=22, help="1-based teacher attention block; default22, student source fixed block2")
     parser.add_argument("--log-every", type=int, default=20,
                         help="Print progress, phase ETA and total ETA every N images (first/last always printed)")
@@ -74,16 +72,17 @@ def main():
     core = backend.model.get_model()
     if not 2 < args.teacher_layer <= len(core.layers):
         raise ValueError("Teacher layer must be after block2 and within the model depth")
-    AttentionPredictor, PredictorConfig = vendor_imports()
-    architecture = PredictorConfig(input_size=core.config.hidden_size, hidden_size=args.hidden_size,
-                                   num_heads=args.num_heads, intermediate_size=args.intermediate_size,
-                                   dropout=args.dropout, rope_theta=core.config.rope_theta)
+    vendor_imports()  # Add the project's pinned LLaVA to sys.path before vendor imports.
     device = core.embed_tokens.weight.device
-    from llava.model.language_model.attention_predictor import student_autocast
+    from llava.model.language_model.attention_predictor import CopiedAttentionPredictor, student_autocast
+    if core.config._attn_implementation == "flash_attention_2" and args.student_precision != "bfloat16":
+        raise ValueError("Copied FlashAttention2 blocks need --student-precision bfloat16; main model stays FP16")
     with student_autocast(device, args.student_precision):
         pass
-    student = AttentionPredictor(architecture).to(device)
-    optimizer = torch.optim.AdamW(student.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    student = CopiedAttentionPredictor.from_backbone(core, gradient_checkpointing=args.gradient_checkpointing).to(device)
+    architecture = student.config
+    optimizer = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad),
+                                 lr=args.learning_rate, weight_decay=args.weight_decay, foreach=False)
     signature = architecture_signature(core)
     file_identity = backbone_file_identity(args.model_path, getattr(core.config, "mm_vision_tower", None))
     identity = dict(backbone_files=file_identity, backbone_signature=signature,
@@ -98,21 +97,28 @@ def main():
                 stream.write(json.dumps(dict(question_id=sample.sample_id, image=sample.origin_path,
                                              category=sample.category, text=GENERIC_PROMPT_V0), ensure_ascii=False) + "\n")
         split_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    metadata = dict(version=1, configuration={key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
+    metadata = dict(version=student.checkpoint_version, configuration={key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
                     source=data_info, training_samples=len(train), validation_samples=len(validation), split_sha256=split_hashes,
                     prompt=GENERIC_PROMPT_V0, architecture=asdict(architecture), backbone_signature=signature,
                     inference=backend.inference_config, objective="KL(teacher last-prompt mean-head spatial attention || side block3 attention)",
                     teacher_layer=args.teacher_layer, student_source_layer=2, backbone_frozen=True,
                     original_visa_test_is_training_source=True, final_test_dataset="independent MVTec",
                     cache_policy="optional H2 + target; keys include prompt/layers/backbone+image file identity and inference config",
-                    student_parameters=sum(p.numel() for p in student.parameters()))
+                    initialization="independent pretrained copies of original Qwen2 decoder blocks 3, 4, 5; no LM head",
+                    frozen_student_parts="block5 V/O/MLP/post-attention norm: downstream of the attention loss, never executed",
+                    student_parameters=sum(p.numel() for p in student.parameters()),
+                    student_trainable_parameters=sum(p.numel() for p in student.parameters() if p.requires_grad))
     (output / "train_run.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     # Relative checkpoint makes this config portable when the training folder moves.
     method_config = dict(checkpoint="best.pt", layer=2, rate_semantics="layer_average",
                          prune_rates=[50, 70, 90], visualize_rates=[50, 70, 90])
     (output / "method.json").write_text(json.dumps(method_config, indent=2), encoding="utf-8")
     print(f"VisA ALL-CSV pool: {len(samples)} images -> train={len(train)}, validation={len(validation)}; no GT/masks", flush=True)
-    print(f"Frozen teacher block{args.teacher_layer}; H2 side student: {metadata['student_parameters']:,} parameters", flush=True)
+    print(f"Frozen teacher block{args.teacher_layer}; H2 -> copied native blocks 3/4/5, "
+          f"width={architecture.input_size}, attention={architecture.attention_implementation}; "
+          f"student={metadata['student_parameters']:,} parameters "
+          f"(trainable={metadata['student_trainable_parameters']:,}); "
+          f"gradient_checkpointing={args.gradient_checkpointing}", flush=True)
     print("Cache disabled: teacher is recomputed each epoch." if not args.cache_dir else
           f"Teacher cache: {args.cache_dir}. H2 is large; monitor disk space (potentially hundreds of GB).", flush=True)
     print("ETA: estimating after the first image; updates use recent train/validation speeds. "

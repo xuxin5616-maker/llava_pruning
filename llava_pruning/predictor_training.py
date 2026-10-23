@@ -1,4 +1,4 @@
-"""Frozen teacher extraction and small-student optimization; no answer labels."""
+"""Frozen teacher extraction and independent side-student optimization; no answer labels."""
 
 from dataclasses import asdict
 import hashlib
@@ -231,8 +231,7 @@ def epoch_pass(student, examples, samples, *, device, precision, optimizer=None,
 
 def save_student(path, student, *, student_precision, backbone_depth, teacher_layer=22,
                  signature=None, provenance=None, epoch=0, validation_kl=None):
-    from llava.model.language_model.attention_predictor import CHECKPOINT_VERSION
-    atomic_save(dict(version=CHECKPOINT_VERSION, architecture=asdict(student.config),
+    atomic_save(dict(version=student.checkpoint_version, architecture=asdict(student.config),
                      state_dict={key: value.detach().cpu() for key, value in student.state_dict().items()},
                      student_layer=2, teacher_layer=teacher_layer, backbone_depth=backbone_depth,
                      student_precision=student_precision, backbone_signature=signature,

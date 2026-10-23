@@ -45,6 +45,10 @@ class PredictorEntrypointTests(unittest.TestCase):
                     Image.new("RGB", (16, 8), "white").save(root / "candle" / f"{index}.png")
                     writer.writerow(dict(object="candle", image=f"candle/{index}.png"))
             model, features, options = toy_model()
+            core = model.get_model()
+            core.config.num_hidden_layers = 6
+            for index in (4, 5):
+                core.layers.append(type(core.layers[0])(core.config, layer_idx=index))
             class Backend:
                 def __init__(self, *args, **kwargs):
                     self.model = model
@@ -53,8 +57,8 @@ class PredictorEntrypointTests(unittest.TestCase):
             def example(backend, sample, teacher_layer):
                 return extract_teacher(backend.model.get_model(), packed, (2, 16), layout(), teacher_layer=teacher_layer)
             args = ["train_attention_predictor.py", "--model-path", str(root), "--data-root", str(root),
-                    "--teacher-layer", "3", "--epochs", "1", "--hidden-size", "16", "--num-heads", "2",
-                    "--intermediate-size", "32", "--student-precision", "float32", "--gradient-accumulation", "4",
+                    "--teacher-layer", "3", "--epochs", "1",
+                    "--student-precision", "float32", "--gradient-accumulation", "4",
                     "--output-dir", str(root / "trained")]
             with patch("sys.argv", args), patch("llava_pruning.backend.LlavaBackend", Backend), \
                     patch("benchmark_fastv.validate_single_gpu"), patch("torch.cuda.is_available", return_value=True), \
@@ -68,9 +72,15 @@ class PredictorEntrypointTests(unittest.TestCase):
             self.assertIn("loss=", logs.getvalue())
             self.assertIn("mean_loss=", logs.getvalue())
             self.assertIn("Best validation loss=", logs.getvalue())
+            self.assertIn("copied native blocks 3/4/5", logs.getvalue())
             trained = root / "trained"
             self.assertTrue((trained / "best.pt").is_file())
             self.assertTrue((trained / "last.pt").is_file())
+            saved = torch.load(trained / "best.pt", weights_only=True)
+            self.assertEqual(saved["version"], 2)
+            self.assertEqual(saved["architecture"]["source_layers"], (3, 4, 5))
+            self.assertEqual(saved["architecture"]["qwen_config"]["hidden_size"], 32)
+            self.assertNotIn("project.weight", saved["state_dict"])
             method = load_method("attention_predictor", trained / "method.json")
             self.assertEqual(method.rates, (50, 70, 90))
             self.assertEqual(method.checkpoint, (trained / "best.pt").resolve())

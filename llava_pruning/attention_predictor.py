@@ -65,8 +65,8 @@ class AttentionPredictorMethod:
                     sha.update(block)
             digest = sha.hexdigest()
         return dict(checkpoint=str(self.checkpoint), checkpoint_sha256=digest,
-                    algorithm="project three-layer lightweight causal Transformer; not MAP reproduction",
-                    student="two full side blocks and third block attention Q/K only; backbone block2 features",
+                    algorithm="KL-trained three-layer side attention; not full MAP/TwigVLM reproduction",
+                    student="architecture comes from checkpoint: v2 independently pretrained native Qwen2 blocks 3/4/5 (no LM head); v1 legacy small branch",
                     teacher="fixed checkpoint teacher block (default22); last prompt query -> visual keys, mean heads; independent QK",
                     gradient="frozen backbone; student trained separately with KL(teacher||student); no GT",
                     budget_scope="joint Base+AnyRes spatial top-k; newlines protected and counted in average",

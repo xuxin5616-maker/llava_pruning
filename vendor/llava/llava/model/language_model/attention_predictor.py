@@ -1,10 +1,12 @@
-"""Three-layer causal side Transformer; third-layer attention is the score.
+"""Pretrained Qwen2 blocks 3/4/5 as an independent attention-only side branch.
 
-Project implementation, not MAP reproduction: two complete small Transformer
-blocks followed by the Q/K attention path of block 3. Its V/O/MLP cannot affect
-block-3 attention and are intentionally not instantiated. No backbone edits.
+The original small architecture is kept ONLY for loading version-1 checkpoints.
+New training copies full-width native blocks, not the backbone's parameters by
+reference. Only block5's input norm and Q/K affect its attention loss; its other
+copied parameters are retained but frozen and never executed. No LM head.
 """
 
+import copy
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 import math
@@ -14,7 +16,18 @@ from torch import nn
 from torch.nn import functional as F
 
 
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
+LEGACY_CHECKPOINT_VERSION = 1
+
+# Only decoder architecture fields, not vision paths/runtime pruning state.
+QWEN_FIELDS = ("hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads",
+               "num_key_value_heads", "hidden_act", "max_position_embeddings", "rms_norm_eps",
+               "rope_theta", "rope_scaling", "attention_dropout", "use_sliding_window",
+               "sliding_window", "max_window_layers")
+
+
+def copied_qwen_config(config):
+    return {key: copy.deepcopy(getattr(config, key, None)) for key in QWEN_FIELDS}
 
 
 def backbone_signature(config):
@@ -100,6 +113,9 @@ class SideBlock(nn.Module):
 
 
 class AttentionPredictor(nn.Module):
+    """Legacy 512-wide predictor, for version-1 checkpoint compatibility only."""
+    checkpoint_version = LEGACY_CHECKPOINT_VERSION
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -122,6 +138,124 @@ class AttentionPredictor(nn.Module):
         return self.layers[2](value, position_ids, indices)
 
 
+@dataclass(frozen=True)
+class CopiedPredictorConfig:
+    qwen_config: dict
+    attention_implementation: str
+    gradient_checkpointing: bool = True
+    source_layers: tuple = (3, 4, 5)
+
+    def __post_init__(self):
+        if tuple(self.source_layers) != (3, 4, 5):
+            raise ValueError("Copied predictor must initialize from original blocks 3, 4, 5")
+        if self.attention_implementation not in {"eager", "sdpa", "flash_attention_2"}:
+            raise ValueError("Unsupported copied Qwen2 attention implementation")
+        if type(self.gradient_checkpointing) is not bool:
+            raise ValueError("gradient_checkpointing must be boolean")
+        if set(self.qwen_config) != set(QWEN_FIELDS):
+            raise ValueError("Incomplete copied Qwen2 architecture")
+        if self.qwen_config["num_hidden_layers"] < 5:
+            raise ValueError("Copied predictor requires backbone blocks 3, 4, 5")
+        if self.qwen_config["use_sliding_window"]:
+            raise ValueError("Copied predictor currently requires non-sliding attention")
+
+    @property
+    def input_size(self):
+        return self.qwen_config["hidden_size"]
+
+
+class CopiedAttentionPredictor(nn.Module):
+    """Native full-width blocks; differentiable, independently calculated Q/K score."""
+    checkpoint_version = CHECKPOINT_VERSION
+
+    def __init__(self, config):
+        super().__init__()
+        from transformers import Qwen2Config
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer, Qwen2RotaryEmbedding
+        self.config = config
+        native_config = Qwen2Config(**config.qwen_config)
+        native_config._attn_implementation = config.attention_implementation
+        # Keep original layer_idx for RoPE/attention policy. No KV is ever used.
+        self.layers = nn.ModuleList([Qwen2DecoderLayer(native_config, layer_idx=i - 1)
+                                     for i in config.source_layers])
+        self.rotary_emb = Qwen2RotaryEmbedding(config=native_config)
+        self.requires_grad_(True)
+        last = self.layers[2]
+        last.requires_grad_(False)
+        for module in (last.input_layernorm, last.self_attn.q_proj, last.self_attn.k_proj):
+            module.requires_grad_(True)
+
+    @classmethod
+    def from_backbone(cls, core, *, gradient_checkpointing=True):
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer, Qwen2RotaryEmbedding
+        if len(core.layers) < 5 or not isinstance(core.rotary_emb, Qwen2RotaryEmbedding):
+            raise ValueError("Copied predictor requires native Qwen2 blocks 3, 4, 5 and RoPE")
+        config = CopiedPredictorConfig(copied_qwen_config(core.config), core.config._attn_implementation,
+                                       gradient_checkpointing=gradient_checkpointing)
+        # Allocate independent FP32 masters on CPU, then copy one block at a time.
+        # Never deepcopy the resident GPU modules/hooks or change the main model.
+        result = cls(config).float()
+        for destination, index in zip(result.layers, config.source_layers):
+            source = core.layers[index - 1]
+            if type(source) is not Qwen2DecoderLayer or type(source.self_attn) is not type(destination.self_attn):
+                raise ValueError("Source must be unmodified native Qwen2 decoder/attention blocks")
+            if any(parameter.is_meta for parameter in source.parameters()):
+                raise ValueError("Cannot initialize side branch from unmaterialized meta weights")
+            destination.load_state_dict({key: value.detach().cpu() for key, value in source.state_dict().items()}, strict=True)
+        return result
+
+    def _run_block(self, layer, hidden, position_ids):
+        rotary = self.rotary_emb(hidden, position_ids)
+        bias = None
+        if self.config.attention_implementation == "eager":
+            n = hidden.shape[1]
+            future = torch.arange(n, device=hidden.device)[None, :] > torch.arange(n, device=hidden.device)[:, None]
+            bias = hidden.new_zeros((1, 1, n, n)).masked_fill(future, torch.finfo(hidden.dtype).min)
+        # Native SDPA uses is_causal when bias=None; FlashAttention2 is causal too.
+        return layer(hidden, attention_mask=bias, position_ids=position_ids, past_key_value=None,
+                     output_attentions=False, use_cache=False, cache_position=position_ids[0],
+                     position_embeddings=rotary)[0]
+
+    def forward(self, hidden, position_ids, spatial_indices):
+        if hidden.ndim != 3 or hidden.shape[0] != 1 or hidden.shape[-1] != self.config.input_size:
+            raise ValueError("Copied predictor requires one unpadded full multimodal sequence")
+        if position_ids.shape != hidden.shape[:2]:
+            raise ValueError("Predictor position IDs must match the original sequence")
+        indices = torch.as_tensor(spatial_indices, dtype=torch.long, device=hidden.device)
+        if (indices.ndim != 1 or indices.numel() == 0 or int(indices.min()) < 0
+                or int(indices.max()) >= hidden.shape[1] or len(indices.unique()) != len(indices)):
+            raise ValueError("Predictor needs distinct original spatial token indices")
+        # Detach is intentional: training must never backpropagate into H2/main.
+        value = hidden.detach().to(self.layers[0].input_layernorm.weight.dtype)
+        for layer in self.layers[:2]:
+            if self.training and self.config.gradient_checkpointing and torch.is_grad_enabled():
+                from torch.utils.checkpoint import checkpoint
+                # Bind layer now; a loop closure would recompute the wrong layer.
+                def run_block(x, ids, block=layer):
+                    return self._run_block(block, x, ids)
+                value = checkpoint(run_block, value, position_ids, use_reentrant=False)
+            else:
+                value = self._run_block(layer, value, position_ids)
+        last = self.layers[2]
+        attention = last.self_attn
+        normalized = last.input_layernorm(value)
+        query = attention.q_proj(normalized[:, -1:]).view(1, 1, attention.num_heads, attention.head_dim).transpose(1, 2)
+        key = attention.k_proj(normalized).view(1, -1, attention.num_key_value_heads, attention.head_dim).transpose(1, 2)
+        cos, sin = self.rotary_emb(value, position_ids)
+        from .fastv_attention import _rotate_half
+        query = query * cos[:, None, -1:] + _rotate_half(query) * sin[:, None, -1:]
+        key = key * cos[:, None] + _rotate_half(key) * sin[:, None]
+        key = key.repeat_interleave(attention.num_key_value_groups, dim=1)
+        # No @no_grad or native output_attentions=True: this row trains Q/K and
+        # the preceding copied blocks, with stable FP32 log-softmax/head mean.
+        with torch.autocast(device_type=value.device.type, enabled=False):
+            logits = (query.float() @ key.float().transpose(-2, -1)) / math.sqrt(attention.head_dim)
+            rows = F.log_softmax(logits, dim=-1)[0, :, 0]
+            mean = torch.logsumexp(rows, dim=0) - math.log(attention.num_heads)
+            spatial = mean[indices]
+            return spatial - torch.logsumexp(spatial, dim=0)
+
+
 def student_autocast(device, precision):
     if precision == "float32":
         return nullcontext()
@@ -134,15 +268,22 @@ def load_predictor(path, device, input_size):
     # weights_only avoids executing arbitrary pickle objects; all payload fields
     # are tensors or primitive containers, including the training provenance.
     saved = torch.load(path, map_location="cpu", weights_only=True)
-    if saved.get("version") != CHECKPOINT_VERSION:
+    if saved.get("version") == LEGACY_CHECKPOINT_VERSION:
+        config = PredictorConfig(**saved["architecture"])
+        model = AttentionPredictor(config)
+    elif saved.get("version") == CHECKPOINT_VERSION:
+        config = CopiedPredictorConfig(**saved["architecture"])
+        model = CopiedAttentionPredictor(config)
+    else:
         raise ValueError("Unsupported attention predictor checkpoint version")
-    config = PredictorConfig(**saved["architecture"])
     if config.input_size != input_size or saved["student_layer"] != 2:
         raise ValueError("Predictor backbone dimension or source-layer mismatch")
-    model = AttentionPredictor(config)
     model.load_state_dict(saved["state_dict"], strict=True)
     model.to(device=device).eval().requires_grad_(False)
     precision = saved.get("student_precision", "float32")
+    if (isinstance(model, CopiedAttentionPredictor) and config.attention_implementation == "flash_attention_2"
+            and precision != "bfloat16"):
+        raise ValueError("Copied FlashAttention2 student requires bfloat16 autocast; main model stays FP16")
     # Validate precision before a long evaluation starts.
     with student_autocast(device, precision):
         pass
@@ -203,6 +344,10 @@ class AttentionPredictorMixin:
                 raise ValueError("Predictor checkpoint has an invalid teacher layer")
             if saved.get("backbone_signature") != backbone_signature(self.config):
                 raise ValueError("Predictor backbone architecture/AnyRes packing/order does not match training")
+            if isinstance(model, CopiedAttentionPredictor) and (
+                    model.config.qwen_config != copied_qwen_config(self.config)
+                    or model.config.attention_implementation != self.config._attn_implementation):
+                raise ValueError("Copied predictor Qwen2 architecture/attention backend does not match backbone")
             self.attention_predictor, self._predictor_precision = model, precision
             self._predictor_teacher_layer = saved["teacher_layer"]
             self._predictor_checkpoint = identity
@@ -231,9 +376,12 @@ class AttentionPredictorMixin:
     def _clse_extra_stats(self):
         if not self.attention_predictor_enabled:
             return super()._clse_extra_stats()
-        return dict(score="predicted_layer_attention", attention_source="three_layer_side_transformer",
+        copied = isinstance(self.attention_predictor, CopiedAttentionPredictor)
+        return dict(score="predicted_layer_attention", attention_source=("copied_qwen2_blocks_3_4_5" if copied else "legacy_small_transformer"),
                     pruning_layer=2, teacher_layer=self._predictor_teacher_layer,
-                    student_layers=3, student_precision=self._predictor_precision)
+                    student_layers=3, student_precision=self._predictor_precision,
+                    student_hidden_size=self.attention_predictor.config.input_size if copied else self.attention_predictor.config.hidden_size,
+                    student_source_layers=[3, 4, 5] if copied else None)
 
     def _clse_score_kind(self):
         return "attention_predictor" if self.attention_predictor_enabled else super()._clse_score_kind()

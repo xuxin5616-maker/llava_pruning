@@ -5,11 +5,18 @@ A small, single-image inference scaffold for LLaVA OneVision/Qwen2 checkpoints. 
 ## Learned block2 -> block22 attention predictor
 
 `--method attention_predictor` adds a **trained** side Transformer; it is not a
-training-free method or a MAP reproduction. The frozen original backbone stays
-FP16 + FlashAttention2. A 512-wide/8-head side branch reads raw block2 features;
-two full small causal blocks followed by the Q/K attention path of block3 predict
-the fixed block22 teacher attention. Only the side parameters are trained with
-KL loss; the original H2, not side features, is pruned and sent to block3 onward.
+training-free method or a full MAP/TwigVLM reproduction. The frozen original
+backbone stays FP16 + FlashAttention2. New training initializes **independent,
+full-width pretrained copies of native Qwen2 blocks 3/4/5** from the current
+backbone. Blocks 3/4 run normally; only block5's input RMSNorm/Q/K/RoPE run to
+predict block22's attention. Block5's unused downstream parameters are copied
+but frozen; no LM head, extra input norm or 512-wide projection is used. Only
+the relevant side parameters are trained with KL loss; original H2, not side
+features, is pruned and sent to block3 onward. BF16 student autocast and training
+gradient checkpointing reduce cost without changing backbone precision/backend.
+Full-width training/checkpoints cost substantially more memory than the legacy
+small predictor. Old v1 checkpoints remain evaluable as legacy, not as v2 copies;
+new architecture training starts from the backbone, not old student weights.
 
 Train on ALL rows of the user's full VisA CSV (no GT/masks), internally split
 90/10 by category and seed42, then evaluate on independent MVTec:
@@ -19,7 +26,7 @@ CUDA_VISIBLE_DEVICES=5 python train_attention_predictor.py \
   --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
   --data-root /home/yz/xxy/data/datasets/VisA \
   --visa-split-csv /home/yz/xxy/data/datasets/VisA/split_csv/1cls.csv \
-  --epochs 5 --output-dir output/attention_predictor_train_01
+  --epochs 5 --output-dir output/attention_predictor_copied_train_01
 
 CUDA_VISIBLE_DEVICES=5 python run.py \
   --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
@@ -27,9 +34,9 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
   --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
   --prompt-version v0 --roi-mode anyres_max_9 \
   --method attention_predictor \
-  --method-config output/attention_predictor_train_01/method.json \
+  --method-config output/attention_predictor_copied_train_01/method.json \
   --no-sample --no-plots --benchmark-metrics --warmup 10 --seed 42 \
-  --output-dir output/attention_predictor_mvtec_01
+  --output-dir output/attention_predictor_copied_mvtec_01
 ```
 
 The training entry writes `best.pt`, `last.pt`, `history.csv`, fixed split lists
