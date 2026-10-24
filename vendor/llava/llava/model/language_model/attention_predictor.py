@@ -319,7 +319,10 @@ class AttentionPredictorMixin:
         return super().configure_pyramiddrop(**kwargs)
 
     def configure_attention_predictor(self, *, enabled, keep_ratio, checkpoint=None,
-                                      capture_attention=False, capture_visualization=False):
+                                      capture_attention=False, capture_visualization=False, selection_mode="base_guided"):
+        if selection_mode not in {"base_guided", "joint"}:
+            raise ValueError("Predictor selection_mode must be base_guided or joint")
+        self._predictor_selection_mode = selection_mode
         if enabled and len(self.layers) <= 2:
             raise ValueError("Attention predictor needs a decoder deeper than block2")
         # Preserve already loaded side weights across rate/sample resets, but not
@@ -358,38 +361,76 @@ class AttentionPredictorMixin:
     def _clse_reference(self, hidden, start, end):
         if not self.attention_predictor_enabled:
             return super()._clse_reference(hidden, start, end)
+        if self._predictor_selection_mode == "base_guided":
+            from .attention_predictor_selection import base_guided_budget
+            # Validate both group quotas before any decoder computation.
+            base_guided_budget(self._clse_layout, self.clse_keep_ratio)
         spatial = [i for grid in self._clse_layout["grids"] for i in grid["indices"]]
         return None, spatial
 
     def _clse_rank(self, hidden, start, end, ids, reference):
         if not self.attention_predictor_enabled:
             return super()._clse_rank(hidden, start, end, ids, reference)
-        indices = [start + i for grid in self._clse_layout["grids"] for i in grid["indices"]]
+        guided = self._predictor_selection_mode == "base_guided"
+        grids = self._clse_layout["grids"]
+        if guided:
+            from .attention_predictor_selection import named_spatial_grids, base_guided_log_scores
+            base = named_spatial_grids(self._clse_layout)["base"]
+            # Score only Base positions for ranking; side input is still the
+            # FULL original H2. Training targets/checkpoint architecture do not change.
+            indices = [start + i for i in base["indices"]]
+        else:
+            indices = [start + i for grid in grids for i in grid["indices"]]
         with student_autocast(hidden.device, self._predictor_precision):
             log_prob = self.attention_predictor(hidden, ids, indices)
         if not torch.isfinite(log_prob).all():
             raise FloatingPointError("Non-finite predictor scores; no precision/backend fallback")
+        if guided:
+            log_prob = base_guided_log_scores(log_prob, self._clse_layout)
         # Ranking log probabilities avoids exp underflow; capture probabilities
         # separately so the public overlay remains easy to interpret.
         return log_prob
+
+    def _clse_select(self, ranking, spatial_indices, original):
+        if not self.attention_predictor_enabled or self._predictor_selection_mode == "joint":
+            return super()._clse_select(ranking, spatial_indices, original)
+        from .attention_predictor_selection import select_base_guided_tokens
+        selected, plan = select_base_guided_tokens(ranking, spatial_indices, original,
+                                                   self.clse_keep_ratio, self._clse_layout)
+        self._clse_stats.update(selection_groups=plan["groups"],
+                                common_spatial_keep_ratio=plan["spatial_keep_ratio"])
+        return selected, plan["target"], len(plan["protected_indices"])
 
     def _clse_extra_stats(self):
         if not self.attention_predictor_enabled:
             return super()._clse_extra_stats()
         copied = isinstance(self.attention_predictor, CopiedAttentionPredictor)
+        guided = self._predictor_selection_mode == "base_guided"
         return dict(score="predicted_layer_attention", attention_source=("copied_qwen2_blocks_3_4_5" if copied else "legacy_small_transformer"),
                     pruning_layer=2, teacher_layer=self._predictor_teacher_layer,
+                    selection_mode=self._predictor_selection_mode,
+                    budget_scope=("separate Base and whole AnyRes; equal proportional spatial quotas after newline reservation"
+                                  if guided else "joint Base + AnyRes; structural newlines protected"),
+                    ranking_source=("predicted Base attention; FP32 bilinear probabilities on actual packed AnyRes grid"
+                                    if guided else "predicted own attention for all spatial tokens"),
+                    rounding=("floor packed target, reserve newlines, proportional largest remainder; ties Base first"
+                              if guided else "floor packed target, reserve newlines"),
                     student_layers=3, student_precision=self._predictor_precision,
                     student_hidden_size=self.attention_predictor.config.input_size if copied else self.attention_predictor.config.hidden_size,
                     student_source_layers=[3, 4, 5] if copied else None)
 
     def _clse_score_kind(self):
-        return "attention_predictor" if self.attention_predictor_enabled else super()._clse_score_kind()
+        if not self.attention_predictor_enabled:
+            return super()._clse_score_kind()
+        return "attention_predictor_base_guided" if self._predictor_selection_mode == "base_guided" else "attention_predictor"
 
     def get_clse_stages(self):
         stages = super().get_clse_stages()
         if self.attention_predictor_enabled:
             for stage in stages:
+                stage["selection_mode"] = self._predictor_selection_mode
+                if "selection_groups" in self._clse_stats:
+                    stage["selection_groups"] = self._clse_stats["selection_groups"]
                 if "attention" in stage:
                     # Newlines are non-spatial; zero is correct for their display.
                     scores = torch.tensor(stage["attention"]["scores"])

@@ -131,7 +131,7 @@ class PredictorEntrypointTests(unittest.TestCase):
 
                 def generate(self, sample, prompt, method, rate, mode, **kwargs):
                     result = super().generate(sample, prompt, method, rate, mode, **kwargs)
-                    before = 100 + int(sample.sample_id)
+                    before = 1000 + int(sample.sample_id)
                     budget = method.resolve_budget(rate, 28)
                     after = max(1, math.floor(before * (100 - budget["requested_layer_prune_rate"]) / 100))
                     rows = []
@@ -141,7 +141,17 @@ class PredictorEntrypointTests(unittest.TestCase):
                         rows.append(dict(layer=layer, image_tokens_in=count, image_tokens_out=out,
                                          sequence_tokens_in=count + 10, sequence_tokens_out=out + 10,
                                          removed_after_layer=count - out, cumulative_prune_rate=100 * (1 - out / before)))
-                    self.core.get_clse_stats = lambda: dict(original_image_tokens=before, final_llm_visual_tokens=after, layers=rows)
+                    base_count, protected = 250, 2
+                    anyres_count = before - base_count - protected
+                    common_keep = (after - protected) / (before - protected)
+                    base_keep = round(base_count * common_keep)
+                    anyres_keep = after - protected - base_keep
+                    groups = [dict(name=name, candidate_tokens=count, kept_tokens=keep,
+                                   masked_tokens=count - keep, actual_prune_rate=100 * (1 - keep / count))
+                              for name, count, keep in (("base", base_count, base_keep), ("anyres", anyres_count, anyres_keep))]
+                    self.core.get_clse_stats = lambda: dict(original_image_tokens=before, final_llm_visual_tokens=after, layers=rows,
+                                                           selection_groups=groups, common_spatial_keep_ratio=common_keep,
+                                                           protected_newline_tokens=protected)
                     result["stats"] = method.stats(self.core, rate)
                     return result
             args = ["run.py", "--model-path", str(root), "--input-json", str(options["input_json"]),
@@ -164,8 +174,15 @@ class PredictorEntrypointTests(unittest.TestCase):
                 self.assertAlmostEqual(metrics["lat_mean_ms"], 150)
                 self.assertAlmostEqual(metrics["mem_peak_allocated_gib"], 1 + rate / 100)
                 self.assertFalse((path / "visualizations").exists())
+                with (path / "view_budgets.csv").open(encoding="utf-8", newline="") as stream:
+                    group_rows = list(csv.DictReader(stream))
+                self.assertEqual(len(group_rows), 8)
+                self.assertEqual([row["name"] for row in group_rows], ["base", "anyres"] * 4)
+                self.assertTrue(all(row["method"] == "attention_predictor" for row in group_rows))
+                self.assertTrue(all(row["protected_newline_tokens"] == "2" for row in group_rows))
             metadata = json.loads((options["output_dir"] / "run.json").read_text(encoding="utf-8"))
             self.assertIn("trained", metadata["inference"]["attention_source"])
+            self.assertEqual(metadata["inference"]["predictor_selection_mode"], "base_guided")
             self.assertEqual(len(metadata["method_details"]["checkpoint_sha256"]), 64)
 
 

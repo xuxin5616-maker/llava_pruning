@@ -36,7 +36,7 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
   --method attention_predictor \
   --method-config output/attention_predictor_copied_train_01/method.json \
   --no-sample --no-plots --benchmark-metrics --warmup 10 --seed 42 \
-  --output-dir output/attention_predictor_copied_mvtec_01
+  --output-dir output/attention_predictor_base_guided_mvtec_01
 ```
 
 Training optimizer defaults follow **original TwigVLM ICCV2025 Appendix A Table5**:
@@ -52,9 +52,20 @@ The training entry writes `best.pt`, `last.pt`, `history.csv`, fixed split lists
 and the portable `method.json`. VisA images used for distillation are **not** an
 independent VisA test set. No H2 disk cache is created by default; optional
 `--cache-dir` can save repeated teacher computation but may use hundreds of GB.
-The evaluation config defaults to layer-average removal 50/70/90%, one joint
-Base+AnyRes budget with protected newlines, original positions and physical KV
-compaction. Lat/Mem includes side computation/weights. Full usage, precision,
+The evaluation config defaults to layer-average removal 50/70/90% and
+`selection_mode=base_guided`: rank Base by its predicted attention and rank
+the whole AnyRes grid by FP32 bilinear interpolation of Base probabilities
+(actual post-unpad/max9 geometry, align_corners=False). The side input is still
+full H2; AnyRes's own predicted scores are not used for selection. Independent
+Base/whole-AnyRes top-k quotas use the same spatial retention ratio after
+reserving newlines within the unchanged packed budget. Largest-remainder
+rounding preserves the exact total, and per-crop AnyRes retention may differ.
+Existing checkpoints/method.json work without retraining; absent selection_mode
+means base_guided. Explicit `selection_mode=joint` restores the old own-score
+joint-top-k policy. Each nonzero rate writes per-image `view_budgets.csv` group
+counts/rates; attention images label AnyRes as Base-mapped, not own attention.
+Original positions and physical KV compaction remain. Lat/Mem includes side
+computation, mapping, selection and weights. Full usage, precision,
 limitations and validation: [attention predictor details](docs/attention_predictor.md).
 
 ## CLSE quick start

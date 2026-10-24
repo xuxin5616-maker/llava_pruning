@@ -136,7 +136,10 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                                      score_dtype="FP32 scoring branch; native decoder dtype/backend unchanged")
     if method.name == "attention_predictor":
         metadata["inference"] = dict(metadata["inference"], attention_source="trained three-layer side Transformer",
-                                     score_dtype="FP32 final QK/softmax; student precision in checkpoint; backbone untouched")
+                                     score_dtype="FP32 final QK/softmax/mapping; student precision in checkpoint; backbone untouched",
+                                     predictor_selection_mode=method.selection_mode,
+                                     ranking_source=("Base prediction mapped to AnyRes; separate proportional group budgets"
+                                                     if method.selection_mode == "base_guided" else "joint own Base/AnyRes prediction"))
     if benchmark_metrics:
         metadata.update(
             warmup_requested=warmup,
@@ -260,6 +263,23 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                             for group in batch["groups"]:
                                 writer.writerow({"question_id": sample.sample_id, "fastv_layer": method.layer,
                                                  "prune_rate": rate, **group})
+                if result["stats"].get("selection_groups"):
+                    # Predictor-only audit, kept separate from FastV's existing
+                    # CSV schema. No per-token score arrays in predictions JSON.
+                    budget_path = rate_dir / "view_budgets.csv"
+                    fields = ("question_id", "method", "pruning_layer", "prune_rate", "name",
+                              "candidate_tokens", "kept_tokens", "masked_tokens", "actual_prune_rate",
+                              "common_spatial_keep_ratio", "protected_newline_tokens")
+                    header = not budget_path.exists()
+                    with budget_path.open("a", encoding="utf-8", newline="") as budget_file:
+                        writer = csv.DictWriter(budget_file, fieldnames=fields)
+                        if header:
+                            writer.writeheader()
+                        for group in result["stats"]["selection_groups"]:
+                            writer.writerow(dict(question_id=sample.sample_id, method=method.name,
+                                                 pruning_layer=method.layer, prune_rate=rate, **group,
+                                                 common_spatial_keep_ratio=result["stats"]["common_spatial_keep_ratio"],
+                                                 protected_newline_tokens=result["stats"]["protected_newline_tokens"]))
                 if result["stats"].get("layers"):
                     write_header = not layer_path.exists()
                     with layer_path.open("a", encoding="utf-8", newline="") as layer_file:

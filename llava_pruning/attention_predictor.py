@@ -18,18 +18,22 @@ class AttentionPredictorMethod:
     layer: int = 2
     rate_semantics: str = "layer_average"
     name: str = "attention_predictor"
+    selection_mode: str = "base_guided"
 
     @classmethod
     def from_config(cls, path):
         path = Path(path).resolve()
         config = json.loads(path.read_text(encoding="utf-8"))
-        allowed = {"checkpoint", "layer", "rate_semantics", "prune_rates", "visualize_rates"}
+        allowed = {"checkpoint", "layer", "rate_semantics", "prune_rates", "visualize_rates", "selection_mode"}
         if set(config) - allowed:
             raise ValueError(f"Unknown attention_predictor keys: {sorted(set(config) - allowed)}")
         if type(config.get("layer", 2)) is not int or config.get("layer", 2) != 2:
             raise ValueError("attention_predictor prunes after completed LLM block 2")
         if config.get("rate_semantics", "layer_average") != "layer_average":
             raise ValueError("attention_predictor requires layer_average rates")
+        selection_mode = config.get("selection_mode", "base_guided")
+        if selection_mode not in {"base_guided", "joint"}:
+            raise ValueError("attention_predictor selection_mode must be base_guided or joint")
         rates, visual = tuple(config["prune_rates"]), tuple(config.get("visualize_rates", []))
         if not rates or any(not is_prune_rate(r) for r in rates) or len(set(rates)) != len(rates):
             raise ValueError("Predictor rates must be distinct percentages in [0,100)")
@@ -42,7 +46,7 @@ class AttentionPredictorMethod:
         if any(r != 0 for r in rates) and not checkpoint.is_file():
             raise FileNotFoundError(f"Predictor checkpoint not found: {checkpoint}. Run train_attention_predictor.py first; "
                                     "then use its output method.json.")
-        return cls(checkpoint, rates, frozenset(visual))
+        return cls(checkpoint, rates, frozenset(visual), selection_mode=selection_mode)
 
     resolve_budget = PriorTRMethod.resolve_budget
     resolve_budgets = PriorTRMethod.resolve_budgets
@@ -54,7 +58,7 @@ class AttentionPredictorMethod:
         core.configure_attention_predictor(enabled=prune_rate != 0,
                                            keep_ratio=(100 - budget["requested_layer_prune_rate"]) / 100,
                                            checkpoint=self.checkpoint, capture_attention=capture_attention,
-                                           capture_visualization=capture_visualization)
+                                           capture_visualization=capture_visualization, selection_mode=self.selection_mode)
 
     def details(self):
         digest = None
@@ -69,7 +73,13 @@ class AttentionPredictorMethod:
                     student="architecture comes from checkpoint: v2 independently pretrained native Qwen2 blocks 3/4/5 (no LM head); v1 legacy small branch",
                     teacher="fixed checkpoint teacher block (default22); last prompt query -> visual keys, mean heads; independent QK",
                     gradient="frozen backbone; student trained separately with KL(teacher||student); no GT",
-                    budget_scope="joint Base+AnyRes spatial top-k; newlines protected and counted in average",
+                    selection_mode=self.selection_mode,
+                    ranking_source=("Base prediction only; bilinear probability interpolation (align_corners=False) to actual unpadded/max9 AnyRes grid"
+                                    if self.selection_mode == "base_guided" else "own predicted attention for Base and AnyRes"),
+                    budget_scope=("separate Base/whole AnyRes with same continuous spatial retention; preserve packed target after newline reservation"
+                                  if self.selection_mode == "base_guided" else "joint Base+AnyRes spatial top-k"),
+                    budget_rounding="floor total packed target; protect newlines; proportional largest remainder for base_guided",
+                    checkpoint_compatibility="selection policy is inference-only; existing v1/v2 weights do not need retraining",
                     position_policy="preserve original IDs, physically compact all existing KV caches",
                     inference="native backbone FP16/FlashAttention2; student precision stored in checkpoint",
                     rate_semantics="layer_average", pruning_layer=2)
@@ -81,4 +91,6 @@ class AttentionPredictorMethod:
             base_grid=int(vision_tower.num_patches_per_side), patch_size=int(vision_tower.config.patch_size),
             output_dir=output_dir, sample_id=sample_id, save_prune=save_prune, save_attention=save_attention,
             prediction_label=prediction_caption(ground_truth, result.get("answer")), method_name="AttentionPredictor",
-            score_caption="Side Transformer block3 predicted teacher attention; NOT defect probability.")
+            score_caption=("Base predicted attention; AnyRes is mapped from Base, NOT its own attention or defect probability."
+                           if self.selection_mode == "base_guided" else
+                           "Side Transformer block3 predicted teacher attention; NOT defect probability."))

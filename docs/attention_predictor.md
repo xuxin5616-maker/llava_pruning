@@ -127,6 +127,7 @@ Layer2/22 都指 **1-based 完成的 block / block 内部 attention**。本版�
 - `train.jsonl`、`validation.jsonl`：固定图片名单，没有 GT/mask 字段。
 - `history.csv`：每轮训练/验证 KL、耗时、Top-k 重合率、保留的教师 attention 总质量。
   这里 Top-k 指空间 token 移除50/70/90的拟合诊断，**不是最终含 newline 的层平均预算**。
+  训练诊断仍比较全部空间token的原始旁路输出，不是下述 Base-guided 推理映射后的选取结果。
   另含 `optimizer_steps`（该阶段实际更新数；验证为0）、`global_step`（累计更新数）、
   `lr_next`（该阶段结束后下一次更新将使用的学习率，不是该阶段平均LR；最终为0）。
 - `best.pt`：以内部 validation KL 选择的最佳旁路；`last.pt`：最后一轮旁路。
@@ -143,6 +144,10 @@ Layer2/22 都指 **1-based 完成的 block / block 内部 attention**。本版�
 
 ## 再评估：MVTec 平均剪枝率50/70/90
 
+**当前默认仅修改推理选取，无需重新训练。** 已有 v1/v2 checkpoint 和训练目录下的
+`method.json` 可以继续使用；旧 JSON 没有 `selection_mode` 时默认使用新策略 `base_guided`。
+这不涉及 `runMyPruningPoolSpatialBaseFull.py`，训练 KL、教师层及权重格式不变。
+
 ```bash
 CUDA_VISIBLE_DEVICES=5 python run.py \
   --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
@@ -152,17 +157,37 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
   --method attention_predictor \
   --method-config output/attention_predictor_copied_train_01/method.json \
   --no-sample --no-plots --benchmark-metrics --warmup 10 --seed 42 \
-  --output-dir output/attention_predictor_copied_mvtec_01
+  --output-dir output/attention_predictor_base_guided_mvtec_01
 ```
 
 评估用与训练一致的 backbone 权重，不是把旁路用于另一个同尺寸但不同权重的模型。
 读取 checkpoint 时校验版本、宽度、深度和实际 AnyRes packing/order；结构签名校验不能证明权重内容相同。
 非零率仅支持 batch1、单张完整 AnyRes 图、无序列 padding、spatial_unpad(_add_newl)、greedy DynamicCache。
 
-在第2层后，旁路对完整 H2 评分；依据第三层 attention 联合选 Base＋AnyRes token，
-**从原始 H2 选择，而非从旁路输出选择特征**，继续运行原 LLM block3..D。
+在第2层后，旁路输入仍是**完整 H2（Base、AnyRes和文本都在）**，不是只输入Base：
+
+1. 仅取第三层对 **Base 空间 token** 的预测attention，归一化为Base图上的分布。
+2. 在FP32中将 Base **概率图** 双线性插值到实际打包的整个AnyRes网格，
+   `align_corners=False`。使用模型真正unpad/max9缩放后的行列数，不假定原始crop一定3×3，
+   不对log分数直接插值，也不读取AnyRes自身预测分数参与排名。
+3. Base、**整个AnyRes** 各自独立Top-k，采用相同连续空间保留比例；AnyRes没有逐crop固定配额，
+   同一AnyRes大图内的不同crop保留数可以不同。分数相同时按原始行优先空间次序决定。
+4. **从原始 H2 选择，而非从旁路输出选择特征**，继续运行原 LLM block3..D。
+
 原始 position IDs 保留，所有已写入 KV 缓存物理压缩，新 token 位置从原始 prompt 长度继续。
-newline 不参与排名但始终保留并计入层平均成本；不足以容纳结构 token 的预算明确报错。
+newline 不参与排名但始终保留并计入层平均成本。为不改变原有层平均总预算，先计算packed总名额
+`T=floor(N*keep_ratio)`，预留P个newline后，以统一的 `q=(T-P)/(B+A)` 分给Base的B个和AnyRes的A个
+空间token：两组连续名额分别是qB、qA，最大余数法取整且总数严格为T-P（余数相同时Base优先）。
+两组整数误差各小于一个token，不按预测attention质量跨组抢占名额。不足以为两组各保留至少一个
+空间token时明确报错，不通过削减newline或放宽目标兜底。
+
+评估每个非零率额外写 `prune_XX/view_budgets.csv`：每图两行Base/AnyRes，包含各自空间token的
+原始/保留/删除数量、实际剪枝率、共同空间保留比例、保护newline数。`run.json` 记录选取策略；
+预测JSON仍只保留原有精简字段，不塞入分数数组。
+
+如需复现旧的“各用自己的预测分数＋联合Top-k”，在同一 `method.json` 显式加
+`"selection_mode": "joint"`；新策略为 `"selection_mode": "base_guided"`。不修改checkpoint本身，
+可用同一权重对照两种推理策略，但请使用不同的输出目录。
 
 设原 packed 视觉数 N，剪后保留 K，深度 D：
 
@@ -172,7 +197,9 @@ newline 不参与排名但始终保留并计入层平均成本；不足以容纳
 ```
 
 28层下平均50/70/90对应单次53.8462/75.3846/96.9231%。用 floor 整数预算，输出另报实际单次/平均比例，
-并提供 `layer_tokens.csv` 独立核查。旁路的额外计算不算在这28层 token 平均数里，因此
+并提供 `layer_tokens.csv` 独立核查。注意上述单次比例包含受保护newline；两组**空间**token的
+共同实际剪枝率还会因newline预留而略高，应以 `view_budgets.csv` 为准。
+旁路的额外计算不算在这28层 token 平均数里，因此
 **平均剪枝率不等于真实 FLOPs 或加速比例**。
 
 ACC/PRE/Recall/TNR、Lat、峰值 Mem 和预算字段沿用公共 `summary.csv` / `metrics.json` / 精简 predictions。
@@ -182,8 +209,9 @@ Lat 包含视觉、projector、packing、主干 prefill、旁路评分与剪枝�
 
 需要图片时，用新输出目录，将 `--no-plots --benchmark-metrics --warmup 10` 替换成
 `--save-prune-vis --save-attention-vis`；可用 `--visualize-samples` 限制保存 ID，不减少评估样本。
-仍只有 `comparison.png`、`attention_overlay.png` 两类 PNG，图上带 GT/Pred；分数图为预测 attention，
-不是缺陷概率。原 CLSE/FastV/PriorTR 配置不变。
+仍只有 `comparison.png`、`attention_overlay.png` 两类 PNG，图上带 GT/Pred；Base为预测attention，
+AnyRes热图为Base映射分数，图片说明明确标注，不冒充AnyRes自身attention或缺陷概率。
+可视化统一缩放分数只用于显示，不影响组内排序。原 CLSE/FastV/PriorTR 配置不变。
 
 ## 本地验证范围
 
@@ -191,7 +219,9 @@ Lat 包含视觉、projector、packing、主干 prefill、旁路评分与剪枝�
 有效学生路径梯度/无效尾部冻结、梯度检查点前向反向等价、冻结教师无梯度、H2及教师层位置、真实 eager attention
 oracle、KL 小样本拟合、尾部梯度累计、真实预处理和打包、不生成教师答案、checkpoint/缓存身份、
 VisA全行无GT读取与内部划分、真实 generate/原始位置/KV压缩、0%身份、跨模式清理、完整训练 CLI
-与共享评估统计接线。可选 native CUDA FP16 + FlashAttention2 / BF16 学生训练测试需要服务器：
+与共享评估统计接线，以及Base-only排名输入、概率插值数值oracle、实际矩形/AnyRes-first/末尾newline
+几何、两组同率精确总预算、组间质量不抢预算、旧joint选项与分组CSV。可选 native CUDA FP16 +
+FlashAttention2 / BF16 学生训练测试需要服务器：
 
 ```bash
 python -m unittest discover -s tests -p 'test_*predictor*.py' -q

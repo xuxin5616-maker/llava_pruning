@@ -95,6 +95,9 @@ class CLSEMixin:
     def _clse_score_kind(self):
         return "clse"
 
+    def _clse_select(self, ranking, spatial_indices, original):
+        return select_joint_tokens(ranking, spatial_indices, original, self.clse_keep_ratio)
+
     def init_clse(self):
         self.clse_enabled = self.clse_configured = False
         self.reset_clse_state()
@@ -275,7 +278,7 @@ class CLSEMixin:
                 with measure_pruning(self, hidden.device):
                     ranking = self._clse_rank(hidden, start, end, ids, reference)
                     reference = None
-                    selected, retained, protected = select_joint_tokens(ranking, spatial_indices, original, self.clse_keep_ratio)
+                    selected, retained, protected = self._clse_select(ranking, spatial_indices, original)
                     selection = torch.cat((torch.arange(start, device=hidden.device), selected + start,
                                            torch.arange(end, hidden.shape[1], device=hidden.device)))
                     hidden = hidden.index_select(1, selection).contiguous()
