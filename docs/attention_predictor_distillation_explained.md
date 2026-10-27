@@ -218,21 +218,27 @@ Answer with the option's letter from the given choices directly.
 
 推理时不再运行完整的第22层教师来获取评分，而是在第2层结束后运行旁路。
 
-**当前默认是你后来要求的 `base_guided` 策略：**
+**当前默认是 `base_crop` 策略（旧名称 `base_guided` 自动升级到此策略）：**
 
 1. 完整 `H₂` 输入旁路。
-2. 只取旁路对 **Base 空间 token** 的预测 attention。
-3. 将 Base 概率图双线性插值到实际打包后的整个 AnyRes 网格。
-4. Base 与整个 AnyRes 分别选 Top-k，采用相同的连续空间保留比例；整数数量允许取整误差。
+2. 取旁路对 **Base 和 AnyRes 空间 token** 的预测 attention。
+3. Base与整个AnyRes仍按同一连续空间比例确定两组保留总额，Base内部按自己的分数选Top-k。
+4. 用Base对应区域的平均attention，经正号Softmax、容量封顶重分配和整数凑整，把AnyRes总额
+   分给各crop。**crop内部用AnyRes自身的预测attention选Top-k**，不加入空间先验。
 5. 用这些索引，**从原始主模型 `H₂` 中选择特征**，继续运行主模型第3～28层。
 
 关键区别是：
 
 > **旁路只给“保留名单”，不会把旁路输出的特征替换进主干。**
 
-而且目前 AnyRes 排名使用的是 **Base 映射分数**，不直接使用自身预测 attention；但旁路计算时仍然看到了 AnyRes 上下文。
+Base决定各crop“留多少”，AnyRes自身分数决定“留哪些”。计算crop均值用的是剪Base之前的完整
+预测分数；不因为某个Base token最终被剪掉就把它的评分先删掉。
 
-不同 AnyRes 图块可以保留不同数量，因为配额针对的是**整个 AnyRes**，不是每个图块单独固定比例。[Base映射与分组选择](E:/GPTspace/llava_pruning/vendor/llava/llava/model/language_model/attention_predictor_selection.py:31)
+不同AnyRes crop允许不同剪枝率，但总额精确。温度 `crop_temperature` 可配置，默认0.05，
+小尺度attention在此温度下可能接近均匀分配，不做隐藏的min-max重标度。
+前置剪枝本次未接通，只预留原始crop/坐标/来源接口。
+上一版Base插值排名仍可显式使用 `selection_mode=base_interpolated`。
+[新版crop分配实现](E:/GPTspace/llava_pruning/vendor/llava/llava/model/language_model/attention_predictor_crops.py)
 
 剪枝后还会：
 

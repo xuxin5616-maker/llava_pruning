@@ -120,7 +120,7 @@ class BaseGuidedPredictorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "best.pt"
             make_checkpoint(path, core)
-            core.configure_attention_predictor(enabled=True, keep_ratio=.5, checkpoint=path)
+            core.configure_attention_predictor(enabled=True, keep_ratio=.5, checkpoint=path, selection_mode="base_interpolated")
             core.set_clse_image_layout([[(2, 16)]], 19, geometry)
             h2, ids = torch.randn(1, 19, 32), torch.arange(19)[None]
             native_scores = torch.arange(19).float() / 10
@@ -162,11 +162,12 @@ class BaseGuidedPredictorTests(unittest.TestCase):
                     path = Path(directory) / "best.pt"
                     make_checkpoint(path, core)
                     core.configure_attention_predictor(enabled=True, keep_ratio=.5, checkpoint=path,
-                                                       capture_attention=True, capture_visualization=True)
+                                                       capture_attention=True, capture_visualization=True,
+                                                       selection_mode="base_interpolated")
                     with patch.object(model, "encode_images", return_value=features), torch.no_grad():
                         model.generate(**options)
                     stats, stage = core.get_clse_stats(), core.get_clse_stages()[0]
-                    self.assertEqual(stats["selection_mode"], "base_guided")
+                    self.assertEqual(stats["selection_mode"], "base_interpolated")
                     self.assertEqual(stage["attention"]["score_kind"], "attention_predictor_base_guided")
                     self.assertEqual(stage["selection_groups"], stats["selection_groups"])
                     actual_layout = core._clse_layout
@@ -188,8 +189,8 @@ class BaseGuidedPredictorTests(unittest.TestCase):
             path = root / "method.json"
             path.write_text(json.dumps(config), encoding="utf-8")
             method = load_method("attention_predictor", path)
-            self.assertEqual(method.selection_mode, "base_guided")
-            self.assertEqual(method.details()["selection_mode"], "base_guided")
+            self.assertEqual(method.selection_mode, "base_crop")
+            self.assertEqual(method.details()["selection_mode"], "base_crop")
             config["selection_mode"] = "joint"
             path.write_text(json.dumps(config), encoding="utf-8")
             self.assertEqual(load_method("attention_predictor", path).selection_mode, "joint")

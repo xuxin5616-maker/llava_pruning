@@ -138,8 +138,10 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         metadata["inference"] = dict(metadata["inference"], attention_source="trained three-layer side Transformer",
                                      score_dtype="FP32 final QK/softmax/mapping; student precision in checkpoint; backbone untouched",
                                      predictor_selection_mode=method.selection_mode,
-                                     ranking_source=("Base prediction mapped to AnyRes; separate proportional group budgets"
-                                                     if method.selection_mode == "base_guided" else "joint own Base/AnyRes prediction"))
+                                     ranking_source=("Base region means allocate crop quotas; own AnyRes prediction selects tokens"
+                                                     if method.selection_mode == "base_crop" else
+                                                     "Base prediction mapped to AnyRes; separate proportional group budgets"
+                                                     if method.selection_mode == "base_interpolated" else "joint own Base/AnyRes prediction"))
     if benchmark_metrics:
         metadata.update(
             warmup_requested=warmup,
@@ -281,6 +283,20 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                                                  common_spatial_keep_ratio=result["stats"]["common_spatial_keep_ratio"],
                                                  protected_newline_tokens=result["stats"]["protected_newline_tokens"]))
                 if result["stats"].get("layers"):
+                    if result["stats"].get("crop_budgets"):
+                        crop_path = rate_dir / "crop_budgets.csv"
+                        crop_fields = ("question_id", "method", "pruning_layer", "prune_rate", "crop_id",
+                                       "candidate_tokens", "kept_tokens", "masked_tokens", "actual_prune_rate",
+                                       "base_reference_tokens", "base_mean_attention", "softmax_weight",
+                                       "crop_temperature", "crop_min_keep")
+                        header = not crop_path.exists()
+                        with crop_path.open("a", encoding="utf-8", newline="") as crop_file:
+                            writer = csv.DictWriter(crop_file, fieldnames=crop_fields)
+                            if header:
+                                writer.writeheader()
+                            for crop in result["stats"]["crop_budgets"]:
+                                writer.writerow(dict(question_id=sample.sample_id, method=method.name,
+                                                     pruning_layer=method.layer, prune_rate=rate, **crop))
                     write_header = not layer_path.exists()
                     with layer_path.open("a", encoding="utf-8", newline="") as layer_file:
                         writer = csv.DictWriter(layer_file, fieldnames=layer_fields)

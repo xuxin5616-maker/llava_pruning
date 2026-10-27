@@ -36,7 +36,7 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
   --method attention_predictor \
   --method-config output/attention_predictor_copied_train_01/method.json \
   --no-sample --no-plots --benchmark-metrics --warmup 10 --seed 42 \
-  --output-dir output/attention_predictor_base_guided_mvtec_01
+  --output-dir output/attention_predictor_base_crop_mvtec_01
 ```
 
 Training optimizer defaults follow **original TwigVLM ICCV2025 Appendix A Table5**:
@@ -53,19 +53,25 @@ and the portable `method.json`. VisA images used for distillation are **not** an
 independent VisA test set. No H2 disk cache is created by default; optional
 `--cache-dir` can save repeated teacher computation but may use hundreds of GB.
 The evaluation config defaults to layer-average removal 50/70/90% and
-`selection_mode=base_guided`: rank Base by its predicted attention and rank
-the whole AnyRes grid by FP32 bilinear interpolation of Base probabilities
-(actual post-unpad/max9 geometry, align_corners=False). The side input is still
-full H2; AnyRes's own predicted scores are not used for selection. Independent
-Base/whole-AnyRes top-k quotas use the same spatial retention ratio after
-reserving newlines within the unchanged packed budget. Largest-remainder
-rounding preserves the exact total, and per-crop AnyRes retention may differ.
-Existing checkpoints/method.json work without retraining; absent selection_mode
-means base_guided. Explicit `selection_mode=joint` restores the old own-score
-joint-top-k policy. Each nonzero rate writes per-image `view_budgets.csv` group
-counts/rates; attention images label AnyRes as Base-mapped, not own attention.
+`selection_mode=base_crop`: preserve the same proportional Base/whole-AnyRes
+spatial quotas after reserving newlines, then use mean predicted Base attention
+in each corresponding original crop region to allocate AnyRes crop budgets via
+Softmax(+mean/T), capacity redistribution and exact integer rounding. Within
+each crop, OWN predicted AnyRes attention selects tokens. No spatial prior or
+additional Base-only/minmax score normalization is used. The side input is
+still full H2. `crop_temperature` defaults to0.05 (configurable; attention means
+are small, so this can be near-uniform); `crop_min_keep` defaults to0.
+Existing checkpoints/method.json work without retraining. Missing selection_mode
+and the old `base_guided` name resolve to base_crop; explicit
+`base_interpolated` reproduces the previous Base-interpolation ranking and
+`joint` reproduces own-score joint top-k. Each nonzero rate writes
+`view_budgets.csv` group counts and `crop_budgets.csv` per-crop counts/weights.
+AnyRes overlays show OWN predicted attention, not the Base allocation scores.
+Versioned original crop/anchor/source provenance is reserved for a future
+pre-LLM adapter; no pre-LLM pruning is currently connected. Layer-average rates
+still reference the unpruned native packed baseline.
 Original positions and physical KV compaction remain. Lat/Mem includes side
-computation, mapping, selection and weights. Full usage, precision,
+computation, allocation, selection and weights. Full usage, precision,
 limitations and validation: [attention predictor details](docs/attention_predictor.md).
 
 ## CLSE quick start
@@ -1368,6 +1374,18 @@ When updating from the previous seven-job benchmark, sync `benchmark_fastv.py`,
 `benchmark_timing.py`; they are unchanged. Use a new/empty output directory.
 These adapters are tested with synthetic directory/CSV fixtures; the actual
 server dataset and 7B GPU run are not accessible in this Windows workspace.
+
+## Standalone PoolSpatial probability-mixture variant
+
+`runMyPruningPoolSpatial.py` integrates the supplied probability-mixture
+method as an independent entry point, without changing `run.py` or the old
+`runMyPruningPoolSpatialBaseFull.py`. Base prunes at the requested rate and
+AnyRes uses a separate aggregate budget. Crop probabilities mix
+`softmax(-redundancy/T)` with a normalized center prior; this is not BaseFull's
+additive spatial bonus. The new script defaults to SigLIP block26 and spatial
+mix weight0 (disabled); set `--spatial-mix-weight 0.02` explicitly to enable it.
+Usage, policy differences, outputs, and timing limitations:
+[PoolSpatial integration](docs/pool_spatial.md).
 
 ## Research cautions
 

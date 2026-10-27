@@ -149,9 +149,15 @@ class PredictorEntrypointTests(unittest.TestCase):
                     groups = [dict(name=name, candidate_tokens=count, kept_tokens=keep,
                                    masked_tokens=count - keep, actual_prune_rate=100 * (1 - keep / count))
                               for name, count, keep in (("base", base_count, base_keep), ("anyres", anyres_count, anyres_keep))]
+                    crops = [dict(crop_id=i, candidate_tokens=count, kept_tokens=keep,
+                                  masked_tokens=count - keep, actual_prune_rate=100 * (1 - keep / count),
+                                  base_reference_tokens=125, base_mean_attention=.01,
+                                  softmax_weight=.5, crop_temperature=.05, crop_min_keep=0)
+                             for i, count, keep in ((0, anyres_count // 2, anyres_keep // 2),
+                                                    (1, anyres_count - anyres_count // 2, anyres_keep - anyres_keep // 2))]
                     self.core.get_clse_stats = lambda: dict(original_image_tokens=before, final_llm_visual_tokens=after, layers=rows,
                                                            selection_groups=groups, common_spatial_keep_ratio=common_keep,
-                                                           protected_newline_tokens=protected)
+                                                           protected_newline_tokens=protected, crop_budgets=crops)
                     result["stats"] = method.stats(self.core, rate)
                     return result
             args = ["run.py", "--model-path", str(root), "--input-json", str(options["input_json"]),
@@ -180,9 +186,16 @@ class PredictorEntrypointTests(unittest.TestCase):
                 self.assertEqual([row["name"] for row in group_rows], ["base", "anyres"] * 4)
                 self.assertTrue(all(row["method"] == "attention_predictor" for row in group_rows))
                 self.assertTrue(all(row["protected_newline_tokens"] == "2" for row in group_rows))
+                with (path / "crop_budgets.csv").open(encoding="utf-8", newline="") as stream:
+                    crop_rows = list(csv.DictReader(stream))
+                self.assertEqual(len(crop_rows), 8)
+                self.assertEqual([row["crop_id"] for row in crop_rows], ["0", "1"] * 4)
+                for image_index in range(4):
+                    self.assertEqual(sum(int(row["kept_tokens"]) for row in crop_rows[2 * image_index:2 * image_index + 2]),
+                                     int(group_rows[2 * image_index + 1]["kept_tokens"]))
             metadata = json.loads((options["output_dir"] / "run.json").read_text(encoding="utf-8"))
             self.assertIn("trained", metadata["inference"]["attention_source"])
-            self.assertEqual(metadata["inference"]["predictor_selection_mode"], "base_guided")
+            self.assertEqual(metadata["inference"]["predictor_selection_mode"], "base_crop")
             self.assertEqual(len(metadata["method_details"]["checkpoint_sha256"]), 64)
 
 

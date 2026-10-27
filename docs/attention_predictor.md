@@ -145,7 +145,7 @@ Layer2/22 都指 **1-based 完成的 block / block 内部 attention**。本版�
 ## 再评估：MVTec 平均剪枝率50/70/90
 
 **当前默认仅修改推理选取，无需重新训练。** 已有 v1/v2 checkpoint 和训练目录下的
-`method.json` 可以继续使用；旧 JSON 没有 `selection_mode` 时默认使用新策略 `base_guided`。
+`method.json` 可以继续使用；缺少 `selection_mode` 或旧值 `base_guided` 都解析为新策略 `base_crop`。
 这不涉及 `runMyPruningPoolSpatialBaseFull.py`，训练 KL、教师层及权重格式不变。
 
 ```bash
@@ -157,7 +157,7 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
   --method attention_predictor \
   --method-config output/attention_predictor_copied_train_01/method.json \
   --no-sample --no-plots --benchmark-metrics --warmup 10 --seed 42 \
-  --output-dir output/attention_predictor_base_guided_mvtec_01
+  --output-dir output/attention_predictor_base_crop_mvtec_01
 ```
 
 评估用与训练一致的 backbone 权重，不是把旁路用于另一个同尺寸但不同权重的模型。
@@ -166,15 +166,20 @@ CUDA_VISIBLE_DEVICES=5 python run.py \
 
 在第2层后，旁路输入仍是**完整 H2（Base、AnyRes和文本都在）**，不是只输入Base：
 
-1. 仅取第三层对 **Base 空间 token** 的预测attention，归一化为Base图上的分布。
-2. 在FP32中将 Base **概率图** 双线性插值到实际打包的整个AnyRes网格，
-   `align_corners=False`。使用模型真正unpad/max9缩放后的行列数，不假定原始crop一定3×3，
-   不对log分数直接插值，也不读取AnyRes自身预测分数参与排名。
-3. Base、**整个AnyRes** 各自独立Top-k，采用相同连续空间保留比例；AnyRes没有逐crop固定配额，
-   同一AnyRes大图内的不同crop保留数可以不同。分数相同时按原始行优先空间次序决定。
+1. 取第三层对 **全部 Base/AnyRes 空间 token** 的预测attention，保持训练时联合视觉L1归一化口径。
+   不额外对Base单独归一化，不对crop均值做min-max，也不使用负号或空间先验。
+2. Base、**整个AnyRes** 先使用同一连续空间保留比例，严格保留原先的两组整数总预算。
+   Base内部按自己的预测attention Top-k。计算crop分数时使用剪Base之前的完整Base预测分数，
+   而不是只拿最终保留下来的Base token计算均值。
+3. 按原始encoder crop与实际unpad/max9后的空间映射，取每个对应Base区域的平均预测attention `s_i`。
+   用 `p_i=Softmax(+s_i/crop_temperature)` 分配AnyRes保留名额：先留最低名额，再按权重分配；
+   达到实际crop容量上限后，剩余名额重新分配给其他crop，最后最大余数法取整，保证总额精确。
+   **每个crop内部用AnyRes自己的预测attention选Top-k**，不再把Base分数插值后直接当AnyRes排名。
+   同分时按原始打包空间次序选取。
 4. **从原始 H2 选择，而非从旁路输出选择特征**，继续运行原 LLM block3..D。
 
 原始 position IDs 保留，所有已写入 KV 缓存物理压缩，新 token 位置从原始 prompt 长度继续。
+主干FP16/FlashAttention2、旁路精度、KL损失和教师层不变；已有v1/v2 checkpoint无需重训。
 newline 不参与排名但始终保留并计入层平均成本。为不改变原有层平均总预算，先计算packed总名额
 `T=floor(N*keep_ratio)`，预留P个newline后，以统一的 `q=(T-P)/(B+A)` 分给Base的B个和AnyRes的A个
 空间token：两组连续名额分别是qB、qA，最大余数法取整且总数严格为T-P（余数相同时Base优先）。
@@ -182,11 +187,15 @@ newline 不参与排名但始终保留并计入层平均成本。为不改变原
 空间token时明确报错，不通过削减newline或放宽目标兜底。
 
 评估每个非零率额外写 `prune_XX/view_budgets.csv`：每图两行Base/AnyRes，包含各自空间token的
-原始/保留/删除数量、实际剪枝率、共同空间保留比例、保护newline数。`run.json` 记录选取策略；
+原始/保留/删除数量、实际剪枝率、共同空间保留比例、保护newline数。另写 `crop_budgets.csv`：
+逐图逐crop的Base均值、Softmax权重、实际容量、保留数、实际剪枝率和分配参数。
+`run.json` 记录选取策略；
 预测JSON仍只保留原有精简字段，不塞入分数数组。
 
 如需复现旧的“各用自己的预测分数＋联合Top-k”，在同一 `method.json` 显式加
-`"selection_mode": "joint"`；新策略为 `"selection_mode": "base_guided"`。不修改checkpoint本身，
+`"selection_mode": "joint"`；上一版Base插值排名使用 `"selection_mode": "base_interpolated"`。
+新策略为 `"selection_mode": "base_crop"`，旧名称 `base_guided` 会升级解析为base_crop。
+不修改checkpoint本身，
 可用同一权重对照两种推理策略，但请使用不同的输出目录。
 
 设原 packed 视觉数 N，剪后保留 K，深度 D：
@@ -210,8 +219,39 @@ Lat 包含视觉、projector、packing、主干 prefill、旁路评分与剪枝�
 需要图片时，用新输出目录，将 `--no-plots --benchmark-metrics --warmup 10` 替换成
 `--save-prune-vis --save-attention-vis`；可用 `--visualize-samples` 限制保存 ID，不减少评估样本。
 仍只有 `comparison.png`、`attention_overlay.png` 两类 PNG，图上带 GT/Pred；Base为预测attention，
-AnyRes热图为Base映射分数，图片说明明确标注，不冒充AnyRes自身attention或缺陷概率。
+AnyRes热图为其自身预测attention，不是Base的crop分配权重，也不是缺陷概率。
 可视化统一缩放分数只用于显示，不影响组内排序。原 CLSE/FastV/PriorTR 配置不变。
+
+## 分配参数和前置剪枝预留接口
+
+已有 `method.json` 不需要改checkpoint路径或重新训练；缺省参数与旧的 `base_guided` 名称会使用
+本次base_crop策略。需要显式配置时，在训练输出的method.json保留原字段，并设置：
+
+```json
+{
+  "selection_mode": "base_crop",
+  "crop_temperature": 0.05,
+  "crop_min_keep": 0
+}
+```
+
+这只是新增字段示例，不是可直接替代完整method.json的配置：仍需保留checkpoint、prune_rates等。
+温度必须大于0，越小越偏向高Base均值的crop。默认0.05沿用PoolSpatial的温度默认值，
+但attention均值尺度更小，分配可能接近均匀；可修改温度做消融，不能把均匀分配误认为没有生效。
+分数直接使用联合视觉预测概率，不偷偷按图重标度。最低名额默认0，允许一个crop全部被删除；
+不照搬VisionZip为合并所设的4个最低token。显式设置最低名额却超出总预算会报错。
+
+**本次没有接通前置剪枝。50/70/90仍相对未剪枝原生packed输入计算LLM各层平均剪枝率。**
+接口在 `layout["predictor_crops"]` 中保留version、原始crop网格、实际unpad尺寸/偏移、
+逐crop的当前packed索引与对应Base索引，以及逐token的原始crop ID、归一化锚点坐标、
+source_ids/source_weights。当前源ID空间是未剪枝的原生packed锚点；身份系数为1，
+不声称这记录了native插值的全部原始encoder感受野。未来前置合并器必须显式提供真实来源/系数，
+不能只凭压缩后的序列长度重建crop，也不能假设每crop还剩729个token。
+
+独立crop分配器已接受不同当前容量和空crop；但真正的稀疏前置→LLM路径尚未接通。
+`pre_pruning_applied=True`、缺失来源或无Base参考的非空crop会明确拒绝，不用补零/猜坐标伪装支持。
+未来接通时还需显式转换两阶段相对原始基线的预算、稀疏Base评分参考以及合并来源映射，
+不能简单重复应用原来的50/70/90。不要把预留元数据当成已经完成两阶段推理。
 
 ## 本地验证范围
 
@@ -219,8 +259,10 @@ AnyRes热图为Base映射分数，图片说明明确标注，不冒充AnyRes自�
 有效学生路径梯度/无效尾部冻结、梯度检查点前向反向等价、冻结教师无梯度、H2及教师层位置、真实 eager attention
 oracle、KL 小样本拟合、尾部梯度累计、真实预处理和打包、不生成教师答案、checkpoint/缓存身份、
 VisA全行无GT读取与内部划分、真实 generate/原始位置/KV压缩、0%身份、跨模式清理、完整训练 CLI
-与共享评估统计接线，以及Base-only排名输入、概率插值数值oracle、实际矩形/AnyRes-first/末尾newline
-几何、两组同率精确总预算、组间质量不抢预算、旧joint选项与分组CSV。可选 native CUDA FP16 +
+与共享评估统计接线，以及旧插值模式的Base-only排名/概率插值oracle、新版完整空间评分、
+Base均值改变crop预算、AnyRes自身分数改变crop内选取、容量封顶重分配、空crop、精确整数总额、
+实际unpad/max9/AnyRes-first/末尾newline几何、两组同率预算、旧模式/名称兼容和逐crop CSV。
+可选 native CUDA FP16 +
 FlashAttention2 / BF16 学生训练测试需要服务器：
 
 ```bash

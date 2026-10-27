@@ -506,6 +506,7 @@ class LlavaMetaForCausalLM(ABC):
                             image_feature = image_feature.flatten(1, 2).flatten(2, 3)
                             image_feature = unpad_image(image_feature, image_sizes[image_idx])
                             c, h, w = image_feature.shape
+                            anyres_unpadded_shape = (h, w)
                             times = math.sqrt(h * w / (max_num_patches * unit**2))
                             if times > 1.1:
                                 image_feature = image_feature[None]
@@ -556,6 +557,12 @@ class LlavaMetaForCausalLM(ABC):
                                     dict(group, rows=height if group["name"] == "base" else anyres_budget_shape[0],
                                          cols=width if group["name"] == "base" else anyres_budget_shape[1])
                                     for group in layout["groups"]]
+                                if (getattr(self.get_model(), "attention_predictor_enabled", False)
+                                        and getattr(self.get_model(), "_predictor_selection_mode", None) == "base_crop"):
+                                    from .language_model.attention_predictor_crops import dense_crop_provenance
+                                    layout["predictor_crops"] = dense_crop_provenance(
+                                        layout, (num_patch_width, num_patch_height), height,
+                                        anyres_unpadded_shape)
                             fastv_view_groups.append(layout)
                         ######################### END ############################
                     else:  # single image operations

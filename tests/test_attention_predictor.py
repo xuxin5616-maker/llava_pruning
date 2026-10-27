@@ -182,7 +182,10 @@ class PredictorTests(unittest.TestCase):
             make_checkpoint(path, core)
             core.configure_attention_predictor(enabled=True, keep_ratio=.5, checkpoint=path,
                                                capture_visualization=True)
-            core.set_clse_image_layout([[(2, 16)]], 19, layout())
+            from llava.model.language_model.attention_predictor_crops import dense_crop_provenance
+            geometry = layout()
+            geometry["predictor_crops"] = dense_crop_provenance(geometry, (2, 1), 2, (2, 4))
+            core.set_clse_image_layout([[(2, 16)]], 19, geometry)
             tokens = torch.arange(1, 20)[None]
             with torch.no_grad():
                 result = core(input_ids=tokens, use_cache=True)
@@ -350,7 +353,10 @@ class PredictorFlashTests(unittest.TestCase):
             save_student(path, predictor, student_precision="bfloat16", backbone_depth=4, teacher_layer=3,
                          signature=backbone_signature(core.config))
             core.configure_attention_predictor(enabled=True, keep_ratio=.5, checkpoint=path)
-            core.set_clse_image_layout([[(2, 16)]], 19, layout())
+            from llava.model.language_model.attention_predictor_crops import dense_crop_provenance
+            geometry = layout()
+            geometry["predictor_crops"] = dense_crop_provenance(geometry, (2, 1), 2, (2, 4))
+            core.set_clse_image_layout([[(2, 16)]], 19, geometry)
             with torch.no_grad():
                 result = core(input_ids=inputs, use_cache=True)
                 self.assertEqual([result.past_key_values.get_seq_length(i) for i in range(4)], [12] * 4)

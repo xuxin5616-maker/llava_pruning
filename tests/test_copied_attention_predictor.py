@@ -248,7 +248,10 @@ class CopiedPredictorFlashTests(unittest.TestCase):
             save_student(path, student, student_precision="bfloat16", backbone_depth=6, teacher_layer=6,
                          signature=backbone_signature(core.config))
             core.configure_attention_predictor(enabled=True, keep_ratio=.5, checkpoint=path)
-            core.set_clse_image_layout([[(2, 16)]], 19, layout())
+            from llava.model.language_model.attention_predictor_crops import dense_crop_provenance
+            geometry = layout()
+            geometry["predictor_crops"] = dense_crop_provenance(geometry, (2, 1), 2, (2, 4))
+            core.set_clse_image_layout([[(2, 16)]], 19, geometry)
             with torch.no_grad():
                 result = core(input_ids=tokens, use_cache=True)
                 self.assertEqual([result.past_key_values.get_seq_length(i) for i in range(6)], [12] * 6)
