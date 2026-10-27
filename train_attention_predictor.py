@@ -125,9 +125,8 @@ def main():
                     student_trainable_parameters=sum(p.numel() for p in student.parameters() if p.requires_grad))
     (output / "train_run.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     # Relative checkpoint makes this config portable when the training folder moves.
-    method_config = dict(checkpoint="best.pt", layer=2, rate_semantics="layer_average", selection_mode="base_crop",
-                         crop_temperature=0.05, crop_min_keep=0,
-                         prune_rates=[50, 70, 90], visualize_rates=[50, 70, 90])
+    method_config = dict(checkpoint="best.pt", layer=2, rate_semantics="layer_average", selection_mode="base_full",
+                         prune_rates=[30, 50, 70], visualize_rates=[70])
     (output / "method.json").write_text(json.dumps(method_config, indent=2), encoding="utf-8")
     print(f"VisA ALL-CSV pool: {len(samples)} images -> train={len(train)}, validation={len(validation)}; no GT/masks", flush=True)
     print(f"Frozen teacher block{args.teacher_layer}; H2 -> copied native blocks 3/4/5, "

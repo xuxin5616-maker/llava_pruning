@@ -1,5 +1,12 @@
 # 第2层旁路预测第22层 attention
 
+当前默认策略已更新为 **`base_full`：Base全保留，Base预测概率映射到整个AnyRes后统一Top-k**。
+整体层平均目标不变，删除额度全部由AnyRes承担；运行前检查所有图片的目标可行性。
+本次不接通前置剪枝，训练目标/权重不改。Lat/Mem与可视化可在同一命令中请求，采用先全部干净
+测量、后额外生成图片的两阶段输出协议。
+**最新配置、完整命令、可行性和统计定义以[Base-full说明](attention_predictor_base_full.md)为准。**
+本页后半的base_crop流程作为保留的对照模式说明，不再是默认选取策略。
+
 这是本项目的可训练实验方法，**不是 MAP 或完整 TwigVLM 的复现**。结构初始化参考
 [TwigVLM 原论文 §3.1](https://arxiv.org/html/2503.14075v2#S3.SS1)：K=2、T=3 时，
 从当前主模型**第3、4、5个 decoder block**复制三层独立旁路，保留原尺寸、预训练权重和原生
@@ -142,10 +149,11 @@ Layer2/22 都指 **1-based 完成的 block / block 内部 attention**。本版�
 旧512维 **version=1** checkpoint 仍可用于旧方法评估，不会被伪装成新版；新版必须重新训练，
 不支持将旧权重直接转换或恢复优化器。教师 H2/attention 的口径没有变，身份一致的旧教师缓存可复用。
 
-## 再评估：MVTec 平均剪枝率50/70/90
+## 对照模式再评估：base_crop
 
 **当前默认仅修改推理选取，无需重新训练。** 已有 v1/v2 checkpoint 和训练目录下的
-`method.json` 可以继续使用；缺少 `selection_mode` 或旧值 `base_guided` 都解析为新策略 `base_crop`。
+`method.json` 可以继续使用；本节对照需要显式设置 `selection_mode=base_crop`。
+当前缺省或旧名称base_guided解析为base_full；详见上方最新说明。
 这不涉及 `runMyPruningPoolSpatialBaseFull.py`，训练 KL、教师层及权重格式不变。
 
 ```bash
@@ -194,7 +202,7 @@ newline 不参与排名但始终保留并计入层平均成本。为不改变原
 
 如需复现旧的“各用自己的预测分数＋联合Top-k”，在同一 `method.json` 显式加
 `"selection_mode": "joint"`；上一版Base插值排名使用 `"selection_mode": "base_interpolated"`。
-新策略为 `"selection_mode": "base_crop"`，旧名称 `base_guided` 会升级解析为base_crop。
+本节对照为 `"selection_mode": "base_crop"`；当前默认/旧名称base_guided则解析为base_full。
 不修改checkpoint本身，
 可用同一权重对照两种推理策略，但请使用不同的输出目录。
 
@@ -224,8 +232,7 @@ AnyRes热图为其自身预测attention，不是Base的crop分配权重，也不
 
 ## 分配参数和前置剪枝预留接口
 
-已有 `method.json` 不需要改checkpoint路径或重新训练；缺省参数与旧的 `base_guided` 名称会使用
-本次base_crop策略。需要显式配置时，在训练输出的method.json保留原字段，并设置：
+已有checkpoint不需重训。保留本节旧crop分配策略时，在method.json保留原字段，并显式设置：
 
 ```json
 {

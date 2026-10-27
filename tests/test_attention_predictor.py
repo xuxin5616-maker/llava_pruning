@@ -252,9 +252,9 @@ class PredictorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             make_checkpoint(root / "best.pt", core)
-            (root / "method.json").write_text(json.dumps(dict(checkpoint="best.pt", prune_rates=[30], visualize_rates=[30])), encoding="utf-8")
+            (root / "method.json").write_text(json.dumps(dict(checkpoint="best.pt", prune_rates=[20], visualize_rates=[20])), encoding="utf-8")
             method = load_method("attention_predictor", root / "method.json")
-            method.configure(core, 30, capture_attention=True, capture_visualization=True)
+            method.configure(core, 20, capture_attention=True, capture_visualization=True)
             with patch.object(model, "encode_images", return_value=features), torch.no_grad():
                 model.generate(**options)
             stages = method.visualization_data(core)["stages"]
@@ -262,7 +262,7 @@ class PredictorTests(unittest.TestCase):
             self.assertAlmostEqual(sum(scores), 1, places=5)
             self.assertEqual(scores[8], 0)
             self.assertEqual(scores[13], 0)
-            result = dict(image=Image.new("RGB", (16, 8), "white"), answer="B", stats=method.stats(core, 30),
+            result = dict(image=Image.new("RGB", (16, 8), "white"), answer="B", stats=method.stats(core, 20),
                           stages=stages, crop_metadata=[dict(mode="anyres_max_9", original_size=[16, 8],
                                                              grid_patches=[2, 1], roi_boxes=[], final_newline=False)])
             tower = types.SimpleNamespace(num_patches_per_side=2, config=types.SimpleNamespace(patch_size=4))

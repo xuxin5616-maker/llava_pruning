@@ -218,7 +218,11 @@ Answer with the option's letter from the given choices directly.
 
 推理时不再运行完整的第22层教师来获取评分，而是在第2层结束后运行旁路。
 
-**当前默认是 `base_crop` 策略（旧名称 `base_guided` 自动升级到此策略）：**
+**当前默认已更新为 `base_full`：Base全保留，Base预测概率映射到整个AnyRes后统一Top-k。**
+原始整体层平均预算不变，所有删除额度由AnyRes承担，不可行的图片/目标会在运行前报错。
+不使用AnyRes自身预测分数或逐crop分配；训练仍用原来的联合视觉KL。
+Lat/Mem及最新命令见[Base-full说明](attention_predictor_base_full.md)。
+下面保留的是显式 `selection_mode=base_crop` 的对照流程，不是当前默认：
 
 1. 完整 `H₂` 输入旁路。
 2. 取旁路对 **Base 和 AnyRes 空间 token** 的预测 attention。

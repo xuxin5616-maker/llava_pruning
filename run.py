@@ -32,6 +32,8 @@ def build_parser():
                         help="Save sample images only for these question_id/id values; sample_ prefix accepted. Evaluation still uses ALL inputs")
     parser.add_argument("--no-plots", action="store_true",
                         help="Disable ALL sample visualizations and the final metric plot (automatic for base_only)")
+    parser.add_argument("--no-metric-plot", action="store_true",
+                        help="Disable only the final metric-curve PNG; keep requested sample visualizations")
     decoding = parser.add_mutually_exclusive_group()
     decoding.add_argument("--no-sample", dest="no_sample", action="store_true",
                           help="Greedy decoding (default, matching the reference baseline)")
@@ -45,7 +47,7 @@ def build_parser():
                         help="Subtract separately timed pruning blocks; diagnostic timing, pruning still runs")
     parser.set_defaults(include_pruning_time=True)
     parser.add_argument("--benchmark-metrics", action="store_true",
-                        help="Record first-token Lat and peak Mem; requires one GPU, greedy decoding, included pruning time and no sample visualization")
+                        help="Record first-token Lat and peak Mem; requires one GPU, greedy decoding and included pruning time. attention_predictor images use a separate pass after all measurements; other methods require no sample visualization")
     parser.add_argument("--warmup", type=int, default=10,
                         help="With --benchmark-metrics: warmup images per rate before evaluating ALL inputs (default 10; 0 disables warmup)")
     parser.add_argument("--output-dir", type=Path, default=PROJECT / "outputs" / "run")
@@ -57,7 +59,7 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     no_plots = args.no_plots or args.roi_mode == "base_only"
-    if not no_plots:
+    if not no_plots and not args.no_metric_plot:
         check_plot_dependencies()
     output = run(
         model_path=args.model_path, input_json=args.input_json,
@@ -71,7 +73,7 @@ def main():
         visualize_samples=args.visualize_samples,
     )
     print(f"Saved results to {output}")
-    if no_plots:
+    if no_plots or args.no_metric_plot:
         return
     try:
         figure = save_metric_plot(output / "summary.csv")

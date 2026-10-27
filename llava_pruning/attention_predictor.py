@@ -19,7 +19,7 @@ class AttentionPredictorMethod:
     layer: int = 2
     rate_semantics: str = "layer_average"
     name: str = "attention_predictor"
-    selection_mode: str = "base_crop"
+    selection_mode: str = "base_full"
     crop_temperature: float = 0.05
     crop_min_keep: int = 0
 
@@ -34,10 +34,10 @@ class AttentionPredictorMethod:
             raise ValueError("attention_predictor prunes after completed LLM block 2")
         if config.get("rate_semantics", "layer_average") != "layer_average":
             raise ValueError("attention_predictor requires layer_average rates")
-        selection_mode = config.get("selection_mode", "base_crop")
-        selection_mode = "base_crop" if selection_mode == "base_guided" else selection_mode
-        if selection_mode not in {"base_crop", "base_interpolated", "joint"}:
-            raise ValueError("attention_predictor selection_mode must be base_crop, base_interpolated or joint")
+        selection_mode = config.get("selection_mode", "base_full")
+        selection_mode = "base_full" if selection_mode == "base_guided" else selection_mode
+        if selection_mode not in {"base_full", "anyres_self", "base_crop", "base_interpolated", "joint"}:
+            raise ValueError("attention_predictor selection_mode must be base_full, anyres_self, base_crop, base_interpolated or joint")
         temperature, minimum = config.get("crop_temperature", 0.05), config.get("crop_min_keep", 0)
         if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("crop_temperature must be finite and positive")
@@ -63,6 +63,43 @@ class AttentionPredictorMethod:
     stats = CLSEMethod.stats
     visualization_data = CLSEMethod.visualization_data
 
+    def validate_input_budgets(self, backend, samples, resolved):
+        """Read image SIZES only, fail before warmups/rate sweeps, never filter data."""
+        if self.selection_mode not in {"base_full", "anyres_self"} or not any(r != 0 for r in self.rates):
+            return None
+        from PIL import Image
+        from llava.mm_utils import get_anyres_image_grid_shape
+        from llava.model.language_model.attention_predictor_selection import native_anyres_counts, base_full_count_budget
+        config, tower = backend.model.get_model().config, backend.vision_tower
+        if config.mm_patch_merge_type not in {"spatial_unpad", "spatial_unpad_add_newl"}:
+            raise ValueError("Base-full preflight requires native spatial_unpad(_add_newl) packing")
+        counts_by_size, invalid, examples = {}, 0, []
+        depth = len(backend.model.get_model().layers)
+        for sample in samples:
+            with Image.open(sample.image) as opened:
+                size = opened.size
+            if size not in counts_by_size:
+                grid = get_anyres_image_grid_shape(size, config.image_grid_pinpoints, tower.image_size)
+                counts_by_size[size] = native_anyres_counts(
+                    int(tower.num_patches_per_side), grid, size,
+                    final_newline=config.mm_patch_merge_type.endswith("_add_newl"))
+            base, anyres, protected = counts_by_size[size]
+            for rate, budget in resolved.items():
+                keep_ratio = 1 - budget["requested_layer_prune_rate"] / 100
+                try:
+                    base_full_count_budget(base, anyres, protected, keep_ratio)
+                except ValueError:
+                    invalid += 1
+                    if len(examples) < 5:
+                        maximum = 100 * (depth - self.layer) / depth * anyres / (base + anyres + protected)
+                        examples.append(f"id={sample.sample_id}, size={size}, target={rate}%, maximum average={maximum:.6f}%")
+        if invalid:
+            raise ValueError("Base-full budget preflight failed for " + str(invalid) + " image/rate pairs. "
+                             "Base and newlines stay protected; targets will NOT be relaxed or samples skipped. "
+                             + "; ".join(examples))
+        return dict(checked_samples=len(samples), geometry_variants=len(counts_by_size), invalid_image_rate_pairs=0,
+                    reference="unpruned native packed Base+AnyRes+newlines", pre_llm_pruning_enabled=False)
+
     def configure(self, core, prune_rate, *, capture_attention=False, capture_visualization=False):
         budget = self.resolve_budget(prune_rate, len(core.layers))
         core.configure_attention_predictor(enabled=prune_rate != 0,
@@ -85,18 +122,27 @@ class AttentionPredictorMethod:
                     teacher="fixed checkpoint teacher block (default22); last prompt query -> visual keys, mean heads; independent QK",
                     gradient="frozen backbone; student trained separately with KL(teacher||student); no GT",
                     selection_mode=self.selection_mode,
-                    crop_temperature=self.crop_temperature, crop_min_keep=self.crop_min_keep,
-                    crop_policy="Softmax(+Base region mean/T), bounded capacity redistribution, exact Hamilton integers; no spatial prior",
-                    crop_score_normalization="original joint visual predicted attention; no extra Base-only normalization or minmax",
+                    crop_temperature=self.crop_temperature if self.selection_mode == "base_crop" else None,
+                    crop_min_keep=self.crop_min_keep if self.selection_mode == "base_crop" else None,
+                    crop_policy=("disabled: ONE whole-AnyRes top-k; no crop quotas or temperature"
+                                 if self.selection_mode in {"base_full", "anyres_self"} else
+                                 "Softmax(+Base region mean/T), bounded capacity redistribution, exact Hamilton integers; no spatial prior"),
+                    crop_score_normalization=("conditional Base probabilities -> FP32 bilinear mapping; no crop allocation"
+                                              if self.selection_mode == "base_full" else
+                                              "original joint visual predicted attention; no extra Base-only normalization or minmax"),
                     pre_llm_pruning_enabled=False,
                     pre_llm_interface="versioned crop/anchor/source provenance reserved; sparse pipeline and baseline accounting not connected",
                     ranking_source=("Base prediction only; bilinear probability interpolation (align_corners=False) to actual unpadded/max9 AnyRes grid"
-                                    if self.selection_mode == "base_interpolated" else
+                                    if self.selection_mode in {"base_full", "base_interpolated"} else
                                     "own predicted attention for Base and AnyRes; Base region means set AnyRes crop quotas"
                                     if self.selection_mode == "base_crop" else "own predicted attention for Base and AnyRes"),
-                    budget_scope=("separate Base/whole AnyRes with same continuous spatial retention; preserve packed target after newline reservation"
+                    budget_scope=("Base fully retained; reserve all Base and newlines from ORIGINAL packed target; transfer all deletions to AnyRes"
+                                  if self.selection_mode in {"base_full", "anyres_self"} else
+                                  "separate Base/whole AnyRes with same continuous spatial retention; preserve packed target after newline reservation"
                                   if self.selection_mode != "joint" else "joint Base+AnyRes spatial top-k"),
-                    budget_rounding="floor packed target; protect newlines; equal-rate group largest remainder; bounded crop Hamilton rounding for base_crop",
+                    budget_rounding=("floor ORIGINAL packed target; AnyRes keep=target-Base-newlines; infeasible targets raise"
+                                     if self.selection_mode in {"base_full", "anyres_self"} else
+                                     "floor packed target; protect newlines; equal-rate group largest remainder; bounded crop Hamilton rounding for base_crop"),
                     checkpoint_compatibility="selection policy is inference-only; existing v1/v2 weights do not need retraining",
                     position_policy="preserve original IDs, physically compact all existing KV caches",
                     inference="native backbone FP16/FlashAttention2; student precision stored in checkpoint",
@@ -110,7 +156,9 @@ class AttentionPredictorMethod:
             output_dir=output_dir, sample_id=sample_id, save_prune=save_prune, save_attention=save_attention,
             prediction_label=prediction_caption(ground_truth, result.get("answer")), method_name="AttentionPredictor",
             score_caption=("Base predicted attention; AnyRes is mapped from Base, NOT its own attention or defect probability."
-                           if self.selection_mode == "base_interpolated" else
+                           if self.selection_mode in {"base_full", "base_interpolated"} else
+                           "Base fully retained. AnyRes uses its OWN predicted attention; NOT defect probability."
+                           if self.selection_mode == "anyres_self" else
                            "Own predicted attention; Base region means allocate crop quotas. NOT defect probability."
                            if self.selection_mode == "base_crop" else
                            "Side Transformer block3 predicted teacher attention; NOT defect probability."))

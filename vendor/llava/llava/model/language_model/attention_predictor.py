@@ -319,13 +319,13 @@ class AttentionPredictorMixin:
         return super().configure_pyramiddrop(**kwargs)
 
     def configure_attention_predictor(self, *, enabled, keep_ratio, checkpoint=None,
-                                      capture_attention=False, capture_visualization=False, selection_mode="base_crop",
+                                      capture_attention=False, capture_visualization=False, selection_mode="base_full",
                                       crop_temperature=0.05, crop_min_keep=0):
         # Old training method.json files explicitly used base_guided. Upgrade
-        # that alias to the new policy; base_interpolated reproduces the old one.
-        selection_mode = "base_crop" if selection_mode == "base_guided" else selection_mode
-        if selection_mode not in {"base_crop", "base_interpolated", "joint"}:
-            raise ValueError("Predictor selection_mode must be base_crop, base_interpolated or joint")
+        # that alias to the current policy; explicit old modes remain available.
+        selection_mode = "base_full" if selection_mode == "base_guided" else selection_mode
+        if selection_mode not in {"base_full", "anyres_self", "base_crop", "base_interpolated", "joint"}:
+            raise ValueError("Predictor selection_mode must be base_full, anyres_self, base_crop, base_interpolated or joint")
         from .attention_predictor_crops import validate_crop_options
         validate_crop_options(crop_temperature, crop_min_keep)
         self._predictor_crop_temperature, self._predictor_crop_min_keep = crop_temperature, crop_min_keep
@@ -368,7 +368,10 @@ class AttentionPredictorMixin:
     def _clse_reference(self, hidden, start, end):
         if not self.attention_predictor_enabled:
             return super()._clse_reference(hidden, start, end)
-        if self._predictor_selection_mode in {"base_crop", "base_interpolated"}:
+        if self._predictor_selection_mode in {"base_full", "anyres_self"}:
+            from .attention_predictor_selection import base_full_budget
+            base_full_budget(self._clse_layout, self.clse_keep_ratio)
+        elif self._predictor_selection_mode in {"base_crop", "base_interpolated"}:
             from .attention_predictor_selection import base_guided_budget
             # Validate both group quotas before any decoder computation.
             base_guided_budget(self._clse_layout, self.clse_keep_ratio)
@@ -381,7 +384,7 @@ class AttentionPredictorMixin:
     def _clse_rank(self, hidden, start, end, ids, reference):
         if not self.attention_predictor_enabled:
             return super()._clse_rank(hidden, start, end, ids, reference)
-        guided = self._predictor_selection_mode == "base_interpolated"
+        guided = self._predictor_selection_mode in {"base_full", "base_interpolated"}
         grids = self._clse_layout["grids"]
         if guided:
             from .attention_predictor_selection import named_spatial_grids, base_guided_log_scores
@@ -404,7 +407,13 @@ class AttentionPredictorMixin:
     def _clse_select(self, ranking, spatial_indices, original):
         if not self.attention_predictor_enabled or self._predictor_selection_mode == "joint":
             return super()._clse_select(ranking, spatial_indices, original)
-        if self._predictor_selection_mode == "base_crop":
+        if self._predictor_selection_mode in {"base_full", "anyres_self"}:
+            from .attention_predictor_selection import select_base_full_tokens
+            selected, plan = select_base_full_tokens(ranking, spatial_indices, original,
+                                                     self.clse_keep_ratio, self._clse_layout)
+            self._clse_stats.update(anyres_spatial_keep_ratio=plan["anyres_spatial_keep_ratio"],
+                                    common_spatial_keep_ratio=None)
+        elif self._predictor_selection_mode == "base_crop":
             from .attention_predictor_crops import select_base_crop_tokens
             selected, plan = select_base_crop_tokens(
                 ranking, spatial_indices, original, self.clse_keep_ratio, self._clse_layout,
@@ -415,7 +424,7 @@ class AttentionPredictorMixin:
             selected, plan = select_base_guided_tokens(ranking, spatial_indices, original,
                                                        self.clse_keep_ratio, self._clse_layout)
         self._clse_stats.update(selection_groups=plan["groups"],
-                                common_spatial_keep_ratio=plan["spatial_keep_ratio"])
+                                common_spatial_keep_ratio=plan.get("spatial_keep_ratio"))
         return selected, plan["target"], len(plan["protected_indices"])
 
     def _clse_extra_stats(self):
@@ -424,18 +433,25 @@ class AttentionPredictorMixin:
         copied = isinstance(self.attention_predictor, CopiedAttentionPredictor)
         guided = self._predictor_selection_mode == "base_interpolated"
         crop = self._predictor_selection_mode == "base_crop"
+        full = self._predictor_selection_mode in {"base_full", "anyres_self"}
+        mapped = self._predictor_selection_mode == "base_full"
         return dict(score="predicted_layer_attention", attention_source=("copied_qwen2_blocks_3_4_5" if copied else "legacy_small_transformer"),
                     pruning_layer=2, teacher_layer=self._predictor_teacher_layer,
                     selection_mode=self._predictor_selection_mode,
-                    budget_scope=("equal-rate Base/whole AnyRes; Base region means -> bounded crop softmax; own AnyRes top-k"
+                    budget_scope=("Base fully retained; all original packed-budget deletions transferred to ONE global AnyRes top-k"
+                                  if full else "equal-rate Base/whole AnyRes; Base region means -> bounded crop softmax; own AnyRes top-k"
                                   if crop else "separate Base and whole AnyRes; equal proportional spatial quotas after newline reservation"
                                   if guided else "joint Base + AnyRes; structural newlines protected"),
-                    ranking_source=("own predicted attention; Base crop means allocate AnyRes quotas" if crop else
+                    ranking_source=("predicted Base attention mapped to whole AnyRes; own AnyRes scores not requested" if mapped else
+                                    "own predicted AnyRes attention; Base protected and its scores not used for selection" if full else
+                                    "own predicted attention; Base crop means allocate AnyRes quotas" if crop else
                                     "predicted Base attention; FP32 bilinear probabilities on actual packed AnyRes grid"
                                     if guided else "predicted own attention for all spatial tokens"),
-                    rounding=("floor packed target, reserve newlines, proportional largest remainder; ties Base first"
+                    rounding=("floor ORIGINAL packed target; reserve ALL Base + newlines; remaining slots go to AnyRes; fail if infeasible"
+                              if full else "floor packed target, reserve newlines, proportional largest remainder; ties Base first"
                               if guided or crop else "floor packed target, reserve newlines"),
-                    crop_temperature=self._predictor_crop_temperature, crop_min_keep=self._predictor_crop_min_keep,
+                    crop_temperature=self._predictor_crop_temperature if crop else None,
+                    crop_min_keep=self._predictor_crop_min_keep if crop else None,
                     pre_llm_pruning_enabled=False, baseline_reference="unpruned native packed sequence",
                     student_layers=3, student_precision=self._predictor_precision,
                     student_hidden_size=self.attention_predictor.config.input_size if copied else self.attention_predictor.config.hidden_size,
@@ -444,7 +460,9 @@ class AttentionPredictorMixin:
     def _clse_score_kind(self):
         if not self.attention_predictor_enabled:
             return super()._clse_score_kind()
-        return ("attention_predictor_base_crop" if self._predictor_selection_mode == "base_crop" else
+        return ("attention_predictor_base_full" if self._predictor_selection_mode == "base_full" else
+                "attention_predictor_anyres_self" if self._predictor_selection_mode == "anyres_self" else
+                "attention_predictor_base_crop" if self._predictor_selection_mode == "base_crop" else
                 "attention_predictor_base_guided" if self._predictor_selection_mode == "base_interpolated" else "attention_predictor")
 
     def get_clse_stages(self):

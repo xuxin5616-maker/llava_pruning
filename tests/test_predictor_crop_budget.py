@@ -154,7 +154,8 @@ class PredictorCropTests(unittest.TestCase):
                     core.configure_attention_predictor(enabled=False, keep_ratio=1)
                     self.assertTrue(torch.equal(baseline, model.generate(**options)))
                     core.configure_attention_predictor(enabled=True, keep_ratio=.5, checkpoint=path,
-                                                       capture_attention=True, capture_visualization=True)
+                                                       capture_attention=True, capture_visualization=True,
+                                                       selection_mode="base_crop")
                     with patch.object(core.attention_predictor, "forward", wraps=core.attention_predictor.forward) as forward:
                         first = model.generate(**options)
                     self.assertEqual(len(forward.call_args.args[2]), 12)
@@ -177,7 +178,7 @@ class PredictorCropTests(unittest.TestCase):
                     config["selection_mode"] = name
                 path.write_text(json.dumps(config), encoding="utf-8")
                 method = load_method("attention_predictor", path)
-                self.assertEqual(method.selection_mode, "base_crop" if name in (None, "base_guided") else name)
+                self.assertEqual(method.selection_mode, "base_full" if name in (None, "base_guided") else name)
                 self.assertEqual(method.crop_temperature, .05)
                 self.assertEqual(method.crop_min_keep, 0)
             for options in (dict(crop_temperature=0), dict(crop_min_keep=True), dict(crop_min_keep=-1)):
@@ -196,7 +197,7 @@ class PredictorCropTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "best.pt"
                 make_checkpoint(path, core)
-                core.configure_attention_predictor(enabled=True, keep_ratio=.5, checkpoint=path)
+                core.configure_attention_predictor(enabled=True, keep_ratio=.5, checkpoint=path, selection_mode="base_crop")
                 with patch.object(model, "encode_images", return_value=features), torch.no_grad():
                     model.generate(**options)
                 provenance = core._clse_layout["predictor_crops"]

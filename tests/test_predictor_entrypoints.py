@@ -85,7 +85,7 @@ class PredictorEntrypointTests(unittest.TestCase):
             self.assertEqual(saved["architecture"]["qwen_config"]["hidden_size"], 32)
             self.assertNotIn("project.weight", saved["state_dict"])
             method = load_method("attention_predictor", trained / "method.json")
-            self.assertEqual(method.rates, (50, 70, 90))
+            self.assertEqual(method.rates, (30, 50, 70))
             self.assertEqual(method.checkpoint, (trained / "best.pt").resolve())
             with (trained / "history.csv").open(encoding="utf-8") as stream:
                 rows = list(csv.DictReader(stream))
@@ -120,7 +120,7 @@ class PredictorEntrypointTests(unittest.TestCase):
             checkpoint = root / "best.pt"
             checkpoint.write_bytes(b"not loaded by mocked backend")
             config = dict(checkpoint="best.pt", layer=2, rate_semantics="layer_average",
-                          prune_rates=[50, 70, 90], visualize_rates=[])
+                          prune_rates=[50, 70, 90], visualize_rates=[], selection_mode="base_crop")
             (root / "method.json").write_text(json.dumps(config), encoding="utf-8")
             parent = fixture.backend(calls, warmups=2)
             class Backend(parent):

@@ -189,8 +189,8 @@ class BaseGuidedPredictorTests(unittest.TestCase):
             path = root / "method.json"
             path.write_text(json.dumps(config), encoding="utf-8")
             method = load_method("attention_predictor", path)
-            self.assertEqual(method.selection_mode, "base_crop")
-            self.assertEqual(method.details()["selection_mode"], "base_crop")
+            self.assertEqual(method.selection_mode, "base_full")
+            self.assertEqual(method.details()["selection_mode"], "base_full")
             config["selection_mode"] = "joint"
             path.write_text(json.dumps(config), encoding="utf-8")
             self.assertEqual(load_method("attention_predictor", path).selection_mode, "joint")

@@ -114,3 +114,76 @@ def select_base_guided_tokens(scores, spatial_indices, original, keep_ratio, lay
         order = torch.argsort(packed_scores[indices], descending=True, stable=True)
         selected.append(indices[order[:group["kept_tokens"]]])
     return torch.cat(selected).sort().values, plan
+
+
+def base_full_count_budget(base_count, anyres_count, protected_count, keep_ratio):
+    """Keep the ORIGINAL packed target; all deletions are from AnyRes.
+
+    The public method converts layer-average rates to this boundary keep_ratio.
+    Never clamp an infeasible target to Base size or change its denominator.
+    Zero retained AnyRes tokens is permitted at the exact feasible boundary.
+    """
+    if (any(type(n) is not int or n < 0 for n in (base_count, anyres_count, protected_count))
+            or min(base_count, anyres_count) < 1
+            or isinstance(keep_ratio, bool) or not math.isfinite(keep_ratio) or not 0 < keep_ratio <= 1):
+        raise ValueError("Invalid Base-full counts or keep ratio")
+    original = base_count + anyres_count + protected_count
+    target = min(original, max(1, math.floor(original * keep_ratio + 1e-10)))
+    anyres_keep = target - base_count - protected_count
+    if not 0 <= anyres_keep <= anyres_count:
+        maximum = 100 * anyres_count / original
+        raise ValueError(
+            f"Base-full packed target {target}/{original} cannot keep all {base_count} Base tokens "
+            f"and {protected_count} protected newlines; AnyRes keep would be {anyres_keep}/{anyres_count}. "
+            f"Maximum boundary pruning is {maximum:.6f}%; lower the requested WHOLE-image layer-average rate.")
+    return dict(target=target, anyres_spatial_keep_ratio=anyres_keep / anyres_count,
+                common_spatial_keep_ratio=None,
+                groups=[dict(name=name, candidate_tokens=count, kept_tokens=keep,
+                             masked_tokens=count - keep, actual_prune_rate=100 * (1 - keep / count))
+                        for name, count, keep in (("base", base_count, base_count),
+                                                 ("anyres", anyres_count, anyres_keep))])
+
+
+def base_full_budget(layout, keep_ratio):
+    named = named_spatial_grids(layout)
+    spatial = {i for grid in named.values() for i in grid["indices"]}
+    protected = sorted(set(range(layout["packed_tokens"])) - spatial)
+    plan = base_full_count_budget(len(named["base"]["indices"]), len(named["anyres"]["indices"]),
+                                  len(protected), keep_ratio)
+    plan["protected_indices"] = protected
+    return plan
+
+
+def select_base_full_tokens(scores, spatial_indices, original, keep_ratio, layout):
+    """Keep Base verbatim; ONE global AnyRes top-k of Base-mapped scores."""
+    plan = base_full_budget(layout, keep_ratio)
+    expected = [i for grid in layout["grids"] for i in grid["indices"]]
+    if (original != layout["packed_tokens"] or list(spatial_indices) != expected
+            or scores.shape != (len(expected),) or not torch.isfinite(scores).all()):
+        raise ValueError("Base-full mapped scores/candidates disagree with actual packing")
+    packed = scores.new_zeros(original)
+    packed[torch.tensor(expected, device=scores.device)] = scores
+    named = named_spatial_grids(layout)
+    base = torch.tensor(named["base"]["indices"], dtype=torch.long, device=scores.device)
+    anyres = torch.tensor(named["anyres"]["indices"], dtype=torch.long, device=scores.device)
+    keep = plan["groups"][1]["kept_tokens"]
+    order = torch.argsort(packed[anyres], descending=True, stable=True)
+    protected = torch.tensor(plan["protected_indices"], dtype=torch.long, device=scores.device)
+    return torch.cat((base, protected, anyres[order[:keep]])).sort().values, plan
+
+
+def native_anyres_counts(base_side, raw_grid, original_size, *, final_newline=False, max_patches=9):
+    """CPU count-only counterpart of native unpad -> conditional max9 -> newlines."""
+    raw_h, raw_w = raw_grid[1] * base_side, raw_grid[0] * base_side
+    original_w, original_h = original_size
+    if min(base_side, raw_h, raw_w, original_w, original_h) < 1:
+        raise ValueError("Invalid native image geometry")
+    h, w = raw_h, raw_w
+    if original_w / original_h > raw_w / raw_h:
+        h -= 2 * ((raw_h - int(original_h * raw_w / original_w)) // 2)
+    else:
+        w -= 2 * ((raw_w - int(original_w * raw_h / original_h)) // 2)
+    times = math.sqrt(h * w / (max_patches * base_side ** 2))
+    if times > 1.1:
+        h, w = int(h // times), int(w // times)
+    return base_side ** 2, h * w, h + int(final_newline)

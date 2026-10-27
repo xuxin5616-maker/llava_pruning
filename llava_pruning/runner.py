@@ -43,15 +43,17 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         raise ValueError("benchmark_metrics must be a boolean")
     if type(warmup) is not int or warmup < 0:
         raise ValueError("warmup must be a nonnegative integer")
-    if benchmark_metrics and (not no_sample or not include_pruning_time
-                              or save_prune_vis or save_attention_vis):
-        raise ValueError("--benchmark-metrics requires --no-sample, --include-pruning-time "
-                         "and no sample visualization (use --no-plots)")
+    if benchmark_metrics and (not no_sample or not include_pruning_time):
+        raise ValueError("--benchmark-metrics requires --no-sample and --include-pruning-time")
     validate_image_token_order(image_token_order, roi_mode)
     if roi_mode == "base_only" and method_config is None and method_name == "fastv":
         method_config = Path(__file__).resolve().parents[1] / "configs" / "baseline.json"
     method_config = resolve_method_config(method_name, method_config)
     method = load_method(method_name, method_config)
+    deferred_visualization = bool(benchmark_metrics and (save_prune_vis or save_attention_vis)
+                                  and method.name == "attention_predictor")
+    if benchmark_metrics and (save_prune_vis or save_attention_vis) and not deferred_visualization:
+        raise ValueError("--benchmark-metrics requires no sample visualization for this method (use --no-plots)")
     if method.name in {"clse", "attention_predictor"} and any(rate != 0 for rate in method.rates):
         if roi_mode != "anyres_max_9":
             raise ValueError(f"{method.name} nonzero rates require --roi-mode anyres_max_9")
@@ -93,6 +95,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
     if hasattr(method, "resolve_budgets"):
         resolved_budgets = {item["prune_rate"]: item for item in
                             method.resolve_budgets(len(backend.model.get_model().layers))}
+    preflight = method.validate_input_budgets(backend, samples, resolved_budgets) if hasattr(method, "validate_input_budgets") else None
     if benchmark_metrics:
         validate_single_gpu(backend.model, torch)
         total_memory = torch.cuda.get_device_properties(0).total_memory
@@ -125,6 +128,8 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         metadata["visualize_samples"] = sorted(visualization_ids)
     if hasattr(method, "details"):
         metadata["method_details"] = method.details()
+    if preflight is not None:
+        metadata["budget_preflight"] = preflight
     if resolved_budgets:
         metadata["resolved_budgets"] = list(resolved_budgets.values())
     if method.name == "priortr":
@@ -141,7 +146,11 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                                      ranking_source=("Base region means allocate crop quotas; own AnyRes prediction selects tokens"
                                                      if method.selection_mode == "base_crop" else
                                                      "Base prediction mapped to AnyRes; separate proportional group budgets"
-                                                     if method.selection_mode == "base_interpolated" else "joint own Base/AnyRes prediction"))
+                                                     if method.selection_mode in {"base_full", "base_interpolated"} else "joint own Base/AnyRes prediction"))
+        if method.selection_mode == "base_full":
+            metadata["inference"]["ranking_source"] = "Base fully retained; Base probabilities mapped to ONE global AnyRes top-k"
+        elif method.selection_mode == "anyres_self":
+            metadata["inference"]["ranking_source"] = "Base fully retained; OWN AnyRes prediction ranks ONE global AnyRes top-k"
     if benchmark_metrics:
         metadata.update(
             warmup_requested=warmup,
@@ -152,6 +161,11 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                                "clearing between rates; reserved memory may reflect earlier rates. "
                                "Per-sample peaks reset immediately before full-answer generation.",
         )
+    if deferred_visualization:
+        metadata["visualization_protocol"] = (
+            "ALL clean Lat/Mem measurements finish first with capture disabled; selected images then get a second "
+            "unmeasured deterministic generation, compared with the measured answer. Rendering/extra calls do not "
+            "enter metrics; additional wall time is NOT latency. No capture cache can inflate later measured reserved peaks.")
     (output / "run.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     if not include_pruning_time:
         print("Timing diagnostic: generation_seconds = generation_with_pruning_seconds - pruning_seconds. "
@@ -167,6 +181,9 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         summary_fields += LAYER_AVERAGE_BUDGET_FIELDS
     with summary_path.open("w", encoding="utf-8", newline="") as summary_file:
         csv.writer(summary_file).writerow(summary_fields)
+    deferred_images = []
+    if deferred_visualization:
+        print("Lat/Mem: clean inference first; sample visualizations run AFTER ALL rates as extra unmeasured calls.", flush=True)
     for rate in method.rates:
         rate_label = format_prune_rate(rate)
         rate_dir = output / f"prune_{rate_label}"
@@ -212,14 +229,16 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                                   or visualization_key(sample.sample_id) in visualization_ids))
                 result = backend.generate(
                     sample, prompt, method, rate, roi_mode,
-                    capture_visualization=visualize,
-                    capture_attention=visualize and save_attention_vis,
+                    capture_visualization=visualize and not deferred_visualization,
+                    capture_attention=visualize and save_attention_vis and not deferred_visualization,
                     random_seed=seed + index,
                     do_sample=not no_sample,
                     include_pruning_time=include_pruning_time,
                     **({"benchmark_metrics": True} if benchmark_metrics else {}),
                 )
-                if visualize:
+                if visualize and deferred_visualization:
+                    deferred_images.append((rate, index, result["answer"]))
+                elif visualize:
                     method.visualize(
                         result=result, vision_tower=backend.vision_tower,
                         output_dir=rate_dir / "visualizations",
@@ -280,7 +299,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                         for group in result["stats"]["selection_groups"]:
                             writer.writerow(dict(question_id=sample.sample_id, method=method.name,
                                                  pruning_layer=method.layer, prune_rate=rate, **group,
-                                                 common_spatial_keep_ratio=result["stats"]["common_spatial_keep_ratio"],
+                                                 common_spatial_keep_ratio=result["stats"].get("common_spatial_keep_ratio"),
                                                  protected_newline_tokens=result["stats"]["protected_newline_tokens"]))
                 if result["stats"].get("layers"):
                     if result["stats"].get("crop_budgets"):
@@ -335,4 +354,25 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
             print(f"rate={rate_label} Lat(mean)={metrics['lat_mean_ms']:.2f} ms "
                   f"Mem(peak allocated)={metrics['mem_peak_allocated_gib']:.3f} GiB "
                   f"Mem(peak reserved)={metrics['mem_peak_reserved_gib']:.3f} GiB", flush=True)
+    if deferred_images:
+        report_path = output / "visualization_verification.csv"
+        with report_path.open("w", encoding="utf-8", newline="") as report_file:
+            writer = csv.DictWriter(report_file, fieldnames=("question_id", "prune_rate", "answer_matches_measured"))
+            writer.writeheader()
+            for ordinal, (rate, index, answer) in enumerate(deferred_images, 1):
+                sample, prompt = samples[index], prompts[index][0]
+                result = backend.generate(sample, prompt, method, rate, roi_mode,
+                                          capture_visualization=True, capture_attention=save_attention_vis,
+                                          random_seed=seed + index, do_sample=False, include_pruning_time=True)
+                matches = result["answer"] == answer
+                writer.writerow(dict(question_id=sample.sample_id, prune_rate=rate, answer_matches_measured=matches))
+                report_file.flush()
+                if not matches:
+                    raise RuntimeError(f"Unmeasured visualization answer differs for id={sample.sample_id}, rate={rate}; "
+                                       "metrics are preserved; refusing to label images with a different result")
+                method.visualize(result=result, vision_tower=backend.vision_tower,
+                                 output_dir=output / f"prune_{format_prune_rate(rate)}" / "visualizations",
+                                 sample_id=sample.sample_id, ground_truth=sample.gt,
+                                 save_prune=save_prune_vis, save_attention=save_attention_vis)
+                print(f"visualization={ordinal}/{len(deferred_images)} rate={rate} id={sample.sample_id} (unmeasured)", flush=True)
     return output

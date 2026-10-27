@@ -1,0 +1,8 @@
+{
+  "checkpoint": "../output/attention_predictor_twig_train_01/best.pt",
+  "layer": 2,
+  "rate_semantics": "layer_average",
+  "selection_mode": "base_full",
+  "prune_rates": [30, 50, 70],
+  "visualize_rates": [70]
+}

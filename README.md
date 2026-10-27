@@ -4,6 +4,21 @@ A small, single-image inference scaffold for LLaVA OneVision/Qwen2 checkpoints. 
 
 ## Learned block2 -> block22 attention predictor
 
+One command compares **own predicted AnyRes attention vs Base-mapped predicted
+attention**, with Base fully retained in BOTH, whole-image layer-average
+rates30/50/70, Lat/Mem, and sample PNGs ONLY at70:
+
+```bash
+python compare_attention_sources.py --gpu 5 \
+  --checkpoint output/attention_predictor_twig_train_01/best.pt \
+  --output-dir output/attention_sources_30_50_70_01
+```
+
+Uses the previous server model/data defaults; paths can be overridden. Two
+isolated child processes execute sequentially on that GPU, one model load per
+source. The root summary.csv contains all six comparable metric rows.
+[Full command, outputs and feasibility limits](docs/attention_source_comparison.md).
+
 `--method attention_predictor` adds a **trained** side Transformer; it is not a
 training-free method or a full MAP/TwigVLM reproduction. The frozen original
 backbone stays FP16 + FlashAttention2. New training initializes **independent,
@@ -52,8 +67,19 @@ The training entry writes `best.pt`, `last.pt`, `history.csv`, fixed split lists
 and the portable `method.json`. VisA images used for distillation are **not** an
 independent VisA test set. No H2 disk cache is created by default; optional
 `--cache-dir` can save repeated teacher computation but may use hundreds of GB.
-The evaluation config defaults to layer-average removal 50/70/90% and
-`selection_mode=base_crop`: preserve the same proportional Base/whole-AnyRes
+The current default is **`selection_mode=base_full`**, whole-image layer-average
+removal30/50/70%: protect ALL Base and newlines, map predicted Base probabilities
+onto the actual AnyRes grid, then select ONE global AnyRes top-k. Base's former
+deletion quota transfers to AnyRes, with the original total budget unchanged.
+All image/rate pairs are checked for feasibility before warmup/evaluation;
+infeasible small-grid targets raise, never relax or skip samples. Own AnyRes
+scores and crop quota temperatures are not used. Existing weights work without
+retraining. Use the user-server config `configs/attention_predictor_base_full.json`
+(existing Twig-trained best.pt), or explicitly set mode in your method.json.
+Missing mode/legacy base_guided resolves to base_full; an explicit old base_crop
+remains a comparison. [Current full usage and Lat/Mem protocol](docs/attention_predictor_base_full.md).
+
+The previous explicit `selection_mode=base_crop` comparison preserves proportional Base/whole-AnyRes
 spatial quotas after reserving newlines, then use mean predicted Base attention
 in each corresponding original crop region to allocate AnyRes crop budgets via
 Softmax(+mean/T), capacity redistribution and exact integer rounding. Within
@@ -61,18 +87,19 @@ each crop, OWN predicted AnyRes attention selects tokens. No spatial prior or
 additional Base-only/minmax score normalization is used. The side input is
 still full H2. `crop_temperature` defaults to0.05 (configurable; attention means
 are small, so this can be near-uniform); `crop_min_keep` defaults to0.
-Existing checkpoints/method.json work without retraining. Missing selection_mode
-and the old `base_guided` name resolve to base_crop; explicit
-`base_interpolated` reproduces the previous Base-interpolation ranking and
+Explicit `base_interpolated` reproduces the previous Base-interpolation ranking and
 `joint` reproduces own-score joint top-k. Each nonzero rate writes
 `view_budgets.csv` group counts and `crop_budgets.csv` per-crop counts/weights.
-AnyRes overlays show OWN predicted attention, not the Base allocation scores.
+In base_crop, AnyRes overlays show OWN predicted attention; base_full shows Base-mapped scores.
 Versioned original crop/anchor/source provenance is reserved for a future
 pre-LLM adapter; no pre-LLM pruning is currently connected. Layer-average rates
 still reference the unpruned native packed baseline.
 Original positions and physical KV compaction remain. Lat/Mem includes side
 computation, allocation, selection and weights. Full usage, precision,
 limitations and validation: [attention predictor details](docs/attention_predictor.md).
+For attention_predictor only, `--benchmark-metrics` can also save sample images:
+all clean measurements finish before a separate, answer-checked visualization
+pass. It increases wall time but does not enter reported Lat/Mem.
 
 ## CLSE quick start
 

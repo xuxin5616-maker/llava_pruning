@@ -2,9 +2,7 @@
   "checkpoint": "../output/attention_predictor_copied_train_01/best.pt",
   "layer": 2,
   "rate_semantics": "layer_average",
-  "selection_mode": "base_crop",
-  "crop_temperature": 0.05,
-  "crop_min_keep": 0,
-  "prune_rates": [50, 70, 90],
-  "visualize_rates": [50, 70, 90]
+  "selection_mode": "base_full",
+  "prune_rates": [30, 50, 70],
+  "visualize_rates": [70]
 }
