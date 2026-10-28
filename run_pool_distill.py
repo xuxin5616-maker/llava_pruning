@@ -1,7 +1,7 @@
 """MyPool before LLM + distilled block2 pruning; isolated lambda/source trials.
 
-Defaults: average30%, lambda0/.25/.5/.75/1, BOTH scoring sources, ALL images.
-Results-only: ACC/PRE/Recall/TNR, TTFT Lat, peak allocated/reserved Mem, budgets.
+Defaults: average30/50/70%, lambda0/.25/.5/.75/1, BOTH scoring sources, ALL images.
+Results-only: ACC/PRE/Recall/TNR/BACC/F1/relative ACC, TTFT Lat, peak Mem, budgets.
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ import subprocess
 import sys
 import time
 
+from llava_pruning.extended_metrics import EXTRA_FIELDS, METRIC_DEFINITIONS, extended_metrics
+
 PROJECT = Path(__file__).resolve().parent
 
 
@@ -27,7 +29,7 @@ def build_parser():
     parser.add_argument("--input-json", type=Path, default=Path("/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl"))
     parser.add_argument("--data-root", type=Path, default=Path("/home/yz/xxy/data/datasets/Traid_eval_data/mvtec"))
     parser.add_argument("--checkpoint", type=Path, default=PROJECT / "output/attention_predictor_twig_train_01/best.pt")
-    parser.add_argument("--prune-rates", type=float, nargs="+", default=[30.])
+    parser.add_argument("--prune-rates", type=float, nargs="+", default=[30., 50., 70.])
     parser.add_argument("--lambdas", type=float, nargs="+", default=[0., .25, .5, .75, 1.])
     parser.add_argument("--selection-modes", nargs="+", choices=("anyres_self", "base_full"), default=["anyres_self", "base_full"])
     parser.add_argument("--prompt-version", choices=("v0", "v1", "v2", "v3"), default="v0")
@@ -37,7 +39,11 @@ def build_parser():
     parser.add_argument("--spatial-mix-weight", type=float, default=0., help="MyPool spatial prior weight; independent of --lambdas")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output-dir", type=Path, default=PROJECT / "output/pool_distill_30_01")
+    parser.add_argument("--baseline-acc", type=float, default=91.18,
+                        help="Unpruned reference ACC in PERCENT (default91.18); no baseline rerun")
+    parser.add_argument("--report-only", type=Path, metavar="EXISTING_OUTPUT",
+                        help="Add/recompute BACC/F1/relative ACC in existing reports; no inference/GPU")
+    parser.add_argument("--output-dir", type=Path, default=PROJECT / "output/pool_distill_30_50_70_01")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     return parser
 
@@ -56,6 +62,7 @@ def write_csv(path, rows):
 
 
 def validate(args):
+    baseline_reference(args.baseline_acc)
     for values, low, high in ((args.prune_rates, 0, 100), (args.lambdas, 0, 1)):
         if not values or len(set(values)) != len(values) or any(not math.isfinite(v) or v < low or v > high for v in values):
             raise ValueError("Rates/lambdas must be finite, distinct and in range")
@@ -84,6 +91,62 @@ def validate(args):
     return output
 
 
+def baseline_reference(percent):
+    if isinstance(percent, bool) or not math.isfinite(percent) or not 0 < percent <= 100:
+        raise ValueError("--baseline-acc must be an ACC percentage in (0,100]")
+    return dict(accuracy=percent / 100, accuracy_percent=percent,
+                source="user-supplied unpruned reference; not rerun", default_reference_percent=91.18)
+
+
+def rebuild_reports(directory, baseline_acc=91.18):
+    """Enrich completed trial reports from exact JSON counts; never call a model.
+
+    A moved/copied output folder is supported: child basenames are resolved
+    within the requested root, not at stale absolute paths in comparison.json.
+    Validate every completed trial before rewriting any report. Failed/running
+    trials remain excluded, and manifest completion/status is not changed.
+    """
+    reference = baseline_reference(baseline_acc)
+    root = Path(directory).expanduser().resolve()
+    manifest_path = root / "comparison.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Hybrid comparison.json not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    pending, seen = [], set()
+    for trial in manifest["trials"]:
+        if trial["status"] != "complete":
+            continue
+        name = trial["directory"].replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        folder = (root / name).resolve()
+        if folder.parent != root or folder in seen:
+            raise ValueError("Invalid or duplicate trial report directory")
+        seen.add(folder)
+        metrics = json.loads((folder / "metrics.json").read_text(encoding="utf-8"))
+        if (not metrics.get("complete") or metrics["prune_rate"] != trial["rate"]
+                or metrics["distill_share"] != trial["distill_share"]
+                or metrics["selection_mode"] != trial["selection_mode"]):
+            raise ValueError(f"Incomplete or mismatched metrics: {folder}")
+        enriched = extended_metrics(metrics, reference["accuracy"])
+        run_path = folder / "run.json"
+        run = json.loads(run_path.read_text(encoding="utf-8"))
+        run["baseline_accuracy_reference"] = reference
+        run["definitions"] = dict(run.get("definitions", {}), **METRIC_DEFINITIONS)
+        pending.append((folder, enriched, run))
+    if not pending:
+        raise ValueError("No verified complete hybrid trials to update")
+    for folder, metrics, run in pending:
+        write_csv(folder / "summary.csv", [metrics])
+        write_json(folder / "metrics.json", metrics)
+        write_json(folder / "run.json", run)
+    write_csv(root / "summary.csv", [metrics for _, metrics, _ in pending])
+    manifest["baseline_accuracy_reference"] = reference
+    manifest["metric_definitions"] = METRIC_DEFINITIONS
+    manifest["report_updated_utc"] = datetime.now(timezone.utc).isoformat()
+    write_json(manifest_path, manifest)
+    print(f"Updated {len(pending)} completed reports without inference: {root / 'summary.csv'}", flush=True)
+    return root
+
+
 def run_sweep(args, *, run_process=None):
     output = validate(args)
     output.mkdir(parents=True, exist_ok=True)
@@ -94,7 +157,8 @@ def run_sweep(args, *, run_process=None):
                     base_policy="MyPool compresses Base + AnyRes; block2 protects remaining Base",
                     checkpoint_policy="reuse existing dense-trained predictor; no training in this sweep",
                     sparse_distribution_shift="side predictor now receives MyPool-compressed/merged inputs; performance requires empirical verification",
-                    visualization=False, trials=[])
+                    visualization=False, baseline_accuracy_reference=baseline_reference(args.baseline_acc),
+                    metric_definitions=METRIC_DEFINITIONS, trials=[])
     manifest_path = output / "comparison.json"
     combined = []
     environment = dict(os.environ, CUDA_VISIBLE_DEVICES=str(args.gpu))
@@ -108,7 +172,8 @@ def run_sweep(args, *, run_process=None):
                            "--data-root", str(args.data_root), "--checkpoint", str(args.checkpoint),
                            "--prune-rates", str(rate), "--lambdas", str(share), "--selection-modes", mode,
                            "--prompt-version", args.prompt_version, "--warmup", str(args.warmup),
-                           "--seed", str(args.seed), "--allocation-temperature", str(args.allocation_temperature),
+                           "--seed", str(args.seed), "--baseline-acc", str(args.baseline_acc),
+                           "--allocation-temperature", str(args.allocation_temperature),
                            "--spatial-mix-weight", str(args.spatial_mix_weight),
                            "--redundancy-layers", *map(str, args.redundancy_layers),
                            "--visionzip-layers", *map(str, args.visionzip_layers), "--output-dir", str(trial_dir)]
@@ -129,6 +194,9 @@ def run_sweep(args, *, run_process=None):
                     for key in ("lat_mean_ms", "mem_peak_allocated_gib", "actual_average_prune_rate"):
                         if not math.isfinite(float(rows[0][key])):
                             raise RuntimeError(f"Invalid {key} for {tag}")
+                    if (not set(EXTRA_FIELDS).issubset(rows[0])
+                            or not math.isclose(float(rows[0]["baseline_accuracy"]), args.baseline_acc / 100)):
+                        raise RuntimeError(f"Missing BACC/F1/relative ACC or wrong baseline for {tag}")
                     combined.extend(rows)
                     write_csv(output / "summary.csv", combined)
                 except Exception as error:
@@ -187,10 +255,11 @@ def run_worker(args):
                 seen.add(size)
     output.mkdir(parents=True, exist_ok=True)
     metadata = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
-    write_json(output / "run.json", dict(configuration=metadata, inference=backend.inference_config, definitions=DEFINITIONS,
+    write_json(output / "run.json", dict(configuration=metadata, inference=backend.inference_config,
+        definitions=dict(DEFINITIONS, **METRIC_DEFINITIONS), baseline_accuracy_reference=baseline_reference(args.baseline_acc),
         method="pool_distill", predictor_training="unchanged dense-input checkpoint",
         budget_reference="native unpruned packed Base+AnyRes+newlines; per-image baseline",
-        actual_budget="recorded per image; integer rounding <2/N percentage points",
+        actual_budget="recorded per image; integer rounding <200/N percentage points",
         mapping="Base mass-preserving backprojection by normalized actual merge coefficients; bilinear image-coordinate sampling; source-weighted AnyRes average",
         position_policy="compressed MyPool prefill positions; second-stage pruning preserves those positions",
         no_visualizations=True, complete=False))
@@ -225,6 +294,7 @@ def run_worker(args):
     for key in ("actual_average_prune_rate", "actual_pre_contribution", "actual_distill_contribution",
                 "baseline_packed_tokens", "pre_llm_tokens", "final_llm_tokens", "pre_base_tokens", "final_anyres_tokens"):
         metrics[key] = statistics.mean(row[key] for row in budgets)
+    metrics = extended_metrics(metrics, args.baseline_acc / 100)
     write_csv(output / "budgets.csv", budgets)
     write_csv(output / "summary.csv", [metrics])
     write_json(output / "metrics.json", metrics)
@@ -236,7 +306,11 @@ def run_worker(args):
 
 def main():
     args = build_parser().parse_args()
-    if args.worker:
+    if args.report_only is not None:
+        if args.worker:
+            raise ValueError("--report-only cannot be combined with --worker")
+        rebuild_reports(args.report_only, args.baseline_acc)
+    elif args.worker:
         run_worker(args)
     else:
         run_sweep(args)

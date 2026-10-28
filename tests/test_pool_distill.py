@@ -179,7 +179,7 @@ class PoolDistillTests(unittest.TestCase):
             (root/"input.json").write_text("[]")
             (root/"best.pt").write_bytes(b"mock")
             args = entry.build_parser().parse_args(["--model-path", str(root/"model"), "--data-root", str(root/"data"),
-                "--input-json", str(root/"input.json"), "--checkpoint", str(root/"best.pt"), "--output-dir", str(root/"out")])
+                "--input-json", str(root/"input.json"), "--checkpoint", str(root/"best.pt"), "--prune-rates", "30", "--output-dir", str(root/"out")])
             calls=[]
             def child(command, **kwargs):
                 trial = entry.build_parser().parse_args(command[2:])
@@ -188,7 +188,8 @@ class PoolDistillTests(unittest.TestCase):
                 self.assertEqual(kwargs["env"]["CUDA_VISIBLE_DEVICES"], "5")
                 trial.output_dir.mkdir()
                 entry.write_csv(trial.output_dir/"summary.csv", [dict(complete=True, prune_rate=30, distill_share=trial.lambdas[0],
-                    selection_mode=trial.selection_modes[0], lat_mean_ms=12., mem_peak_allocated_gib=3., actual_average_prune_rate=30.001)])
+                    selection_mode=trial.selection_modes[0], lat_mean_ms=12., mem_peak_allocated_gib=3., actual_average_prune_rate=30.001,
+                    f1=.8, bacc=.8, baseline_accuracy=trial.baseline_acc/100, relative_accuracy_pct=90.)])
                 return types.SimpleNamespace(returncode=0)
             entry.run_sweep(args, run_process=child)
             self.assertEqual(len(calls), 10)

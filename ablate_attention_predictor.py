@@ -26,6 +26,7 @@ from llava_pruning.predictor_data import load_visa_distillation, split_samples
 from llava_pruning.prompts import GENERIC_PROMPT_V0, resolve_prompt
 from llava_pruning.rates import format_prune_rate, is_prune_rate
 from llava_pruning.training_schedule import training_step_plan
+from llava_pruning.extended_metrics import extended_metrics
 
 
 PROJECT = Path(__file__).resolve().parent
@@ -195,26 +196,6 @@ def command_for(plan, job, phase):
             "--no-sample", "--no-plots", "--include-pruning-time", "--benchmark-metrics",
             "--warmup", str(settings["warmup"]), "--seed", str(settings["seed"]),
             "--output-dir", str(folder / "test")]
-
-
-def extended_metrics(metrics, baseline):
-    """Undefined denominators stay null; do not derive F1 from rounded PRE/Recall."""
-    if not math.isfinite(baseline) or not 0 < baseline <= 1:
-        raise ValueError("Baseline must be a fraction in (0,1]")
-    counts = [metrics[key] for key in ("tp", "fp", "tn", "fn")]
-    if any(type(value) is not int or value < 0 for value in counts):
-        raise ValueError("Confusion counts must be nonnegative integers")
-    tp, fp, tn, fn = counts
-    accuracy = metrics.get("accuracy")
-    if accuracy is not None and (type(accuracy) not in (int, float) or not math.isfinite(accuracy)
-                                 or not 0 <= accuracy <= 1):
-        raise ValueError("ACC must be a fraction in [0,1], not a percentage")
-    recall = tp / (tp + fn) if tp + fn else None
-    tnr = tn / (tn + fp) if tn + fp else None
-    return dict(metrics, f1=2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else None,
-                bacc=(recall + tnr) / 2 if recall is not None and tnr is not None else None,
-                baseline_accuracy=baseline,
-                relative_accuracy_pct=100 * accuracy / baseline if accuracy is not None else None)
 
 
 def validate_training(plan, job):

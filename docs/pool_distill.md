@@ -5,7 +5,7 @@ the existing block2 side predictor. This is a new results-only entry; the
 standalone MyPool and `run.py --method attention_predictor` remain available.
 No training or checkpoint conversion is performed.
 
-Confirmed experiment: whole-image LLM-layer-average removal30%, lambda
+Default sweep: whole-image LLM-layer-average removal30/50/70%, lambda
 0/.25/.5/.75/1, both `anyres_self` and `base_full`. ALL input records run.
 MyPool compresses BOTH Base and AnyRes; stage2 protects the remaining Base.
 
@@ -21,14 +21,15 @@ python run_pool_distill.py \
   --input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \
   --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
   --prompt-version v0 \
-  --prune-rates 30 \
+  --prune-rates 30 50 70 \
   --lambdas 0 0.25 0.5 0.75 1 \
   --selection-modes anyres_self base_full \
-  --output-dir output/pool_distill_30_01
+  --baseline-acc 91.18 \
+  --output-dir output/pool_distill_30_50_70_01
 ```
 
 No edits to training `method.json` are needed. The checkpoint argument is the
-existing best.pt, not a new training directory. All ten configurations execute
+existing best.pt, not a new training directory. All30 configurations execute
 as isolated sequential child processes on this one GPU; each loads the model
 once. Their allocators and side-branch residency are independent. Lambda0 is
 intentionally measured for both sources as a duplicate endpoint control.
@@ -119,9 +120,9 @@ would be a separate training change.
 ## Outputs and timing
 
 ```text
-output/pool_distill_30_01/
+output/pool_distill_30_50_70_01/
   comparison.json                       # commands, status, budget definitions
-  summary.csv                           #10 rows, two sources x five lambdas
+  summary.csv                           #30 rows, three rates x two sources x five lambdas
   prune_30_anyres_self_lambda_0.5/
     run.json                            #configuration / inference / timing
     predictions.jsonl                   #ID, GT, answer, Lat and memory
@@ -131,11 +132,53 @@ output/pool_distill_30_01/
   ...
 ```
 
-This first30% sweep saves NO images or feature/attention arrays. It reports
-ACC/PRE/Recall/TNR, unparsed counts, Lat mean/p50/p95/std in ms, peak allocated
+This sweep saves NO images or feature/attention arrays. It reports
+ACC/PRE/Recall/TNR/BACC/F1/relative ACC, unparsed counts, Lat mean/p50/p95/std in ms, peak allocated
 and reserved GiB, allocated/device-total percentage, full generation duration,
 and per-image actual contributions. Runtime progress prints elapsed and ETA.
 No input count limit is imposed. Default10 warmups per trial are excluded.
+
+### Classification additions and the unpruned reference
+
+Both child and root `summary.csv`, and each `metrics.json`, now include:
+
+| Column | Definition | Units |
+|---|---|---|
+| `f1` | `2*TP/(2*TP+FP+FN)`, defect positive class | fraction0..1 |
+| `bacc` | `(Recall+TNR)/2` | fraction0..1 |
+| `baseline_accuracy` | supplied unpruned reference ACC | fraction0..1 |
+| `relative_accuracy_pct` | `100*accuracy/baseline_accuracy` | percent |
+
+These use the SAME shared calculation as `ablate_attention_predictor.py`.
+F1/BACC use parsed labeled A/B answers; unparsed labeled answers remain errors
+in ACC and are reported separately. Undefined denominators stay null/empty.
+Relative ACC can exceed100%; it is accuracy retention, not a Lat/Mem/token ratio.
+
+The earlier additions existed only in the ablation entry; the hybrid entry
+had not called them. Default `--baseline-acc 91.18` reuses that entry's supplied
+reference, NOT a new measured zero-pruning run. If your corresponding original
+model/dataset/prompt baseline differs, pass its ACC in percent. The reference
+and its source are recorded in root `comparison.json` and each `run.json`.
+
+Existing hybrid outputs can receive the missing columns without inference:
+
+```bash
+python run_pool_distill.py \
+  --report-only output/pool_distill_30_01 \
+  --baseline-acc 91.18
+```
+
+This reads exact confusion counts and ACC from completed trials' `metrics.json`,
+updates both levels of CSV/JSON reports, and preserves predictions, budgets,
+timings and failed/running statuses. No model/data paths or GPU are needed.
+Incomplete trials are excluded, never marked successful. A moved/copied root
+is supported; original absolute child paths are not followed outside the root.
+
+50/70 targets remain subject to the existing feasibility checks. For example,
+with one729-token AnyRes crop, Base729 and27 protected newlines, lambda1 has
+maximum whole-image layer-average removal about45.58% at block2 of28. The code
+stops with an error for an impossible trial; it does not prune protected Base,
+lower the requested rate, or skip test images to produce a misleading result.
 
 Lat uses the shared synchronized resident-input->first-selected-token observer.
 It includes vision/projector/packing, MyPool scoring/allocation/merging and

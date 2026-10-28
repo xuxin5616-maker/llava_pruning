@@ -9,12 +9,13 @@ For **MyPool before LLM + the existing distilled block2 predictor**, use:
 ```bash
 python run_pool_distill.py --gpu 5 \
   --checkpoint output/attention_predictor_twig_train_01/best.pt \
-  --prune-rates 30 --lambdas 0 0.25 0.5 0.75 1 \
-  --output-dir output/pool_distill_30_01
+  --prune-rates 30 50 70 --lambdas 0 0.25 0.5 0.75 1 \
+  --baseline-acc 91.18 --output-dir output/pool_distill_30_50_70_01
 ```
 
 Both own-AnyRes and Base-mapped sources run, preserving remaining Base after
-MyPool. Ten isolated sequential jobs report ACC/PRE/Recall/TNR/Lat/Mem with
+MyPool. Thirty isolated sequential jobs report ACC/PRE/Recall/TNR/BACC/F1,
+accuracy relative to the supplied unpruned reference, and Lat/Mem with
 per-image budget audits, no sample PNGs. Lambda splits contributions to the
 original whole-image layer-average rate, not two naive sequential percentages.
 [Full command, sparse merge scoring and budget definitions](docs/pool_distill.md).
