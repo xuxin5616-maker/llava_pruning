@@ -4,6 +4,21 @@ A small, single-image inference scaffold for LLaVA OneVision/Qwen2 checkpoints. 
 
 ## Learned block2 -> block22 attention predictor
 
+For **MyPool before LLM + the existing distilled block2 predictor**, use:
+
+```bash
+python run_pool_distill.py --gpu 5 \
+  --checkpoint output/attention_predictor_twig_train_01/best.pt \
+  --prune-rates 30 --lambdas 0 0.25 0.5 0.75 1 \
+  --output-dir output/pool_distill_30_01
+```
+
+Both own-AnyRes and Base-mapped sources run, preserving remaining Base after
+MyPool. Ten isolated sequential jobs report ACC/PRE/Recall/TNR/Lat/Mem with
+per-image budget audits, no sample PNGs. Lambda splits contributions to the
+original whole-image layer-average rate, not two naive sequential percentages.
+[Full command, sparse merge scoring and budget definitions](docs/pool_distill.md).
+
 One command compares **own predicted AnyRes attention vs Base-mapped predicted
 attention**, with Base fully retained in BOTH, whole-image layer-average
 rates30/50/70, Lat/Mem, and sample PNGs ONLY at70:

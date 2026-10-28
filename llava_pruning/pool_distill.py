@@ -212,7 +212,10 @@ class PoolDistillMethod:
         if self.share == 1 or rate == 0:
             self.native.configure(core, rate, **capture)
         else:
-            core.configure_attention_predictor(enabled=self.share > 0, keep_ratio=1.,
+            # Dense configuration treats keep_ratio=1 as disabled, including
+            # skipping checkpoint loading. Actual ratio is assigned after the
+            # pre-LLM adapter knows this image's original and sparse lengths.
+            core.configure_attention_predictor(enabled=self.share > 0, keep_ratio=.5 if self.share > 0 else 1.,
                 checkpoint=self.native.checkpoint, selection_mode=self.mode)
             self.adapter.configure(self.adapter.settings.prune_rate, capture_visualization=False)
 
@@ -252,7 +255,7 @@ class PoolDistillMethod:
             original, pre = plan["baseline_packed_tokens"], plan["pre_llm_tokens"]
             final = raw["final_llm_visual_tokens"] if self.share > 0 else pre
         if final != plan["final_llm_tokens"]:
-            raise RuntimeError("Final native generation differs from the hybrid plan")
+            raise RuntimeError(f"Final native generation {final} differs from hybrid plan {plan['final_llm_tokens']} (lambda={self.share})")
         depth = len(core.layers)
         rows = raw.get("layers")
         observed = sum(row["image_tokens_in"] for row in rows) if rows else depth * pre
@@ -269,6 +272,7 @@ class PoolDistillMethod:
         return dict(plan, selection_mode=self.mode, observed_layer_token_sum=observed,
                     pre_base_tokens=base, pre_anyres_tokens=anyres, protected_newlines=protected,
                     final_base_tokens=base, final_anyres_tokens=final - base - protected,
+                    final_llm_visual_tokens=final,
                     actual_average_prune_rate=100 * (1 - observed / (depth * original)),
                     base_policy="MyPool compresses Base; stage2 protects remaining Base",
                     position_policy="MyPool consecutive prefill IDs; stage2 preserves these IDs",
