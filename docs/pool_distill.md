@@ -174,6 +174,65 @@ timings and failed/running statuses. No model/data paths or GPU are needed.
 Incomplete trials are excluded, never marked successful. A moved/copied root
 is supported; original absolute child paths are not followed outside the root.
 
+### Resume after Ctrl+C / terminal interruption
+
+Keep the ORIGINAL output directory. After syncing the updated project, run:
+
+```bash
+/home/zsl/anaconda3/envs/triad/bin/python run_pool_distill.py \
+  --resume \
+  --output-dir output/pool_distill_30_50_70_01
+```
+
+This explicitly uses the existing triad interpreter; `conda activate` is not
+needed. A `KeyboardInterrupt` following terminal `^C` indicates SIGINT, not an
+exception raised by the token membership test shown in the interrupted frame.
+The separate `conda activate` shell-initialization error does not explain that
+model interruption. The log alone cannot identify who sent the signal.
+
+The short resume command restores model/data/checkpoint paths, rates, lambdas,
+sources, seed, warmups, reference ACC and MyPool options from the recorded
+configuration (legacy root manifests use their saved child commands). New CLI
+defaults do not replace them. Explicit changes to inference options are
+rejected. A GPU override is allowed only with matching worker hardware/software
+configuration; baseline ACC can be changed as a reporting reference.
+
+Completed trials are skipped only after checking completion artifacts,
+configuration, sample count, ordered IDs/labels and saved timings. Root status
+alone is insufficient: a child that finished before the parent was interrupted
+is also reusable. Failed/interrupted jobs keep the same manifest entry and are
+retried, not duplicated or mislabeled as successful.
+
+For interrupted trials, `progress.jsonl` commits one complete record per sample:
+answer + original Lat/Mem + scalar budget counts. It is flushed after each
+measured call, outside timing. Metadata/CSV reports use atomic replacements.
+A torn trailing journal fragment is discarded on restoration; a corrupt middle
+record, changed ID/GT/order, input content fingerprint or saved checkpoint
+identity causes an error instead of combining incompatible results.
+
+Prior released workers saved answers/Lat/Mem in `predictions.jsonl`, but only
+wrote budgets/summary at trial completion. Resume migrates every complete
+prediction prefix, reuses its original answers/timings, and reconstructs the
+deterministic integer budgets from actual image dimensions and recorded
+configuration without model inference. Such rows explicitly have
+`budget_source=legacy_reconstructed_counts`, `observed_layer_token_sum` empty,
+and a separate `planned_layer_token_sum`. New rows use
+`budget_source=observed_generation`. Summary exports `resumed_samples`,
+`fresh_samples`, `budget_reconstructed_samples`, `budget_observed_samples`,
+and `measurement_segments`. Earliest legacy files have no historical content
+fingerprint; that weaker provenance is recorded in `resume_history`.
+
+Remaining samples use their original `seed + sample_index`; warmups repeat at
+each new measurement segment and are excluded. Original Lat/Mem are not replaced
+by new timings. Multi-segment timings describe the actual saved calls across
+those sessions, not a claim of one uninterrupted benchmark. Source scoring,
+merging, backbone precision and attention backend are unchanged by this fix.
+
+The console prints `Recovered X/N samples` and then resumes at X+1 (or rebuilds
+final reports without generation if all samples were already committed).
+Do not infer X from the last every20-images progress line; read the recovered
+count. No100-image limit or sample skipping is introduced.
+
 50/70 targets remain subject to the existing feasibility checks. For example,
 with one729-token AnyRes crop, Base729 and27 protected newlines, lambda1 has
 maximum whole-image layer-average removal about45.58% at block2 of28. The code

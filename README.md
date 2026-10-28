@@ -20,6 +20,11 @@ per-image budget audits, no sample PNGs. Lambda splits contributions to the
 original whole-image layer-average rate, not two naive sequential percentages.
 [Full command, sparse merge scoring and budget definitions](docs/pool_distill.md).
 
+Interrupted hybrid runs can continue with
+`python run_pool_distill.py --resume --output-dir <original-output-directory>`.
+The original sweep settings are restored, completed trials are verified/skipped,
+and interrupted samples resume from flushed checkpoints or legacy predictions.
+
 One command compares **own predicted AnyRes attention vs Base-mapped predicted
 attention**, with Base fully retained in BOTH, whole-image layer-average
 rates30/50/70, Lat/Mem, and sample PNGs ONLY at70:

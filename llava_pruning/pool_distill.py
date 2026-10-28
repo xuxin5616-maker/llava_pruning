@@ -270,10 +270,46 @@ class PoolDistillMethod:
             base, protected = self.adapter.view_plan["base_keep"], self.adapter.view_plan["protected_newlines"]
             anyres = pre - base - protected
         return dict(plan, selection_mode=self.mode, observed_layer_token_sum=observed,
+                    budget_source="observed_generation", planned_layer_token_sum=expected,
                     pre_base_tokens=base, pre_anyres_tokens=anyres, protected_newlines=protected,
                     final_base_tokens=base, final_anyres_tokens=final - base - protected,
                     final_llm_visual_tokens=final,
                     actual_average_prune_rate=100 * (1 - observed / (depth * original)),
+                    base_policy="MyPool compresses Base; stage2 protects remaining Base",
+                    position_policy="MyPool consecutive prefill IDs; stage2 preserves these IDs",
+                    source_policy="normalized original merge coefficients; Base backprojection preserves probability mass")
+
+    def recover_legacy_budget(self, original_size):
+        """Reconstruct deterministic integer counts, not scores or observed rows.
+
+        Old workers checked stats before saving each prediction, but did not
+        save per-image budgets until the entire trial finished. Mark these
+        reconstructed counts explicitly; original Lat/Mem are never recomputed.
+        """
+        core = self.adapter.core
+        if self.share == 1:
+            from llava.mm_utils import get_anyres_image_grid_shape
+            from llava.model.language_model.attention_predictor_selection import native_anyres_counts
+            tower = core.get_vision_tower()
+            grid = get_anyres_image_grid_shape(original_size, core.config.image_grid_pinpoints, tower.image_size)
+            base, anyres, protected = native_anyres_counts(int(tower.num_patches_per_side), grid, original_size,
+                final_newline=core.config.mm_patch_merge_type.endswith("_add_newl"))
+            plan = hybrid_budget(base+anyres+protected, self.rate, self.share, len(core.layers))
+        else:
+            self.adapter.set_image_context(original_size)
+            plan = dict(self.adapter.plan)
+            base = self.adapter.view_plan["base_keep"]
+            protected = self.adapter.view_plan["protected_newlines"]
+            anyres = plan["pre_llm_tokens"] - base - protected
+        final = plan["final_llm_tokens"]
+        if final < base + protected:
+            raise ValueError("Legacy counts cannot preserve Base and newlines")
+        return dict(plan, selection_mode=self.mode, observed_layer_token_sum=None,
+                    planned_layer_token_sum=2*plan["pre_llm_tokens"]+(len(core.layers)-2)*final,
+                    budget_source="legacy_reconstructed_counts",
+                    pre_base_tokens=base, pre_anyres_tokens=anyres, protected_newlines=protected,
+                    final_base_tokens=base, final_anyres_tokens=final-base-protected,
+                    final_llm_visual_tokens=final,
                     base_policy="MyPool compresses Base; stage2 protects remaining Base",
                     position_policy="MyPool consecutive prefill IDs; stage2 preserves these IDs",
                     source_policy="normalized original merge coefficients; Base backprojection preserves probability mass")
