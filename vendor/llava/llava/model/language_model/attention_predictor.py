@@ -368,6 +368,9 @@ class AttentionPredictorMixin:
     def _clse_reference(self, hidden, start, end):
         if not self.attention_predictor_enabled:
             return super()._clse_reference(hidden, start, end)
+        hybrid = getattr(self, "_pool_distill_adapter", None)
+        if hybrid is not None:
+            return hybrid.reference(hidden, start, end)
         if self._predictor_selection_mode in {"base_full", "anyres_self"}:
             from .attention_predictor_selection import base_full_budget
             base_full_budget(self._clse_layout, self.clse_keep_ratio)
@@ -384,6 +387,9 @@ class AttentionPredictorMixin:
     def _clse_rank(self, hidden, start, end, ids, reference):
         if not self.attention_predictor_enabled:
             return super()._clse_rank(hidden, start, end, ids, reference)
+        hybrid = getattr(self, "_pool_distill_adapter", None)
+        if hybrid is not None:
+            return hybrid.rank(hidden, start, ids)
         guided = self._predictor_selection_mode in {"base_full", "base_interpolated"}
         grids = self._clse_layout["grids"]
         if guided:
@@ -405,6 +411,9 @@ class AttentionPredictorMixin:
         return log_prob
 
     def _clse_select(self, ranking, spatial_indices, original):
+        hybrid = getattr(self, "_pool_distill_adapter", None)
+        if self.attention_predictor_enabled and hybrid is not None:
+            return hybrid.select(ranking, spatial_indices, original)
         if not self.attention_predictor_enabled or self._predictor_selection_mode == "joint":
             return super()._clse_select(ranking, spatial_indices, original)
         if self._predictor_selection_mode in {"base_full", "anyres_self"}:

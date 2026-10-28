@@ -1,0 +1,246 @@
+"""MyPool before LLM + distilled block2 pruning; isolated lambda/source trials.
+
+Defaults: average30%, lambda0/.25/.5/.75/1, BOTH scoring sources, ALL images.
+Results-only: ACC/PRE/Recall/TNR, TTFT Lat, peak allocated/reserved Mem, budgets.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+from datetime import datetime, timezone
+import json
+import math
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+PROJECT = Path(__file__).resolve().parent
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--gpu", type=int, default=5)
+    parser.add_argument("--model-path", type=Path, default=Path("/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov"))
+    parser.add_argument("--input-json", type=Path, default=Path("/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl"))
+    parser.add_argument("--data-root", type=Path, default=Path("/home/yz/xxy/data/datasets/Traid_eval_data/mvtec"))
+    parser.add_argument("--checkpoint", type=Path, default=PROJECT / "output/attention_predictor_twig_train_01/best.pt")
+    parser.add_argument("--prune-rates", type=float, nargs="+", default=[30.])
+    parser.add_argument("--lambdas", type=float, nargs="+", default=[0., .25, .5, .75, 1.])
+    parser.add_argument("--selection-modes", nargs="+", choices=("anyres_self", "base_full"), default=["anyres_self", "base_full"])
+    parser.add_argument("--prompt-version", choices=("v0", "v1", "v2", "v3"), default="v0")
+    parser.add_argument("--redundancy-layers", type=int, nargs="+", default=[26])
+    parser.add_argument("--visionzip-layers", type=int, nargs="+", default=[26])
+    parser.add_argument("--allocation-temperature", type=float, default=.05)
+    parser.add_argument("--spatial-mix-weight", type=float, default=0., help="MyPool spatial prior weight; independent of --lambdas")
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output-dir", type=Path, default=PROJECT / "output/pool_distill_30_01")
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    return parser
+
+
+def write_json(path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+
+
+def write_csv(path, rows):
+    if not rows:
+        return
+    with path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def validate(args):
+    for values, low, high in ((args.prune_rates, 0, 100), (args.lambdas, 0, 1)):
+        if not values or len(set(values)) != len(values) or any(not math.isfinite(v) or v < low or v > high for v in values):
+            raise ValueError("Rates/lambdas must be finite, distinct and in range")
+    if any(not 0 < r < 100 for r in args.prune_rates):
+        raise ValueError("This sweep requires average rates strictly between0 and100")
+    if args.gpu < 0 or args.warmup < 0 or not 0 <= args.seed <= 2**32 - 1:
+        raise ValueError("Invalid GPU / warmup / seed")
+    if len(set(args.selection_modes)) != len(args.selection_modes):
+        raise ValueError("Duplicate selection modes")
+    if not math.isfinite(args.allocation_temperature) or args.allocation_temperature <= 0 or not 0 <= args.spatial_mix_weight <= 1:
+        raise ValueError("Invalid MyPool temperature / spatial weight")
+    for layers in (args.redundancy_layers, args.visionzip_layers):
+        if sorted(set(layers)) != layers or any(not 1 <= i <= 26 for i in layers):
+            raise ValueError("SigLIP layer lists must be increasing, distinct, within1..26")
+    for name, is_dir in (("model_path", True), ("input_json", False), ("data_root", True),
+                         ("checkpoint", False)):
+        path = getattr(args, name).expanduser().resolve()
+        if name == "checkpoint" and not any(args.lambdas):
+            continue
+        if not (path.is_dir() if is_dir else path.is_file()):
+            raise FileNotFoundError(f"{name}: {path}")
+        setattr(args, name, path)
+    output = args.output_dir.resolve()
+    if output.exists() and any(output.iterdir()):
+        raise FileExistsError(f"Use a new/empty output directory: {output}")
+    return output
+
+
+def run_sweep(args, *, run_process=None):
+    output = validate(args)
+    output.mkdir(parents=True, exist_ok=True)
+    manifest = dict(created_utc=datetime.now(timezone.utc).isoformat(), complete=False,
+                    prune_rates=args.prune_rates, lambdas=args.lambdas, selection_modes=args.selection_modes,
+                    isolated_sequential_processes=True,
+                    lambda_definition="distillation contribution / target WHOLE native-packed layer-average removal",
+                    base_policy="MyPool compresses Base + AnyRes; block2 protects remaining Base",
+                    checkpoint_policy="reuse existing dense-trained predictor; no training in this sweep",
+                    sparse_distribution_shift="side predictor now receives MyPool-compressed/merged inputs; performance requires empirical verification",
+                    visualization=False, trials=[])
+    manifest_path = output / "comparison.json"
+    combined = []
+    environment = dict(os.environ, CUDA_VISIBLE_DEVICES=str(args.gpu))
+    for rate in args.prune_rates:
+        for mode in args.selection_modes:
+            for share in args.lambdas:
+                tag = f"prune_{rate:g}_{mode}_lambda_{share:g}"
+                trial_dir = output / tag
+                command = [sys.executable, str(Path(__file__).resolve()), "--worker", "--gpu", str(args.gpu),
+                           "--model-path", str(args.model_path), "--input-json", str(args.input_json),
+                           "--data-root", str(args.data_root), "--checkpoint", str(args.checkpoint),
+                           "--prune-rates", str(rate), "--lambdas", str(share), "--selection-modes", mode,
+                           "--prompt-version", args.prompt_version, "--warmup", str(args.warmup),
+                           "--seed", str(args.seed), "--allocation-temperature", str(args.allocation_temperature),
+                           "--spatial-mix-weight", str(args.spatial_mix_weight),
+                           "--redundancy-layers", *map(str, args.redundancy_layers),
+                           "--visionzip-layers", *map(str, args.visionzip_layers), "--output-dir", str(trial_dir)]
+                trial = dict(rate=rate, distill_share=share, selection_mode=mode, directory=str(trial_dir), command=command, status="running")
+                manifest["trials"].append(trial)
+                write_json(manifest_path, manifest)
+                print(f"Starting {tag}; GPU{args.gpu}; isolated sequential job", flush=True)
+                try:
+                    completed = (run_process or subprocess.run)(command, cwd=str(PROJECT), env=environment, check=False)
+                    if completed.returncode:
+                        raise RuntimeError(f"{tag} exited with code{completed.returncode}; see traceback above")
+                    with (trial_dir / "summary.csv").open(encoding="utf-8-sig", newline="") as stream:
+                        rows = list(csv.DictReader(stream))
+                    if (len(rows) != 1 or rows[0].get("complete", "").lower() != "true"
+                            or float(rows[0]["prune_rate"]) != rate or float(rows[0]["distill_share"]) != share
+                            or rows[0]["selection_mode"] != mode):
+                        raise RuntimeError(f"Incomplete or wrong trial results: {tag}")
+                    for key in ("lat_mean_ms", "mem_peak_allocated_gib", "actual_average_prune_rate"):
+                        if not math.isfinite(float(rows[0][key])):
+                            raise RuntimeError(f"Invalid {key} for {tag}")
+                    combined.extend(rows)
+                    write_csv(output / "summary.csv", combined)
+                except Exception as error:
+                    trial.update(status="failed", error=str(error))
+                    write_json(manifest_path, manifest)
+                    raise
+                trial["status"] = "complete"
+                write_json(manifest_path, manifest)
+    manifest["complete"] = True
+    write_json(manifest_path, manifest)
+    print(f"Completed {len(combined)} trials: {output / 'summary.csv'}", flush=True)
+    return output
+
+
+def run_worker(args):
+    output = validate(args)
+    if len(args.prune_rates) != 1 or len(args.lambdas) != 1 or len(args.selection_modes) != 1:
+        raise ValueError("Worker requires one rate/lambda/mode")
+    import statistics
+    import torch
+    from PIL import Image
+    from benchmark_fastv import DEFINITIONS, measurement_summary, validate_single_gpu, warmup_indices
+    from llava_pruning.backend import LlavaBackend
+    from llava_pruning.data import load_samples
+    from llava_pruning.metrics import Accuracy
+    from llava_pruning.prompts import resolve_prompt
+    from llava_pruning.pool_distill import PoolDistillMethod
+    from runMyPruningPoolSpatial import MethodSettings
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        raise RuntimeError("Use exactly one visible CUDA GPU")
+    rate, share, mode = args.prune_rates[0], args.lambdas[0], args.selection_modes[0]
+    samples = load_samples(args.input_json, args.data_root)
+    if not samples or args.seed + len(samples) > 2**32:
+        raise ValueError("Empty samples / invalid per-image seed range")
+    prompts = [resolve_prompt(args.prompt_version, s.category, s.text) for s in samples]
+    backend = LlavaBackend(args.model_path, roi_mode="anyres_max_9", image_token_order="base_first")
+    validate_single_gpu(backend.model, torch)
+    core = backend.model.get_model()
+    settings = MethodSettings(prune_rate=0, redundancy_layers=tuple(args.redundancy_layers),
+        visionzip_layers=tuple(args.visionzip_layers), allocation_temperature=args.allocation_temperature,
+        spatial_strength=args.spatial_mix_weight)
+    method = PoolDistillMethod(core, args.checkpoint, rate=rate, share=share, mode=mode, settings=settings)
+    # Feasibility checks do not score images, skip records, or loosen budgets.
+    if share == 1:
+        method.native.validate_input_budgets(backend, samples, {rate: method.native.resolve_budget(rate, len(core.layers))})
+    else:
+        seen = set()
+        for sample in samples:
+            with Image.open(sample.image) as opened:
+                size = opened.size
+            if size not in seen:
+                try:
+                    method.adapter.set_image_context(size)
+                except ValueError as error:
+                    raise ValueError(f"id={sample.sample_id}, size={size}: {error}") from error
+                seen.add(size)
+    output.mkdir(parents=True, exist_ok=True)
+    metadata = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
+    write_json(output / "run.json", dict(configuration=metadata, inference=backend.inference_config, definitions=DEFINITIONS,
+        method="pool_distill", predictor_training="unchanged dense-input checkpoint",
+        budget_reference="native unpruned packed Base+AnyRes+newlines; per-image baseline",
+        actual_budget="recorded per image; integer rounding <2/N percentage points",
+        mapping="Base mass-preserving backprojection by normalized actual merge coefficients; bilinear image-coordinate sampling; source-weighted AnyRes average",
+        position_policy="compressed MyPool prefill positions; second-stage pruning preserves those positions",
+        no_visualizations=True, complete=False))
+    def generate(index):
+        with method.generation_context(backend.model):
+            return backend.generate(samples[index], prompts[index], method=method, rate=rate,
+                roi_mode="anyres_max_9", capture_visualization=False, capture_attention=False,
+                random_seed=args.seed + index, do_sample=False, include_pruning_time=True, benchmark_metrics=True)
+    warmups = warmup_indices(len(samples), args.warmup)
+    for i, index in enumerate(warmups):
+        generate(index)
+        print(f"Warmup {i + 1}/{len(warmups)}", flush=True)
+    validate_single_gpu(backend.model, torch)  # includes the newly loaded side.
+    total_memory = torch.cuda.get_device_properties(0).total_memory
+    accuracy, timings, budgets = Accuracy(len(samples)), [], []
+    started = time.perf_counter()
+    with (output / "predictions.jsonl").open("w", encoding="utf-8") as stream:
+        for i, sample in enumerate(samples):
+            result = generate(i)
+            accuracy.add(sample.gt, result["answer"])
+            timings.append({key: result[key] for key in ("lat_seconds", "generation_seconds", "generated_tokens", "peak_allocated_bytes", "peak_reserved_bytes")})
+            budgets.append(dict(question_id=sample.sample_id, **result["stats"]))
+            stream.write(json.dumps(dict(question_id=sample.sample_id, gt=sample.gt, answer=result["answer"],
+                **timings[-1]), ensure_ascii=False, allow_nan=False) + "\n")
+            if i == 0 or (i + 1) % 20 == 0 or i + 1 == len(samples):
+                elapsed = time.perf_counter() - started
+                print(f"{mode} lambda={share:g} {i+1}/{len(samples)} elapsed={elapsed:.1f}s ETA={elapsed/(i+1)*(len(samples)-i-1):.1f}s", flush=True)
+    metrics = accuracy.result(rate, complete=True)
+    metrics.pop("rule", None)
+    metrics.update(selection_mode=mode, distill_share=share, warmup_samples=len(warmups),
+                   **measurement_summary(timings, total_memory))
+    for key in ("actual_average_prune_rate", "actual_pre_contribution", "actual_distill_contribution",
+                "baseline_packed_tokens", "pre_llm_tokens", "final_llm_tokens", "pre_base_tokens", "final_anyres_tokens"):
+        metrics[key] = statistics.mean(row[key] for row in budgets)
+    write_csv(output / "budgets.csv", budgets)
+    write_csv(output / "summary.csv", [metrics])
+    write_json(output / "metrics.json", metrics)
+    manifest = json.loads((output / "run.json").read_text(encoding="utf-8"))
+    manifest["complete"] = True
+    write_json(output / "run.json", manifest)
+    print(f"Done {mode} lambda={share:g}; ACC={metrics['accuracy']}; Lat={metrics['lat_mean_ms']:.2f}ms; Mem={metrics['mem_peak_allocated_gib']:.3f}GiB", flush=True)
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.worker:
+        run_worker(args)
+    else:
+        run_sweep(args)
+
+
+if __name__ == "__main__":
+    main()

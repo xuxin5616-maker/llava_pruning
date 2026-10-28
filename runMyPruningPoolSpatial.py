@@ -1691,6 +1691,15 @@ class CustomPruningAdapter:
         self.geometry = ScoreGeometry.create(self.original_size, tuple(grid),
                                               int(self.tower.image_size), int(self.tower.config.patch_size))
 
+    def allocate_view_budgets(self, raw_redundancy, first, spatial):
+        """Override point for composed methods; standalone arithmetic is unchanged."""
+        allocation, probability = allocate_spatial_probability_budgets(
+            raw_redundancy, first["base_token_indices"], self.geometry.grid, spatial["spatial_prior"],
+            prune_rate=self.settings.prune_rate, mix_weight=self.settings.spatial_strength,
+            temperature=self.settings.allocation_temperature, minimum_keep=MINIMUM_CROP_KEEP)
+        base_d, base_c = token_budget(729, self.settings.prune_rate / 100)
+        return allocation, probability, base_d, base_c
+
     def encode_images(self, images):
         if self.core.training:
             raise ValueError("Custom pruning requires eval mode")
@@ -1773,15 +1782,10 @@ class CustomPruningAdapter:
         scores_after_spatial = scores_before_spatial + np.zeros_like(scores_before_spatial)
         allocation_map = redundancy_to_base_map(
             -scores_after_spatial, first["base_token_indices"], 729)
-        allocation, probability = allocate_spatial_probability_budgets(
-            raw_redundancy, first["base_token_indices"], self.geometry.grid, spatial["spatial_prior"],
-            prune_rate=self.settings.prune_rate,
-            mix_weight=self.settings.spatial_strength,
-            temperature=self.settings.allocation_temperature, minimum_keep=MINIMUM_CROP_KEEP)
+        allocation, probability, base_d, base_c = self.allocate_view_budgets(raw_redundancy, first, spatial)
         spatial["spatial_bonus"] = probability["spatial_probability_contribution"]
         # There is no fused score in the probability-mixture scheme.
         after_score_record = scores_after_spatial.tolist() if self.settings.spatial_strength == 0 else None
-        base_d, base_c = token_budget(729, self.settings.prune_rate / 100)
         base_keep = base_d + base_c
         keeps = [base_keep] + [crop["keep"] for crop in allocation["crops"]]
         if any(keep < 4 for keep in keeps):
