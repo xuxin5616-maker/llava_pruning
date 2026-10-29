@@ -34,7 +34,10 @@ def require_current_prompt_format(metadata):
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--gpu", type=int, default=5)
+    gpu_group = parser.add_mutually_exclusive_group()
+    gpu_group.add_argument("--gpu", type=int, default=5, help="One physical GPU; sequential trials")
+    gpu_group.add_argument("--gpus", type=int, nargs="+", default=None,
+                           help="Physical GPUs for parallel independent trials, e.g. --gpus 5 6 7")
     parser.add_argument("--model-path", type=Path, default=Path("/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov"))
     parser.add_argument("--input-json", type=Path, default=Path("/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl"))
     parser.add_argument("--data-root", type=Path, default=Path("/home/yz/xxy/data/datasets/Traid_eval_data/mvtec"))
@@ -90,6 +93,12 @@ def write_csv(path, rows):
 
 def validate(args):
     baseline_reference(args.baseline_acc)
+    if args.gpus is not None:
+        if not args.gpus or len(set(args.gpus)) != len(args.gpus) or any(gpu < 0 for gpu in args.gpus):
+            raise ValueError("--gpus needs distinct nonnegative physical GPU IDs")
+        if args.worker:
+            raise ValueError("Each worker uses exactly one --gpu; --gpus belongs to the parent scheduler")
+        args.gpu = args.gpus[0]
     for values, low, high in ((args.prune_rates, 0, 100), (args.lambdas, 0, 1)):
         if not values or len(set(values)) != len(values) or any(not math.isfinite(v) or v < low or v > high for v in values):
             raise ValueError("Rates/lambdas must be finite, distinct and in range")
@@ -144,6 +153,12 @@ def restore_sweep_args(args, argv):
                 raise ValueError(f"Cannot resume with changed {flag}; keep original settings")
         else:
             setattr(args, name, Path(value) if name in {"model_path","input_json","data_root","checkpoint"} else value)
+    if "--gpus" in explicit:
+        pass  # Reassign unfinished trials to an explicitly requested GPU pool.
+    elif "--gpu" in explicit:
+        args.gpus = None
+    else:
+        args.gpus = manifest.get("gpus", saved.get("gpus"))
     return args
 
 
@@ -247,7 +262,12 @@ def rebuild_reports(directory, baseline_acc=91.18):
     return root
 
 
-def run_sweep(args, *, run_process=None):
+def run_sweep(args, *, run_process=None, process_factory=None):
+    if args.gpus is not None and len(args.gpus) > 1:
+        if run_process is not None:
+            raise ValueError("Parallel trials use a nonblocking process_factory")
+        from llava_pruning.pool_distill_parallel import run_parallel_sweep
+        return run_parallel_sweep(args, api=sys.modules[__name__], process_factory=process_factory)
     output = validate(args)
     output.mkdir(parents=True, exist_ok=True)
     manifest_path = output / "comparison.json"
@@ -263,7 +283,9 @@ def run_sweep(args, *, run_process=None):
                     sparse_distribution_shift="side predictor now receives MyPool-compressed/merged inputs; performance requires empirical verification",
                     visualization=False, baseline_accuracy_reference=baseline_reference(args.baseline_acc),
                     metric_definitions=METRIC_DEFINITIONS, prompt_format=PROMPT_FORMAT, trials=[])
-    manifest.update(complete=False, baseline_accuracy_reference=baseline_reference(args.baseline_acc))
+    manifest.update(complete=False, baseline_accuracy_reference=baseline_reference(args.baseline_acc),
+                    gpus=[args.gpu], isolated_sequential_processes=True,
+                    execution_mode="independent_single_gpu_trials", max_concurrent_trials=1)
     manifest["configuration"] = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     if args.resume:
         manifest["last_resumed_utc"] = datetime.now(timezone.utc).isoformat()
@@ -416,7 +438,8 @@ def run_worker(args):
     records = load_records(output, samples, recover_budget, rate=rate, share=share, mode=mode) if args.resume else []
     resumed_samples = len(records)
     run_metadata["resume_history"].append(dict(started_utc=datetime.now(timezone.utc).isoformat(),
-        resumed_samples=resumed_samples, legacy_without_content_fingerprint=bool(previous and "input_json_sha256" not in previous)))
+        gpu_id=args.gpu, resumed_samples=resumed_samples,
+        legacy_without_content_fingerprint=bool(previous and "input_json_sha256" not in previous)))
     run_metadata["completed_samples"] = resumed_samples
     write_json(output / "run.json", run_metadata)
     # Rewrite the validated prefix atomically: removes only a torn final journal
@@ -478,7 +501,7 @@ def run_worker(args):
         raise
     metrics = accuracy.result(rate, complete=True)
     metrics.pop("rule", None)
-    metrics.update(selection_mode=mode, distill_share=share, warmup_samples=len(warmups),
+    metrics.update(selection_mode=mode, distill_share=share, gpu_id=args.gpu, warmup_samples=len(warmups),
                    resumed_samples=resumed_samples, fresh_samples=len(samples)-resumed_samples,
                    budget_reconstructed_samples=sum(row.get("budget_source")=="legacy_reconstructed_counts" for row in budgets),
                    budget_observed_samples=sum(row.get("budget_source")!="legacy_reconstructed_counts" for row in budgets),

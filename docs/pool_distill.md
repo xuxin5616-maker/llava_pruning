@@ -61,6 +61,62 @@ The spatial weight is independent of the new stage-allocation lambda.
 Backbone FP16/FlashAttention2, greedy generation, original prompt templates,
 and existing side precision remain unchanged.
 
+## Parallel independent trials on GPU5/6/7
+
+The single-GPU `--gpu` mode remains available. For three cards use `--gpus`:
+
+```bash
+/home/zsl/anaconda3/envs/triad/bin/python run_pool_distill.py \
+  --gpus 5 6 7 \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --checkpoint output/attention_predictor_twig_train_01/best.pt \
+  --input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --prompt-version v0 \
+  --prune-rates 30 50 70 \
+  --lambdas 0.01 0.25 0.5 0.75 0.99 \
+  --selection-modes anyres_self base_full \
+  --baseline-acc 91.18 \
+  --output-dir output/pool_distill_gpu567_01
+```
+
+Thirty configurations share a dynamic FIFO queue. At most one worker occupies
+each physical GPU; each child sees only its own card through
+`CUDA_VISIBLE_DEVICES` and loads one model. A free card starts the next pending
+configuration while other cards continue. No model splitting/DDP or changes to
+the scoring, precision, token budgets, resolved prompts or metrics are applied.
+Every configuration still measures single-GPU Lat/Mem. No sample images are
+saved. CPU/model-loading resources are shared, so speedup is measured, not
+assumed to equal the card count.
+
+Each job writes its existing outputs in its own directory. Only the parent
+updates root `comparison.json` and `summary.csv`, preventing concurrent CSV
+writes. Root rows retain configuration order and include `gpu_id`. Each worker
+also records its GPU in summary and resume history; for a multi-segment trial,
+`gpu_id` is the latest segment's card, with earlier cards in `run.json`.
+
+Image progress and exceptions are redirected to
+`output/pool_distill_gpu567_01/logs/<trial>.log`. The parent prints each start,
+completion and log path, and an active-job/elapsed/approximate-ETA update every
+30 seconds. Follow one job with `tail -f <printed-log-path>` on the server.
+
+On worker failure the scheduler stops new launches and cancels/reaps the other
+workers. On Linux, Ctrl+C sends them SIGINT and gives them time to close sample
+journals; pending jobs remain pending, interrupted ones remain resumable.
+Actual algorithm feasibility errors still stop the run; no rates or images
+are silently changed to make all configurations finish.
+
+```bash
+/home/zsl/anaconda3/envs/triad/bin/python run_pool_distill.py \
+  --resume --output-dir output/pool_distill_gpu567_01
+```
+
+Resume restores the recorded GPU pool and experiment settings. To move pending
+work from a compatible single-GPU run to these cards, explicitly append
+`--gpus 5 6 7` to its resume command. Existing resolved-prompt compatibility and
+worker hardware/software checks still apply; incompatible old prompt outputs
+must be rerun in a new directory.
+
 ## Exact meaning of lambda
 
 Let r be the desired average fraction, D the LLM depth, k=2, N0 the ORIGINAL
