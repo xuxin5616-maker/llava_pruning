@@ -1,6 +1,6 @@
 """MyPool before LLM + distilled block2 pruning; isolated lambda/source trials.
 
-Defaults: average30/50/70%, lambda0/.25/.5/.75/1, BOTH scoring sources, ALL images.
+Defaults: average30/50/70%, lambda.01/.25/.5/.75/.99, BOTH scoring sources, ALL images.
 Results-only: ACC/PRE/Recall/TNR/BACC/F1/relative ACC, TTFT Lat, peak Mem, budgets.
 """
 
@@ -23,6 +23,13 @@ from llava_pruning.pool_distill_resume import (COMMON_FIELDS, TIMING_FIELDS, fil
     load_records, read_prefix, same_setting, validate_configuration, validate_prediction)
 
 PROJECT = Path(__file__).resolve().parent
+PROMPT_FORMAT = "resolved_text_v1"
+
+
+def require_current_prompt_format(metadata):
+    if metadata.get("prompt_format") != PROMPT_FORMAT:
+        raise ValueError("This output predates the resolved prompt-text fix or has an incompatible prompt format. "
+                         "Use a NEW --output-dir and rerun; do not --resume results generated from the prompt tuple.")
 
 
 def build_parser():
@@ -33,7 +40,7 @@ def build_parser():
     parser.add_argument("--data-root", type=Path, default=Path("/home/yz/xxy/data/datasets/Traid_eval_data/mvtec"))
     parser.add_argument("--checkpoint", type=Path, default=PROJECT / "output/attention_predictor_twig_train_01/best.pt")
     parser.add_argument("--prune-rates", type=float, nargs="+", default=[30., 50., 70.])
-    parser.add_argument("--lambdas", type=float, nargs="+", default=[0., .25, .5, .75, 1.])
+    parser.add_argument("--lambdas", type=float, nargs="+", default=[.01, .25, .5, .75, .99])
     parser.add_argument("--selection-modes", nargs="+", choices=("anyres_self", "base_full"), default=["anyres_self", "base_full"])
     parser.add_argument("--prompt-version", choices=("v0", "v1", "v2", "v3"), default="v0")
     parser.add_argument("--redundancy-layers", type=int, nargs="+", default=[26])
@@ -115,6 +122,7 @@ def restore_sweep_args(args, argv):
     """A short --resume command inherits the original sweep, not new defaults."""
     path = args.output_dir.expanduser().resolve() / "comparison.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
+    require_current_prompt_format(manifest)
     saved = manifest.get("configuration")
     if saved is None:
         if not manifest.get("trials"):
@@ -169,6 +177,7 @@ def verified_complete(folder, args, rate, share, mode):
     run, metrics = [json.loads(path.read_text(encoding="utf-8")) for path in paths[:2]]
     if not run.get("complete") or not metrics.get("complete"):
         return False
+    require_current_prompt_format(run)
     validate_configuration(args, run["configuration"], rate, share, mode)
     if run.get("input_json_sha256") not in (None, file_hash(args.input_json)):
         raise ValueError("Input JSON content changed; cannot reuse completed trials")
@@ -243,6 +252,8 @@ def run_sweep(args, *, run_process=None):
     output.mkdir(parents=True, exist_ok=True)
     manifest_path = output / "comparison.json"
     saved_manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if args.resume else None
+    if saved_manifest is not None:
+        require_current_prompt_format(saved_manifest)
     manifest = saved_manifest or dict(created_utc=datetime.now(timezone.utc).isoformat(), complete=False,
                     prune_rates=args.prune_rates, lambdas=args.lambdas, selection_modes=args.selection_modes,
                     isolated_sequential_processes=True,
@@ -251,7 +262,7 @@ def run_sweep(args, *, run_process=None):
                     checkpoint_policy="reuse existing dense-trained predictor; no training in this sweep",
                     sparse_distribution_shift="side predictor now receives MyPool-compressed/merged inputs; performance requires empirical verification",
                     visualization=False, baseline_accuracy_reference=baseline_reference(args.baseline_acc),
-                    metric_definitions=METRIC_DEFINITIONS, trials=[])
+                    metric_definitions=METRIC_DEFINITIONS, prompt_format=PROMPT_FORMAT, trials=[])
     manifest.update(complete=False, baseline_accuracy_reference=baseline_reference(args.baseline_acc))
     manifest["configuration"] = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     if args.resume:
@@ -340,6 +351,7 @@ def run_worker(args):
     previous = None
     if args.resume and output.exists() and any(output.iterdir()):
         previous = json.loads((output / "run.json").read_text(encoding="utf-8"))
+        require_current_prompt_format(previous)
         validate_configuration(args, previous["configuration"], rate, share, mode)
     input_digest = file_hash(args.input_json)
     checkpoint = args.checkpoint.stat() if args.checkpoint.is_file() else None
@@ -352,7 +364,9 @@ def run_worker(args):
     samples = load_samples(args.input_json, args.data_root)
     if not samples or args.seed + len(samples) > 2**32:
         raise ValueError("Empty samples / invalid per-image seed range")
-    prompts = [resolve_prompt(args.prompt_version, s.category, s.text) for s in samples]
+    # resolve_prompt returns (text, source). Match runner.py: only the text is
+    # passed to generate, never the Python tuple repr with escaped newlines.
+    prompts = [resolve_prompt(args.prompt_version, s.category, s.text)[0] for s in samples]
     backend = LlavaBackend(args.model_path, roi_mode="anyres_max_9", image_token_order="base_first")
     if previous:
         for key in ("model_dtype", "vision_dtype", "attention", "matmul_tf32", "cudnn_tf32",
@@ -384,7 +398,7 @@ def run_worker(args):
     metadata = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     run_metadata = dict(configuration=metadata, inference=backend.inference_config,
         definitions=dict(DEFINITIONS, **METRIC_DEFINITIONS), baseline_accuracy_reference=baseline_reference(args.baseline_acc),
-        method="pool_distill", predictor_training="unchanged dense-input checkpoint",
+        method="pool_distill", prompt_format=PROMPT_FORMAT, predictor_training="unchanged dense-input checkpoint",
         budget_reference="native unpruned packed Base+AnyRes+newlines; per-image baseline",
         actual_budget="recorded per image; integer rounding <200/N percentage points",
         mapping="Base mass-preserving backprojection by normalized actual merge coefficients; bilinear image-coordinate sampling; source-weighted AnyRes average",

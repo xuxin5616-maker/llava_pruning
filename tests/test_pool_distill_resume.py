@@ -18,6 +18,7 @@ from llava_pruning.pool_distill import PoolDistillMethod
 from llava_pruning.pool_distill_budget import hybrid_budget
 from llava_pruning.pool_distill_resume import load_records, read_prefix
 from test_pool_spatial import _Core
+from llava_pruning.prompts import resolve_prompt
 
 
 class ResumeTests(unittest.TestCase):
@@ -54,6 +55,8 @@ class ResumeTests(unittest.TestCase):
                 self.model=SimpleNamespace(get_model=lambda:core)
                 self.inference_config=dict(attention="mock")
             def generate(self,sample,prompt,**kw):
+                assert isinstance(prompt,str)
+                assert prompt == resolve_prompt("v0",sample.category,sample.text)[0]
                 index=int(sample.sample_id)
                 state["calls"].append(index)
                 if index==2 and state["interrupt"]:
@@ -105,13 +108,13 @@ class ResumeTests(unittest.TestCase):
                 entry.run_worker(args)
                 self.assertFalse(state["calls"])  # all samples committed; no warmup or generation
 
-    def test_old_predictions_are_reused_and_missing_budgets_explicitly_reconstructed(self):
+    def test_verified_text_predictions_without_journal_reconstruct_missing_budgets(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
             args,samples=self.fixture(root)
             with self.fake_worker(samples) as state:
                 with self.assertRaises(KeyboardInterrupt): entry.run_worker(args)
-                (root/"output/progress.jsonl").unlink()  # emulate the prior released worker
+                (root/"output/progress.jsonl").unlink()  # missing journal, but prompt format is verified
                 metadata=json.loads((root/"output/run.json").read_text(encoding="utf-8"))
                 metadata.pop("input_json_sha256")
                 metadata.pop("checkpoint_identity")
@@ -168,7 +171,7 @@ class ResumeTests(unittest.TestCase):
         entry.write_json(folder/"metrics.json",metrics)
         entry.write_csv(folder/"summary.csv",[metrics])
         configuration={k:str(v) if isinstance(v,Path) else v for k,v in vars(trial).items()}
-        entry.write_json(folder/"run.json",dict(complete=True,configuration=configuration,inference={}))
+        entry.write_json(folder/"run.json",dict(complete=True,prompt_format=entry.PROMPT_FORMAT,configuration=configuration,inference={}))
         entry.write_text_atomic(folder/"predictions.jsonl","".join(json.dumps(p)+"\n" for p in predictions))
 
     def test_parent_records_sigint_restores_old_args_and_skips_complete_trials(self):
@@ -207,12 +210,42 @@ class ResumeTests(unittest.TestCase):
             changed=short+["--seed","43"]
             with self.assertRaisesRegex(ValueError,"changed --seed"):
                 entry.restore_sweep_args(entry.build_parser().parse_args(changed),changed)
-            # Old released root manifests stored only child commands.
+            # A verified prompt-text run can use the command-only root schema.
             manifest.pop("configuration")
             entry.write_json(root/"output/comparison.json",manifest)
             recovered=entry.restore_sweep_args(entry.build_parser().parse_args(short),short)
             self.assertEqual(recovered.gpu,4)
             self.assertEqual(recovered.lambdas,[.25,.75])
+
+    def test_legacy_tuple_outputs_cannot_be_resumed_or_reused_as_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            args,samples=self.fixture(root)
+            with self.fake_worker(samples,interrupt=False) as state:
+                entry.run_worker(args)
+                args.resume=True
+                worker_path=root/"output/run.json"
+                metadata=json.loads(worker_path.read_text(encoding="utf-8"))
+                metadata.pop("prompt_format")  # actual older outputs have no format marker
+                entry.write_json(worker_path,metadata)
+                before=worker_path.read_bytes()
+                state["calls"].clear()
+                with self.assertRaisesRegex(ValueError,"NEW --output-dir"):
+                    entry.run_worker(args)
+                self.assertFalse(state["calls"])
+                with self.assertRaisesRegex(ValueError,"NEW --output-dir"):
+                    entry.verified_complete(root/"output",args,30,.5,"base_full")
+                self.assertEqual(worker_path.read_bytes(),before)
+            # Parent refuses old roots before rewriting status or spawning.
+            parent_path=root/"output/comparison.json"
+            entry.write_json(parent_path,dict(complete=True,trials=[]))
+            before=parent_path.read_bytes()
+            with patch.object(entry.subprocess,"run",side_effect=AssertionError("No child execution")):
+                with self.assertRaisesRegex(ValueError,"NEW --output-dir"):
+                    entry.run_sweep(args)
+                with self.assertRaisesRegex(ValueError,"NEW --output-dir"):
+                    entry.restore_sweep_args(args,[])
+            self.assertEqual(parent_path.read_bytes(),before)
 
     def test_real_count_reconstruction_does_not_encode_or_invent_observed_rows(self):
         core=_Core()

@@ -16,6 +16,7 @@ import run_pool_distill as entry
 import ablate_attention_predictor as ablation
 from llava_pruning.extended_metrics import extended_metrics
 from llava_pruning.pool_distill_budget import hybrid_budget
+from llava_pruning.prompts import resolve_prompt
 
 
 class PoolDistillMetricTests(unittest.TestCase):
@@ -52,6 +53,7 @@ class PoolDistillMetricTests(unittest.TestCase):
             root = Path(directory)
             args = self.fixture(root, "--baseline-acc", "90")
             self.assertEqual(args.prune_rates, [30,50,70])
+            self.assertEqual(args.lambdas, [.01,.25,.5,.75,.99])
             calls = []
             def child(command, **kwargs):
                 trial = entry.build_parser().parse_args(command[2:])
@@ -69,9 +71,11 @@ class PoolDistillMetricTests(unittest.TestCase):
                 return SimpleNamespace(returncode=0)
             entry.run_sweep(args, run_process=child)
             self.assertEqual(len(calls),30)
+            self.assertEqual({trial.lambdas[0] for trial in calls}, {.01,.25,.5,.75,.99})
             rows = self.read_rows(root / "output/summary.csv")
             self.assertEqual(len(rows),30)
             self.assertEqual({float(r["prune_rate"]) for r in rows}, {30,50,70})
+            self.assertEqual({float(r["distill_share"]) for r in rows}, {.01,.25,.5,.75,.99})
             self.assertTrue(all(float(r["baseline_accuracy"])==.9 for r in rows))
             self.assertTrue(all(abs(float(r["relative_accuracy_pct"])-100*.5/.9)<1e-10 for r in rows))
 
@@ -152,6 +156,11 @@ class PoolDistillMetricTests(unittest.TestCase):
                     self.model=model
                     self.inference_config={"attention":"mock"}
                 def generate(self, sample, prompt, **kwargs):
+                    # Assert the real worker-to-backend interface, not only
+                    # metrics or direct model.generate pruning equivalence.
+                    assert isinstance(prompt, str)
+                    assert prompt == resolve_prompt(args.prompt_version, sample.category, sample.text)[0]
+                    assert "mvtec_v0" not in prompt and "\\n" not in prompt
                     calls.append(kwargs)
                     assert kwargs["method"].active and kwargs["benchmark_metrics"]
                     assert not kwargs["capture_visualization"] and not kwargs["capture_attention"] and not kwargs["do_sample"]
@@ -178,6 +187,8 @@ class PoolDistillMetricTests(unittest.TestCase):
             self.assertEqual(len((root/"output/predictions.jsonl").read_text().splitlines()),5)
             metrics=json.loads((root/"output/metrics.json").read_text(encoding="utf-8"))
             self.assertEqual(metrics["f1"],.5)
+            metadata=json.loads((root/"output/run.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["prompt_format"],entry.PROMPT_FORMAT)
             self.assertFalse(list((root/"output").rglob("*.png")))
 
 

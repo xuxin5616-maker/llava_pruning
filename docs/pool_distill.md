@@ -6,8 +6,23 @@ standalone MyPool and `run.py --method attention_predictor` remain available.
 No training or checkpoint conversion is performed.
 
 Default sweep: whole-image LLM-layer-average removal30/50/70%, lambda
-0/.25/.5/.75/1, both `anyres_self` and `base_full`. ALL input records run.
+.01/.25/.5/.75/.99, both `anyres_self` and `base_full`. ALL input records run.
 MyPool compresses BOTH Base and AnyRes; stage2 protects the remaining Base.
+
+## Prompt-text correction: rerun pre-fix outputs
+
+The hybrid worker previously passed the entire `(prompt_text, source_tag)`
+return value of `resolve_prompt` to the backend. It was formatted as a Python
+tuple string, including quotes, the source tag and literal escaped newlines.
+That changed the model input even at lambda1, despite identical pruning budgets.
+The worker now passes only `resolve_prompt(...)[0]`, matching `runner.py`.
+New root/worker metadata record `prompt_format=resolved_text_v1`.
+
+This affects ALL lambdas, including MyPool-only lambda0. Keep the old outputs
+as records, but rerun intended comparisons in a NEW output directory; adding
+CSV columns cannot correct old answers. Resume refuses output roots or trials
+without the corrected format marker, preventing old/new prompt mixing. New
+corrected runs retain sample-level resume. No predictor retraining is needed.
 
 ## Command
 
@@ -22,17 +37,21 @@ python run_pool_distill.py \
   --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
   --prompt-version v0 \
   --prune-rates 30 50 70 \
-  --lambdas 0 0.25 0.5 0.75 1 \
+  --lambdas 0.01 0.25 0.5 0.75 0.99 \
   --selection-modes anyres_self base_full \
   --baseline-acc 91.18 \
-  --output-dir output/pool_distill_30_50_70_01
+  --output-dir output/pool_distill_lambda_001_099_01
 ```
 
 No edits to training `method.json` are needed. The checkpoint argument is the
 existing best.pt, not a new training directory. All30 configurations execute
 as isolated sequential child processes on this one GPU; each loads the model
-once. Their allocators and side-branch residency are independent. Lambda0 is
-intentionally measured for both sources as a duplicate endpoint control.
+once. Their allocators and side-branch residency are independent. All default
+lambdas now activate BOTH stages: .01 is not MyPool-only, and .99 is not
+distillation-only. The full side branch still executes at .01; its cost is not
+scaled to1% by lambda. Explicit0/1 remain supported for endpoint verification.
+Resume restores the original recorded lambda list; it does not relabel old
+0/1 results as .01/.99. Start a new output directory for the new sweep.
 
 MyPool defaults are the CURRENT supplied script's defaults: redundancy layer26,
 VisionZip attention layer26, T=.05, spatial prior mixing0. Use
@@ -66,11 +85,11 @@ For D28, r30%, ignoring integer rounding:
 
 | lambda | pre contribution | distill contribution | stage2 deletes from remaining |
 |---|---:|---:|---:|
-| 0 |30pp|0pp|0%|
+| .01 |29.7pp|0.3pp|0.46%|
 | .25 |22.5pp|7.5pp|10.42%|
 | .5 |15pp|15pp|19.00%|
 | .75 |7.5pp|22.5pp|26.20%|
-| 1 |0pp|30pp|32.31%|
+| .99 |0.3pp|29.7pp|32.08%|
 
 The original MyPool CLI rate refers to RAW encoder content, not the native
 packed count. The composed method consequently adapts its integer budget:
@@ -120,7 +139,7 @@ would be a separate training change.
 ## Outputs and timing
 
 ```text
-output/pool_distill_30_50_70_01/
+output/pool_distill_lambda_001_099_01/
   comparison.json                       # commands, status, budget definitions
   summary.csv                           #30 rows, three rates x two sources x five lambdas
   prune_30_anyres_self_lambda_0.5/
@@ -181,7 +200,7 @@ Keep the ORIGINAL output directory. After syncing the updated project, run:
 ```bash
 /home/zsl/anaconda3/envs/triad/bin/python run_pool_distill.py \
   --resume \
-  --output-dir output/pool_distill_30_50_70_01
+  --output-dir output/pool_distill_lambda_001_099_01
 ```
 
 This explicitly uses the existing triad interpreter; `conda activate` is not
@@ -192,7 +211,8 @@ model interruption. The log alone cannot identify who sent the signal.
 
 The short resume command restores model/data/checkpoint paths, rates, lambdas,
 sources, seed, warmups, reference ACC and MyPool options from the recorded
-configuration (legacy root manifests use their saved child commands). New CLI
+configuration (command-only root schemas use their saved child commands,
+provided the corrected prompt-format marker is present). New CLI
 defaults do not replace them. Explicit changes to inference options are
 rejected. A GPU override is allowed only with matching worker hardware/software
 configuration; baseline ACC can be changed as a reporting reference.
@@ -210,8 +230,8 @@ A torn trailing journal fragment is discarded on restoration; a corrupt middle
 record, changed ID/GT/order, input content fingerprint or saved checkpoint
 identity causes an error instead of combining incompatible results.
 
-Prior released workers saved answers/Lat/Mem in `predictions.jsonl`, but only
-wrote budgets/summary at trial completion. Resume migrates every complete
+For verified prompt-text outputs without a journal, answers/Lat/Mem can be
+recovered from `predictions.jsonl`. Resume migrates the complete
 prediction prefix, reuses its original answers/timings, and reconstructs the
 deterministic integer budgets from actual image dimensions and recorded
 configuration without model inference. Such rows explicitly have
@@ -219,8 +239,9 @@ configuration without model inference. Such rows explicitly have
 and a separate `planned_layer_token_sum`. New rows use
 `budget_source=observed_generation`. Summary exports `resumed_samples`,
 `fresh_samples`, `budget_reconstructed_samples`, `budget_observed_samples`,
-and `measurement_segments`. Earliest legacy files have no historical content
-fingerprint; that weaker provenance is recorded in `resume_history`.
+and `measurement_segments`. A verified prompt-text file without historical
+content fingerprints records that weaker provenance in `resume_history`.
+Actual pre-fix tuple-prompt outputs are rejected, even when IDs and options match.
 
 Remaining samples use their original `seed + sample_index`; warmups repeat at
 each new measurement segment and are excluded. Original Lat/Mem are not replaced

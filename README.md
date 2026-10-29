@@ -9,8 +9,8 @@ For **MyPool before LLM + the existing distilled block2 predictor**, use:
 ```bash
 python run_pool_distill.py --gpu 5 \
   --checkpoint output/attention_predictor_twig_train_01/best.pt \
-  --prune-rates 30 50 70 --lambdas 0 0.25 0.5 0.75 1 \
-  --baseline-acc 91.18 --output-dir output/pool_distill_30_50_70_01
+  --prune-rates 30 50 70 --lambdas 0.01 0.25 0.5 0.75 0.99 \
+  --baseline-acc 91.18 --output-dir output/pool_distill_lambda_001_099_01
 ```
 
 Both own-AnyRes and Base-mapped sources run, preserving remaining Base after
