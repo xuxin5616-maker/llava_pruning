@@ -25,6 +25,7 @@ def worker_command(args, api, rate, share, mode, gpu, folder):
         "--seed", str(args.seed), "--baseline-acc", str(args.baseline_acc),
         "--allocation-temperature", str(args.allocation_temperature),
         "--spatial-mix-weight", str(args.spatial_mix_weight),
+        "--pruning-audit", args.pruning_audit,
         "--redundancy-layers", *map(str, args.redundancy_layers),
         "--visionzip-layers", *map(str, args.visionzip_layers), "--output-dir", str(folder)]
     if args.resume:
@@ -78,6 +79,7 @@ def run_parallel_sweep(args, *, api, process_factory=None, poll_interval=.2):
             base_policy="MyPool compresses Base + AnyRes; block2 protects remaining Base",
             checkpoint_policy="reuse existing predictor; no training")
     manifest.update(complete=False, gpus=list(args.gpus), isolated_sequential_processes=False,
+        pruning_auxiliary_profile=api.auxiliary_profile(args.pruning_audit),
         execution_mode="independent_single_gpu_trials", max_concurrent_trials=len(args.gpus),
         baseline_accuracy_reference=api.baseline_reference(args.baseline_acc),
         metric_definitions=api.METRIC_DEFINITIONS,

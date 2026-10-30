@@ -20,6 +20,12 @@ per-image budget audits, no sample PNGs. Lambda splits contributions to the
 original whole-image layer-average rate, not two naive sequential percentages.
 [Full command, sparse merge scoring and budget definitions](docs/pool_distill.md).
 
+The hybrid defaults to `--pruning-audit lean`: static shape metadata is prepared
+before Lat and unused diagnostics are not generated. Actual scoring, allocation,
+selection, merging, projection and decoding still count. `full` preserves the old
+auxiliary path; resume never mixes the two timing profiles.
+[MyPool algorithm, execution locations and timing details](docs/mypool_method_and_latency.md).
+
 Interrupted hybrid runs can continue with
 `python run_pool_distill.py --resume --output-dir <original-output-directory>`.
 The original sweep settings are restored, completed trials are verified/skipped,

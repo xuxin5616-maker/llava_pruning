@@ -15,7 +15,7 @@ import runMyPruningPoolSpatial as pool
 from .pool_distill_budget import hybrid_budget, pre_view_budget
 
 
-def source_records(decisions, grid, side=27, final_newline=False):
+def source_records(decisions, grid, side=27, final_newline=False, *, fast=False):
     """Mirror pack_anchor_rows exactly, recording pre-projector linear sources.
 
     A contextual feature is anchor + mean(OTHER), not a convex average. Keep
@@ -28,11 +28,20 @@ def source_records(decisions, grid, side=27, final_newline=False):
     for view, decision in enumerate(decisions):
         dominant, contextual = decision["dominant_indices"], decision["contextual_indices"]
         assignments = decision["cluster_assignments"]
+        if fast:
+            cluster_of = {anchor:cluster for cluster,anchor in enumerate(contextual)}
+            members = [[] for _ in contextual]
+            for source,cluster in enumerate(assignments):
+                if cluster >= 0:
+                    if cluster >= len(contextual):
+                        raise ValueError("Invalid contextual cluster assignment")
+                    members[cluster].append(source)
         for anchor in dominant + contextual:
             sources, weights = [anchor], [1.]
-            if anchor in contextual:
-                cluster = contextual.index(anchor)
-                others = [i for i, slot in enumerate(assignments) if slot == cluster and i != anchor]
+            if anchor in (cluster_of if fast else contextual):
+                cluster = cluster_of[anchor] if fast else contextual.index(anchor)
+                others = ([i for i in members[cluster] if i != anchor] if fast else
+                          [i for i, slot in enumerate(assignments) if slot == cluster and i != anchor])
                 if others:
                     sources += others
                     weights += [1. / len(others)] * len(others)
@@ -106,12 +115,21 @@ def mapped_scores(base_log, base_records, anyres_records, geometry):
 
 
 class PoolDistillAdapter(pool.CustomPruningAdapter):
-    def __init__(self, core, settings, *, rate, share, mode):
+    def __init__(self, core, settings, *, rate, share, mode, lean=False):
         super().__init__(core, settings)
         self.rate, self.share, self.mode = rate, share, mode
         self.plan, self.records = None, None
+        self.lean = lean
+        self._geometry_cache = {}
+        self._prepared_shapes = {}
+        self.prepared = None
+        self.prepared_prompt_split = None
 
     def set_image_context(self, original_size):
+        key = tuple(map(int,original_size))
+        if self.lean and key in self._geometry_cache:
+            self.original_size,self.geometry,self.plan,self.view_plan,self.prepared = self._geometry_cache[key]
+            return
         super().set_image_context(original_size)
         original = pool.baseline_packed_count(self.original_size, self.geometry.grid, 27,
                                              self.core.config.mm_patch_merge_type)
@@ -119,6 +137,17 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         self.plan["raw_grid_height"] = self.geometry.grid[1]
         self.view_plan = pre_view_budget(self.plan, self.geometry.tile_count,
                                         final_newline=self.core.config.mm_patch_merge_type.endswith("_add_newl"))
+        if self.lean:
+            from .pool_lean import prepare_geometry
+            shape_key=(tuple(self.geometry.grid),self.geometry.token_side)
+            if shape_key not in self._prepared_shapes:
+                prepared = prepare_geometry(self.geometry,self.core.image_newline.device)
+                # No spatial-prior template/normalization when its weight is zero.
+                prepared["spatial_prior"] = (pool.center_spatial_prior(729,prepared["base_token_indices"],0.)["spatial_prior"]
+                    if self.settings.spatial_strength else None)
+                self._prepared_shapes[shape_key]=prepared
+            self.prepared=self._prepared_shapes[shape_key]
+            self._geometry_cache[key] = (self.original_size,self.geometry,self.plan,self.view_plan,self.prepared)
 
     def allocate_view_budgets(self, raw_redundancy, first, spatial):
         # Choose an interior point of the ceil interval to avoid FP/Decimal
@@ -130,7 +159,7 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         allocation, probability = pool.allocate_spatial_probability_budgets(
             raw_redundancy, first["base_token_indices"], self.geometry.grid, spatial["spatial_prior"],
             prune_rate=allocator_rate, mix_weight=self.settings.spatial_strength,
-            temperature=self.settings.allocation_temperature, minimum_keep=pool.MINIMUM_CROP_KEEP)
+            temperature=self.settings.allocation_temperature, minimum_keep=pool.MINIMUM_CROP_KEEP,audit=not self.lean)
         if allocation["target_anyres_keep"] != target:
             raise RuntimeError("MyPool allocator changed the exact hybrid AnyRes target")
         keep = self.view_plan["base_keep"]
@@ -138,21 +167,46 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         return allocation, probability, dominant, keep - dominant
 
     def encode_images(self, images):
-        packed = super().encode_images(images)
-        self.records = source_records(self.decisions, self.geometry.grid,
-                                      final_newline=self.core.config.mm_patch_merge_type.endswith("_add_newl"))
+        if self.lean:
+            from .pool_lean import encode,export_source_decisions
+            packed = encode(self,images)
+            if self.mode == "base_full":
+                self.decisions = export_source_decisions(self.device_decisions)
+                self.records = source_records(self.decisions,self.geometry.grid,
+                    final_newline=self.core.config.mm_patch_merge_type.endswith("_add_newl"),fast=True)
+            else:
+                # Only roles are needed for own-AnyRes scoring; do not construct
+                # unused original-source lists/weights for every merged token.
+                self.records = [None if role==2 else dict(view=role) for role in self.roles.cpu().tolist()]
+                self.decisions = []
+        else:
+            packed = super().encode_images(images)
+            self.records = source_records(self.decisions, self.geometry.grid,
+                                          final_newline=self.core.config.mm_patch_merge_type.endswith("_add_newl"))
         if len(self.records) != packed.shape[0] or packed.shape[0] != self.plan["pre_llm_tokens"]:
             raise RuntimeError("Sparse provenance / pre-LLM budget / packed features disagree")
         # The shared CLSE engine physically drops at this boundary keep ratio.
         self.core.clse_keep_ratio = self.plan["final_llm_tokens"] / self.plan["pre_llm_tokens"]
         return packed
 
+    def pack(self,image_features,image_sizes,modalities):
+        if not self.lean:
+            return super().pack(image_features,image_sizes,modalities)
+        if len(image_features)!=1 or len(image_sizes)!=1 or list(modalities)!=["image"]:
+            raise ValueError("Lean hybrid requires one image")
+        if image_features[0].ndim!=2 or image_features[0].shape[0]!=self.plan["pre_llm_tokens"]:
+            raise RuntimeError("Lean packed image violates the exact pre-LLM budget")
+        return image_features
+
     def attach_layout(self, input_ids):
         from llava.constants import IMAGE_TOKEN_INDEX
-        placeholders = (input_ids[0] == IMAGE_TOKEN_INDEX).nonzero(as_tuple=False).flatten()
-        if len(placeholders) != 1:
-            raise ValueError("Hybrid requires one image placeholder")
-        start = int(placeholders[0])
+        if self.lean and self.prepared_prompt_split is not None:
+            start = self.prepared_prompt_split
+        else:
+            placeholders = (input_ids[0] == IMAGE_TOKEN_INDEX).nonzero(as_tuple=False).flatten()
+            if len(placeholders) != 1:
+                raise ValueError("Hybrid requires one image placeholder")
+            start = int(placeholders[0])
         self.spatial = [i for i, record in enumerate(self.records) if record is not None]
         self.base = [i for i in self.spatial if self.records[i]["view"] == 0]
         self.anyres = [i for i in self.spatial if self.records[i]["view"] != 0]
@@ -196,15 +250,29 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
 class PoolDistillMethod:
     name = "pool_distill"
 
-    def __init__(self, core, checkpoint, *, rate, share, mode, settings):
+    def __init__(self, core, checkpoint, *, rate, share, mode, settings, pruning_audit="lean"):
         if mode not in {"base_full", "anyres_self"}:
             raise ValueError("Choose base_full or anyres_self")
         from .attention_predictor import AttentionPredictorMethod
         self.native = AttentionPredictorMethod(checkpoint, (rate,), frozenset(), selection_mode=mode)
-        self.adapter = PoolDistillAdapter(core, settings, rate=rate, share=share, mode=mode)
+        if pruning_audit not in {"lean","full"}:
+            raise ValueError("pruning_audit must be lean or full")
+        self.adapter = PoolDistillAdapter(core, settings, rate=rate, share=share, mode=mode,lean=pruning_audit=="lean")
         self.rate, self.share, self.mode = rate, share, mode
 
+    def prepare_inputs(self, original_size, tokens):
+        """Static geometry/prompt metadata belongs to input preparation, before Lat."""
+        if not self.adapter.lean or self.share == 1 or self.rate == 0:
+            return
+        from llava.constants import IMAGE_TOKEN_INDEX
+        positions = (tokens[0]==IMAGE_TOKEN_INDEX).nonzero(as_tuple=False).flatten()
+        if len(positions)!=1:
+            raise ValueError("Hybrid requires one image placeholder")
+        self.adapter.prepared_prompt_split = int(positions[0])
+        self.adapter.set_image_context(original_size)
+
     def configure(self, core, rate, **capture):
+        self.adapter.prepared_prompt_split = None
         if rate != self.rate:
             raise ValueError("Wrong runtime hybrid rate")
         if any(capture.values()):

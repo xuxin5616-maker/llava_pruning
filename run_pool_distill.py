@@ -20,7 +20,7 @@ import time
 
 from llava_pruning.extended_metrics import EXTRA_FIELDS, METRIC_DEFINITIONS, extended_metrics
 from llava_pruning.pool_distill_resume import (COMMON_FIELDS, TIMING_FIELDS, file_hash,
-    load_records, read_prefix, same_setting, validate_configuration, validate_prediction)
+    load_records, read_prefix, same_setting, validate_configuration, validate_prediction, auxiliary_profile)
 
 PROJECT = Path(__file__).resolve().parent
 PROMPT_FORMAT = "resolved_text_v1"
@@ -50,6 +50,8 @@ def build_parser():
     parser.add_argument("--visionzip-layers", type=int, nargs="+", default=[26])
     parser.add_argument("--allocation-temperature", type=float, default=.05)
     parser.add_argument("--spatial-mix-weight", type=float, default=0., help="MyPool spatial prior weight; independent of --lambdas")
+    parser.add_argument("--pruning-audit",choices=("lean","full"),default="lean",
+                        help="lean removes unused pre-LLM diagnostics and prepares static geometry before Lat; full preserves the old audit path")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--baseline-acc", type=float, default=91.18,
@@ -145,6 +147,8 @@ def restore_sweep_args(args, argv):
             # Earliest legacy manifests/commands predate this reporting option.
             if name == "baseline_acc":
                 value = 91.18
+            elif name == "pruning_audit":
+                value = "full"
             else:
                 raise ValueError(f"Saved sweep is missing {name}")
         flag = "--" + name.replace("_", "-")
@@ -284,6 +288,7 @@ def run_sweep(args, *, run_process=None, process_factory=None):
                     visualization=False, baseline_accuracy_reference=baseline_reference(args.baseline_acc),
                     metric_definitions=METRIC_DEFINITIONS, prompt_format=PROMPT_FORMAT, trials=[])
     manifest.update(complete=False, baseline_accuracy_reference=baseline_reference(args.baseline_acc),
+                    pruning_auxiliary_profile=auxiliary_profile(args.pruning_audit),
                     gpus=[args.gpu], isolated_sequential_processes=True,
                     execution_mode="independent_single_gpu_trials", max_concurrent_trials=1)
     manifest["configuration"] = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
@@ -319,6 +324,7 @@ def run_sweep(args, *, run_process=None, process_factory=None):
                            "--seed", str(args.seed), "--baseline-acc", str(args.baseline_acc),
                            "--allocation-temperature", str(args.allocation_temperature),
                            "--spatial-mix-weight", str(args.spatial_mix_weight),
+                           "--pruning-audit",args.pruning_audit,
                            "--redundancy-layers", *map(str, args.redundancy_layers),
                            "--visionzip-layers", *map(str, args.visionzip_layers), "--output-dir", str(trial_dir)]
                 if args.resume:
@@ -401,7 +407,8 @@ def run_worker(args):
     settings = MethodSettings(prune_rate=0, redundancy_layers=tuple(args.redundancy_layers),
         visionzip_layers=tuple(args.visionzip_layers), allocation_temperature=args.allocation_temperature,
         spatial_strength=args.spatial_mix_weight)
-    method = PoolDistillMethod(core, args.checkpoint, rate=rate, share=share, mode=mode, settings=settings)
+    method = PoolDistillMethod(core, args.checkpoint, rate=rate, share=share, mode=mode, settings=settings,
+                              pruning_audit=args.pruning_audit)
     # Feasibility checks do not score images, skip records, or loosen budgets.
     if share == 1:
         method.native.validate_input_budgets(backend, samples, {rate: method.native.resolve_budget(rate, len(core.layers))})
@@ -419,6 +426,10 @@ def run_worker(args):
     output.mkdir(parents=True, exist_ok=True)
     metadata = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     run_metadata = dict(configuration=metadata, inference=backend.inference_config,
+        pruning_auxiliary_profile=auxiliary_profile(args.pruning_audit),
+        latency_policy="resident prepared inputs -> first token; actual pruning scoring/selection/merging INCLUDED; no subtraction",
+        auxiliary_policy=("static shape/budget/bin/prior metadata prepared before generate; unused diagnostic maps/lists are not produced"
+                          if args.pruning_audit=="lean" else "legacy full diagnostic preparation inside generate"),
         definitions=dict(DEFINITIONS, **METRIC_DEFINITIONS), baseline_accuracy_reference=baseline_reference(args.baseline_acc),
         method="pool_distill", prompt_format=PROMPT_FORMAT, predictor_training="unchanged dense-input checkpoint",
         budget_reference="native unpruned packed Base+AnyRes+newlines; per-image baseline",
@@ -502,6 +513,7 @@ def run_worker(args):
     metrics = accuracy.result(rate, complete=True)
     metrics.pop("rule", None)
     metrics.update(selection_mode=mode, distill_share=share, gpu_id=args.gpu, warmup_samples=len(warmups),
+                   pruning_auxiliary_profile=auxiliary_profile(args.pruning_audit),
                    resumed_samples=resumed_samples, fresh_samples=len(samples)-resumed_samples,
                    budget_reconstructed_samples=sum(row.get("budget_source")=="legacy_reconstructed_counts" for row in budgets),
                    budget_observed_samples=sum(row.get("budget_source")!="legacy_reconstructed_counts" for row in budgets),

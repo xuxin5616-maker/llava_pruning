@@ -249,6 +249,9 @@ class LlavaBackend:
             method.validate_token_boundary(tokens, self.tokenizer, IMAGE_TOKEN_INDEX, rate,
                                            use_im_end=getattr(self.model.config, "mm_use_im_start_end", False))
 
+        if hasattr(method,"prepare_inputs"):
+            method.prepare_inputs(image.size,tokens)
+
         # Match SimpleModelWorker's context budget, including its base-view
         # patch count approximation (not a newly chosen anyres token budget).
         max_new_tokens = min(

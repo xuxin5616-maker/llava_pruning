@@ -378,7 +378,8 @@ class TokenDecisions:
 
 
 
-def compress_tokens(features, scores, metric, dominant_count, contextual_count):
+def compress_tokens(features, scores, metric, dominant_count, contextual_count, *, audit=True, validate=True,
+                    source_provenance=True, spatial_indices=None):
     """Return compressed [B,D+C,F] and JSON-safe decisions for each view.
 
     features [B,N,F], scores [B,N], metric [B,N,K]. Dominant top-k features
@@ -394,14 +395,14 @@ def compress_tokens(features, scores, metric, dominant_count, contextual_count):
     Feature computation never casts or moves tensors, preserving source FP16
     arithmetic. Source has no key-norm epsilon: invalid norms fail clearly.
     """
-    dominant_count, contextual_count = _validate_inputs(
-        features, scores, metric, dominant_count, contextual_count
-    )
+    if validate:
+        dominant_count, contextual_count = _validate_inputs(
+            features, scores, metric, dominant_count, contextual_count)
     batch, token_count, feature_dim = features.shape
     ranked = scores.topk(dominant_count, dim=1).indices
     mask = torch.ones((batch, token_count), dtype=torch.bool, device=features.device)
     mask.scatter_(1, ranked, False)
-    spatial = torch.arange(token_count, device=features.device).expand(batch, -1)
+    spatial = (torch.arange(token_count, device=features.device) if spatial_indices is None else spatial_indices).expand(batch, -1)
     dominant_indices = spatial[~mask].view(batch, dominant_count)
     full_selection = dominant_count == token_count and contextual_count == 0
     dominant_features = (features if full_selection else
@@ -409,7 +410,8 @@ def compress_tokens(features, scores, metric, dominant_count, contextual_count):
     remaining_count = token_count - dominant_count
     remaining_indices = spatial[mask].view(batch, remaining_count)
     filtered_features = features.masked_select(mask.unsqueeze(-1)).view(batch, remaining_count, feature_dim)
-    assignments = torch.full((batch, token_count), -1, device=features.device, dtype=torch.long)
+    assignments = (torch.full((batch, token_count), -1, device=features.device, dtype=torch.long)
+                   if audit or source_provenance else None)
     contextual_indices = spatial[:, :0]
     merged_indices = spatial[:, :0]
     merge_counts = features.new_empty((batch, 0))
@@ -439,14 +441,23 @@ def compress_tokens(features, scores, metric, dominant_count, contextual_count):
         counts = merge_counts.clamp(min=1).unsqueeze(-1)
         aggregated = torch.bmm(one_hot.transpose(1, 2), filtered_features[:, non_anchor_mask, :]) / counts
         contextual_features = filtered_features[:, anchors, :] + aggregated
-        assignments.scatter_(1, contextual_indices, torch.arange(contextual_count, device=features.device).expand(batch, -1))
-        assignments.scatter_(1, merged_indices, cluster)
+        if assignments is not None:
+            assignments.scatter_(1, contextual_indices, torch.arange(contextual_count, device=features.device).expand(batch, -1))
+            assignments.scatter_(1, merged_indices, cluster)
 
     # Preserve the original tensor, layout and storage offset at full retention.
     compressed = (features if full_selection else
                   _match_feature_memory_order(torch.cat((dominant_features, contextual_features), dim=1), features))
     if not bool(torch.isfinite(compressed).all()):
         raise ValueError("VisionZip feature aggregation produced non-finite values")
+    if not audit:
+        # Inference-only decisions stay on the GPU. No scores/features or
+        # diagnostic lists are copied to CPU just to build JSON-safe records.
+        return compressed, [dict(original_token_count=token_count,
+            retained_token_count=dominant_count+contextual_count,
+            dominant_indices=dominant_indices[i], contextual_indices=contextual_indices[i],
+            cluster_assignments=assignments[i] if assignments is not None else None, dominant_count=dominant_count,
+            contextual_count=contextual_count) for i in range(batch)]
     # Transfer metadata only after processing all views together.
     ranked_cpu = ranked.detach().cpu().tolist()
     dominant_cpu = dominant_indices.detach().cpu().tolist()
@@ -1283,10 +1294,14 @@ def visionzip_generation(model, adapter):
                  else torch.ones_like(input_ids[0], dtype=torch.bool))
         prompt_ids = input_ids[0][valid]
         from llava.constants import IMAGE_TOKEN_INDEX
-        placeholders = torch.where(prompt_ids == IMAGE_TOKEN_INDEX)[0]
-        if placeholders.numel() != 1:
-            raise ValueError("Prompt must contain exactly one unmasked <image> placeholder")
-        split = int(placeholders.item())
+        prepared_split = getattr(adapter,"prepared_prompt_split",None) if getattr(adapter,"lean",False) else None
+        if prepared_split is not None and attention_mask is None:
+            split = prepared_split
+        else:
+            placeholders = torch.where(prompt_ids == IMAGE_TOKEN_INDEX)[0]
+            if placeholders.numel() != 1:
+                raise ValueError("Prompt must contain exactly one unmasked <image> placeholder")
+            split = int(placeholders.item())
         # At rate=0 this still calls VisionZip scoring/selection/projector/packing.
         # No fallback to the original multimodal implementation on image prefill.
         adapter.set_image_context(image_sizes[0])
@@ -1355,8 +1370,14 @@ def allocation_temperature_argument(value):
 
 
 
-def _redundancy_unit_vectors(values, description):
+def _redundancy_unit_vectors(values, description, *, compact_checks=False):
     """Return true unit vectors, rejecting undefined directions explicitly."""
+    if compact_checks:
+        norms = torch.linalg.vector_norm(values, ord=2, dim=-1, keepdim=True)
+        valid = torch.isfinite(values).all() & torch.isfinite(norms).all() & (norms > 0).all()
+        if not bool(valid):
+            raise ValueError(f"{description} contain non-finite or zero-norm vectors")
+        return values / norms
     if not bool(torch.isfinite(values).all().item()):
         raise ValueError(f"{description} contain non-finite values")
     norms = torch.linalg.vector_norm(values, ord=2, dim=-1, keepdim=True)
@@ -1367,7 +1388,7 @@ def _redundancy_unit_vectors(values, description):
     return values / norms
 
 
-def pooled_crop_redundancy(features, grid, reduction="mean"):
+def pooled_crop_redundancy(features, grid, reduction="mean", *, audit=True, prepared=None):
     """Score each AnyRes crop by two internal pooled-token cosine groups.
 
     ``features`` is [1 + width * height, N, D], ordered Base first, then
@@ -1408,11 +1429,11 @@ def pooled_crop_redundancy(features, grid, reduction="mean"):
 
     # Casting/detaching does not change the caller's input, even if it is FP32.
     token_unit = _redundancy_unit_vectors(
-        features.detach().to(dtype=torch.float32), "input feature tokens"
+        features.detach().to(dtype=torch.float32), "input feature tokens", compact_checks=not audit
     )
     anyres_tokens = token_unit[1:]
     anyres_pool_unit = _redundancy_unit_vectors(
-        anyres_tokens.mean(dim=1), "AnyRes pooled features"
+        anyres_tokens.mean(dim=1), "AnyRes pooled features", compact_checks=not audit
     )
     anyres_similarity = (anyres_tokens * anyres_pool_unit[:, None, :]).sum(dim=-1).clamp(-1.0, 1.0)
     anyres_similarity_sum = anyres_similarity.sum(dim=1)
@@ -1421,28 +1442,35 @@ def pooled_crop_redundancy(features, grid, reduction="mean"):
     base_token_indices = []
     base_pools = []
     base_sums = []
-    base_similarity_map = torch.empty(token_count, dtype=torch.float32, device=features.device)
+    base_similarity_map = torch.empty(token_count, dtype=torch.float32, device=features.device) if audit else None
     for crop in range(crop_count):
         crop_row, crop_col = divmod(crop, grid_width)
         row_start, col_start = crop_row * bin_height, crop_col * bin_width
         row_end = side if crop_row == grid_height - 1 else row_start + bin_height
         col_end = side if crop_col == grid_width - 1 else col_start + bin_width
-        indices = [row * side + col
-                   for row in range(row_start, row_end)
-                   for col in range(col_start, col_end)]
+        if prepared is not None:
+            if prepared["grid"] != tuple(grid) or prepared["side"] != side:
+                raise ValueError("Prepared Base bins disagree with actual geometry")
+            indices = prepared["base_token_indices"][crop]
+            index_tensor = prepared["base_index_tensors"][crop]
+        else:
+            indices = [row * side + col
+                       for row in range(row_start, row_end)
+                       for col in range(col_start, col_end)]
+            index_tensor = torch.tensor(indices, dtype=torch.long, device=features.device)
         base_token_indices.append(indices)
-        index_tensor = torch.tensor(indices, dtype=torch.long, device=features.device)
         region_tokens = token_unit[0].index_select(0, index_tensor)
         region_pool_unit = _redundancy_unit_vectors(
-            region_tokens.mean(dim=0), f"Base pooled feature for crop {crop}"
+            region_tokens.mean(dim=0), f"Base pooled feature for crop {crop}", compact_checks=not audit
         )
         similarity = (region_tokens * region_pool_unit).sum(dim=-1).clamp(-1.0, 1.0)
-        base_similarity_map.index_copy_(0, index_tensor, similarity)
-        base_pools.append(region_pool_unit)
+        if audit:
+            base_similarity_map.index_copy_(0, index_tensor, similarity)
+            base_pools.append(region_pool_unit)
         base_sums.append(similarity.sum())
 
     base_similarity_sum = torch.stack(base_sums)
-    base_token_counts = torch.tensor(
+    base_token_counts = prepared["base_token_counts"] if prepared is not None else torch.tensor(
         [len(indices) for indices in base_token_indices],
         dtype=torch.long,
         device=features.device,
@@ -1456,6 +1484,9 @@ def pooled_crop_redundancy(features, grid, reduction="mean"):
     redundancy = base_redundancy + anyres_redundancy
     if not bool(torch.isfinite(redundancy).all().item()):
         raise ValueError("pooled-cosine redundancy produced non-finite scores")
+    if not audit:
+        return dict(redundancy=redundancy, base_token_counts=base_token_counts,
+                    base_token_indices=base_token_indices)
     return {
         "redundancy": redundancy,
         "base_similarity_sum": base_similarity_sum,
@@ -2278,7 +2309,7 @@ def _bounded_temperature_extras(score_sums, temperature, total, capacity):
 
 
 def allocate_crop_budgets(base_scores, grid, tokens_per_crop=729,
-                          prune_rate=70, temperature=DEFAULT_ALLOCATION_TEMPERATURE, minimum_keep=0):
+                          prune_rate=70, temperature=DEFAULT_ALLOCATION_TEMPERATURE, minimum_keep=0, *, audit=True):
     """Temperature-only custom budget mapping with hard bounds and exact total.
 
     Reserve L slots for every crop, then distribute B-M*L extra slots according
@@ -2352,6 +2383,11 @@ def allocate_crop_budgets(base_scores, grid, tokens_per_crop=729,
     floors = [minimum_keep+value for value in extra_floors]
     if sum(kept)!=target or any(not minimum_keep<=value<=capacity for value in kept):
         raise RuntimeError("Crop allocation violated its hard bounds or aggregate budget")
+    if not audit:
+        return dict(target_anyres_keep=target, crops=[dict(keep=int(value)) for value in kept],
+                    softmax_weights=probabilities, softmax_shifted_scores=shifted,
+                    crop_score_sums=score_sums, tokens_per_crop=capacity, minimum_keep=minimum_keep,
+                    extra_token_budget=extra_target)
     effective = extras/extra_target if extra_target else np.zeros(count)
     crops = []
     for i in range(count):
@@ -2445,7 +2481,7 @@ def _bounded_mixed_probability_extras(log_probabilities, raw_scores, temperature
 
 def allocate_spatial_probability_budgets(raw_redundancy, base_token_indices, grid, spatial_prior,
                                        *, prune_rate=70, temperature=DEFAULT_ALLOCATION_TEMPERATURE,
-                                       mix_weight=0.0, minimum_keep=MINIMUM_CROP_KEEP, tokens_per_crop=729):
+                                       mix_weight=0.0, minimum_keep=MINIMUM_CROP_KEEP, tokens_per_crop=729, audit=True):
     """p=(1-lambda)*softmax(-R/T)+lambda*P/sum(P), then bounded quotas.
 
     lambda=0 returns the ORIGINAL allocator result, without reconstructing or
@@ -2462,7 +2498,9 @@ def allocate_spatial_probability_budgets(raw_redundancy, base_token_indices, gri
     legacy_scores_after = scores_before + np.zeros_like(scores_before)
     base_map = redundancy_to_base_map(-legacy_scores_after, base_token_indices, tokens_per_crop)
     baseline = allocate_crop_budgets(base_map, grid, tokens_per_crop=tokens_per_crop,
-                                    prune_rate=prune_rate, temperature=temperature, minimum_keep=minimum_keep)
+                                    prune_rate=prune_rate, temperature=temperature, minimum_keep=minimum_keep, audit=audit)
+    if not audit and mix_weight == 0:
+        return baseline, {}
     p_r = np.asarray(baseline["softmax_weights"], dtype=np.float64)
     prior = np.asarray(spatial_prior)
     if (prior.ndim != 1 or prior.shape != p_r.shape or prior.dtype.kind not in "fiu"
@@ -2516,6 +2554,8 @@ def allocate_spatial_probability_budgets(raw_redundancy, base_token_indices, gri
     effective = extras / extra_target if extra_target else np.zeros(len(p_r))
     if sum(keeps) != target or any(not lower <= value <= capacity for value in keeps):
         raise RuntimeError("Probability fusion violated hard bounds or exact total")
+    if not audit:
+        return dict(target_anyres_keep=target, crops=[dict(keep=int(value)) for value in keeps]), {}
     result = dict(baseline)
     crops = []
     for i, old in enumerate(baseline["crops"]):

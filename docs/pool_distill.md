@@ -1,5 +1,10 @@
 # MyPool + attention distillation
 
+当前混合入口默认使用 `--pruning-audit lean`：固定几何/预算元数据在Lat前准备，
+不生成无用统计热图和完整诊断数组；实际评分、选择、合并、投影、LLM及蒸馏仍计时。
+`--pruning-audit full` 保留旧辅助路径。旧输出续跑默认继承full，不混合两种Lat。
+详见[前置方法完整说明、代码位置与计时变化](mypool_method_and_latency.md)。
+
 `run_pool_distill.py` combines the supplied `runMyPruningPoolSpatial.py` with
 the existing block2 side predictor. This is a new results-only entry; the
 standalone MyPool and `run.py --method attention_predictor` remain available.
