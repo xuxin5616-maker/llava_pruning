@@ -1,5 +1,8 @@
 # Attention Predictor：蒸馏方法与旁路结构详解
 
+后续推理消融（沿用训练checkpoint）：[末尾删图与Base＋Text旁路](pool_distill_ablations.md)。
+这些实验不修改本文的教师、学生权重结构或蒸馏训练目标。
+
 你说的是我们之前做的 **`attention_predictor`：在主模型第2层后，用三层旁路预测第22层 attention，再据此剪枝**。
 
 我核对了当前本地代码。先强调两个容易混淆的地方：

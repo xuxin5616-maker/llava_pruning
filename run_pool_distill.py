@@ -20,7 +20,9 @@ import time
 
 from llava_pruning.extended_metrics import EXTRA_FIELDS, METRIC_DEFINITIONS, extended_metrics
 from llava_pruning.pool_distill_resume import (COMMON_FIELDS, TIMING_FIELDS, file_hash,
-    load_records, read_prefix, same_setting, validate_configuration, validate_prediction, auxiliary_profile)
+    load_records, read_prefix, same_setting, validate_configuration, validate_prediction, auxiliary_profile,
+    OPTION_DEFAULTS)
+from llava_pruning.pool_ablation_report import summary_rows
 
 PROJECT = Path(__file__).resolve().parent
 PROMPT_FORMAT = "resolved_text_v1"
@@ -52,6 +54,12 @@ def build_parser():
     parser.add_argument("--spatial-mix-weight", type=float, default=0., help="MyPool spatial prior weight; independent of --lambdas")
     parser.add_argument("--pruning-audit",choices=("lean","full"),default="lean",
                         help="lean removes unused pre-LLM diagnostics and prepares static geometry before Lat; full preserves the old audit path")
+    parser.add_argument("--tail-drop-layers", type=int, choices=(0, 2, 3, 4), default=0,
+                        help="Extra ablation: remove all remaining image tokens before the last N LLM blocks")
+    parser.add_argument("--predictor-input", choices=("full", "base_text"), default="full",
+                        help="Side branch context only; base_text excludes AnyRes/newlines and keeps original position IDs")
+    parser.add_argument("--summary-format", choices=("full", "compact"), default="full",
+                        help="compact: config,tp,fp,tn,fn,acc(percent),Lat(ms),mem(allocated GiB)")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--baseline-acc", type=float, default=91.18,
@@ -110,6 +118,10 @@ def validate(args):
         raise ValueError("Invalid GPU / warmup / seed")
     if len(set(args.selection_modes)) != len(args.selection_modes):
         raise ValueError("Duplicate selection modes")
+    if args.predictor_input == "base_text" and args.selection_modes != ["base_full"]:
+        raise ValueError("base_text side input requires --selection-modes base_full")
+    if (args.tail_drop_layers or args.predictor_input == "base_text") and any(s == 0 for s in args.lambdas):
+        raise ValueError("These ablations require an active distilled stage (lambda > 0)")
     if not math.isfinite(args.allocation_temperature) or args.allocation_temperature <= 0 or not 0 <= args.spatial_mix_weight <= 1:
         raise ValueError("Invalid MyPool temperature / spatial weight")
     for layers in (args.redundancy_layers, args.visionzip_layers):
@@ -141,13 +153,15 @@ def restore_sweep_args(args, argv):
         command = manifest["trials"][0]["command"]
         saved = vars(build_parser().parse_args(command[command.index("--worker"):]))
     explicit = {arg.split("=", 1)[0] for arg in argv if arg.startswith("--")}
-    for name in (*COMMON_FIELDS, "gpu", "baseline_acc", "prune_rates", "lambdas", "selection_modes"):
+    for name in (*COMMON_FIELDS, "gpu", "baseline_acc", "prune_rates", "lambdas", "selection_modes", "summary_format"):
         value = manifest.get(name, saved.get(name))
         if value is None:
             # Earliest legacy manifests/commands predate this reporting option.
             if name == "baseline_acc":
                 value = 91.18
-            elif name == "pruning_audit":
+            elif name in OPTION_DEFAULTS:
+                value = OPTION_DEFAULTS[name]
+            elif name == "summary_format":
                 value = "full"
             else:
                 raise ValueError(f"Saved sweep is missing {name}")
@@ -171,7 +185,9 @@ def read_trial_rows(folder, rate, share, mode, baseline_acc):
     if metrics_path.is_file():
         row = extended_metrics(json.loads(metrics_path.read_text(encoding="utf-8")), baseline_acc / 100)
         write_json(metrics_path, row)
-        write_csv(folder / "summary.csv", [row])
+        run_path = folder / "run.json"
+        config = json.loads(run_path.read_text(encoding="utf-8")).get("configuration", {}) if run_path.is_file() else {}
+        write_csv(folder / "summary.csv", summary_rows([row], config.get("summary_format", "full")))
     else:
         with (folder / "summary.csv").open(encoding="utf-8-sig", newline="") as stream:
             rows = list(csv.DictReader(stream))
@@ -254,10 +270,11 @@ def rebuild_reports(directory, baseline_acc=91.18):
     if not pending:
         raise ValueError("No verified complete hybrid trials to update")
     for folder, metrics, run in pending:
-        write_csv(folder / "summary.csv", [metrics])
+        write_csv(folder / "summary.csv", summary_rows([metrics], run.get("configuration", {}).get("summary_format", "full")))
         write_json(folder / "metrics.json", metrics)
         write_json(folder / "run.json", run)
-    write_csv(root / "summary.csv", [metrics for _, metrics, _ in pending])
+    write_csv(root / "summary.csv", summary_rows([metrics for _, metrics, _ in pending],
+              manifest.get("configuration", {}).get("summary_format", "full")))
     manifest["baseline_accuracy_reference"] = reference
     manifest["metric_definitions"] = METRIC_DEFINITIONS
     manifest["report_updated_utc"] = datetime.now(timezone.utc).isoformat()
@@ -312,7 +329,7 @@ def run_sweep(args, *, run_process=None, process_factory=None):
                         trial = dict(rate=rate, distill_share=share, selection_mode=mode, directory=str(trial_dir))
                         manifest["trials"].append(trial)
                     trial.update(status="complete", reused=True)
-                    write_csv(output / "summary.csv", combined)
+                    write_csv(output / "summary.csv", summary_rows(combined, args.summary_format))
                     write_json(manifest_path, manifest)
                     print(f"Skipping verified complete trial: {tag}", flush=True)
                     continue
@@ -325,6 +342,8 @@ def run_sweep(args, *, run_process=None, process_factory=None):
                            "--allocation-temperature", str(args.allocation_temperature),
                            "--spatial-mix-weight", str(args.spatial_mix_weight),
                            "--pruning-audit",args.pruning_audit,
+                           "--tail-drop-layers",str(args.tail_drop_layers),
+                           "--predictor-input",args.predictor_input,"--summary-format",args.summary_format,
                            "--redundancy-layers", *map(str, args.redundancy_layers),
                            "--visionzip-layers", *map(str, args.visionzip_layers), "--output-dir", str(trial_dir)]
                 if args.resume:
@@ -342,7 +361,7 @@ def run_sweep(args, *, run_process=None, process_factory=None):
                     if completed.returncode:
                         raise RuntimeError(f"{tag} exited with code{completed.returncode}; see traceback above")
                     combined.extend(read_trial_rows(trial_dir, rate, share, mode, args.baseline_acc))
-                    write_csv(output / "summary.csv", combined)
+                    write_csv(output / "summary.csv", summary_rows(combined, args.summary_format))
                 except KeyboardInterrupt:
                     trial.update(status="interrupted", error="SIGINT / KeyboardInterrupt; resume the same output directory")
                     write_json(manifest_path, manifest)
@@ -408,7 +427,8 @@ def run_worker(args):
         visionzip_layers=tuple(args.visionzip_layers), allocation_temperature=args.allocation_temperature,
         spatial_strength=args.spatial_mix_weight)
     method = PoolDistillMethod(core, args.checkpoint, rate=rate, share=share, mode=mode, settings=settings,
-                              pruning_audit=args.pruning_audit)
+                              pruning_audit=args.pruning_audit, tail_drop_layers=args.tail_drop_layers,
+                              predictor_input=args.predictor_input)
     # Feasibility checks do not score images, skip records, or loosen budgets.
     if share == 1:
         method.native.validate_input_budgets(backend, samples, {rate: method.native.resolve_budget(rate, len(core.layers))})
@@ -430,6 +450,10 @@ def run_worker(args):
         latency_policy="resident prepared inputs -> first token; actual pruning scoring/selection/merging INCLUDED; no subtraction",
         auxiliary_policy=("static shape/budget/bin/prior metadata prepared before generate; unused diagnostic maps/lists are not produced"
                           if args.pruning_audit=="lean" else "legacy full diagnostic preparation inside generate"),
+        ablation=dict(tail_drop_layers=args.tail_drop_layers, predictor_input=args.predictor_input,
+            tail_budget_policy="extra removal; original two-stage budgets unchanged",
+            tail_cache_policy="earlier layers retain image KV; final layers encode/decode text only",
+            side_input_policy="Base+Text means selecting H2 rows, preserving position IDs; H2 already contains multimodal information"),
         definitions=dict(DEFINITIONS, **METRIC_DEFINITIONS), baseline_accuracy_reference=baseline_reference(args.baseline_acc),
         method="pool_distill", prompt_format=PROMPT_FORMAT, predictor_training="unchanged dense-input checkpoint",
         budget_reference="native unpruned packed Base+AnyRes+newlines; per-image baseline",
@@ -513,6 +537,7 @@ def run_worker(args):
     metrics = accuracy.result(rate, complete=True)
     metrics.pop("rule", None)
     metrics.update(selection_mode=mode, distill_share=share, gpu_id=args.gpu, warmup_samples=len(warmups),
+                   tail_drop_layers=args.tail_drop_layers, predictor_input=args.predictor_input,
                    pruning_auxiliary_profile=auxiliary_profile(args.pruning_audit),
                    resumed_samples=resumed_samples, fresh_samples=len(samples)-resumed_samples,
                    budget_reconstructed_samples=sum(row.get("budget_source")=="legacy_reconstructed_counts" for row in budgets),
@@ -524,7 +549,7 @@ def run_worker(args):
         metrics[key] = statistics.mean(row[key] for row in budgets)
     metrics = extended_metrics(metrics, args.baseline_acc / 100)
     write_csv(output / "budgets.csv", budgets)
-    write_csv(output / "summary.csv", [metrics])
+    write_csv(output / "summary.csv", summary_rows([metrics], args.summary_format))
     write_json(output / "metrics.json", metrics)
     manifest = json.loads((output / "run.json").read_text(encoding="utf-8"))
     manifest.update(complete=True, status="complete", completed_samples=len(samples))

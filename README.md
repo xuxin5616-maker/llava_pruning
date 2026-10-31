@@ -4,6 +4,11 @@ A small, single-image inference scaffold for LLaVA OneVision/Qwen2 checkpoints. 
 
 ## Learned block2 -> block22 attention predictor
 
+For the **63-trial tail-image-drop / Base+Text side-input ablation suite**, use
+`python run_pool_distill_ablations.py --gpus 5 6 7`. It runs rates30/50/70 and
+lambda0.7/0.8/0.9, writes a compact eight-column summary, and saves no images.
+See [exact command, boundaries and units](docs/pool_distill_ablations.md).
+
 For **MyPool before LLM + the existing distilled block2 predictor**, use:
 
 ```bash

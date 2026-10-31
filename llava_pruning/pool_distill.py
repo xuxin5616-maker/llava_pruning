@@ -115,11 +115,12 @@ def mapped_scores(base_log, base_records, anyres_records, geometry):
 
 
 class PoolDistillAdapter(pool.CustomPruningAdapter):
-    def __init__(self, core, settings, *, rate, share, mode, lean=False):
+    def __init__(self, core, settings, *, rate, share, mode, lean=False, predictor_input="full"):
         super().__init__(core, settings)
         self.rate, self.share, self.mode = rate, share, mode
         self.plan, self.records = None, None
         self.lean = lean
+        self.predictor_input = predictor_input
         self._geometry_cache = {}
         self._prepared_shapes = {}
         self.prepared = None
@@ -224,10 +225,13 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         return None, self.spatial
 
     def rank(self, hidden, start, ids):
-        from llava.model.language_model.attention_predictor import student_autocast
+        from llava.model.language_model.attention_predictor import student_autocast, base_text_predictor_inputs
         positions = self.base if self.mode == "base_full" else self.spatial
+        indices = [start + i for i in positions]
+        if self.predictor_input == "base_text":
+            hidden, ids, indices = base_text_predictor_inputs(hidden, ids, start, start+len(self.records), self.base)
         with student_autocast(hidden.device, self.core._predictor_precision):
-            scores = self.core.attention_predictor(hidden, ids, [start + i for i in positions])
+            scores = self.core.attention_predictor(hidden, ids, indices)
         if self.mode == "base_full":
             scores = mapped_scores(scores, [self.records[i] for i in self.base],
                                    [self.records[i] for i in self.anyres], self.geometry)
@@ -250,14 +254,24 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
 class PoolDistillMethod:
     name = "pool_distill"
 
-    def __init__(self, core, checkpoint, *, rate, share, mode, settings, pruning_audit="lean"):
+    def __init__(self, core, checkpoint, *, rate, share, mode, settings, pruning_audit="lean",
+                 tail_drop_layers=0, predictor_input="full"):
         if mode not in {"base_full", "anyres_self"}:
             raise ValueError("Choose base_full or anyres_self")
         from .attention_predictor import AttentionPredictorMethod
         self.native = AttentionPredictorMethod(checkpoint, (rate,), frozenset(), selection_mode=mode)
         if pruning_audit not in {"lean","full"}:
             raise ValueError("pruning_audit must be lean or full")
-        self.adapter = PoolDistillAdapter(core, settings, rate=rate, share=share, mode=mode,lean=pruning_audit=="lean")
+        if (type(tail_drop_layers) is not int or tail_drop_layers not in {0,2,3,4}
+                or (tail_drop_layers and tail_drop_layers >= len(core.layers)-2)):
+            raise ValueError("Tail removal must be 0/2/3/4 blocks and begin after block2")
+        if predictor_input not in {"full","base_text"} or (predictor_input=="base_text" and mode!="base_full"):
+            raise ValueError("Base+Text predictor input requires base_full mode")
+        if (tail_drop_layers or predictor_input=="base_text") and (share==0 or rate==0):
+            raise ValueError("Ablations require an active distilled pruning stage")
+        self.tail_drop_layers, self.predictor_input = tail_drop_layers, predictor_input
+        self.adapter = PoolDistillAdapter(core, settings, rate=rate, share=share, mode=mode,
+            lean=pruning_audit=="lean", predictor_input=predictor_input)
         self.rate, self.share, self.mode = rate, share, mode
 
     def prepare_inputs(self, original_size, tokens):
@@ -289,6 +303,24 @@ class PoolDistillMethod:
 
     @contextmanager
     def generation_context(self, model):
+        core = model.get_model()
+        options = {"_pool_tail_drop_layers":self.tail_drop_layers, "_pool_predictor_input":self.predictor_input}
+        previous = {name:getattr(core,name,None) for name in options}
+        present = {name:hasattr(core,name) for name in options}
+        try:
+            for name,value in options.items():
+                setattr(core,name,value)
+            with self._generation_context(model):
+                yield
+        finally:
+            for name in options:
+                if present[name]:
+                    setattr(core,name,previous[name])
+                else:
+                    delattr(core,name)
+
+    @contextmanager
+    def _generation_context(self, model):
         if self.share == 1 or self.rate == 0:
             yield
             return
@@ -316,18 +348,19 @@ class PoolDistillMethod:
             raw = self.native.stats(core, rate)
             plan = hybrid_budget(raw.get("original_image_tokens") or raw["final_llm_visual_tokens"],
                                  rate, self.share, len(core.layers))
-            original, pre, final = plan["baseline_packed_tokens"], plan["pre_llm_tokens"], raw["final_llm_visual_tokens"]
+            original, pre = plan["baseline_packed_tokens"], plan["pre_llm_tokens"]
+            final = raw.get("stage2_llm_visual_tokens", raw["final_llm_visual_tokens"])
         else:
             plan = self.adapter.plan
             raw = dict(core.get_clse_stats()) if self.share > 0 else {}
             original, pre = plan["baseline_packed_tokens"], plan["pre_llm_tokens"]
-            final = raw["final_llm_visual_tokens"] if self.share > 0 else pre
+            final = raw.get("stage2_llm_visual_tokens", raw["final_llm_visual_tokens"]) if self.share > 0 else pre
         if final != plan["final_llm_tokens"]:
             raise RuntimeError(f"Final native generation {final} differs from hybrid plan {plan['final_llm_tokens']} (lambda={self.share})")
         depth = len(core.layers)
         rows = raw.get("layers")
         observed = sum(row["image_tokens_in"] for row in rows) if rows else depth * pre
-        expected = 2 * pre + (depth - 2) * final
+        expected = 2 * pre + (depth - 2 - self.tail_drop_layers) * final
         if observed != expected:
             raise RuntimeError("Actual per-layer token accounting differs from hybrid budget")
         if self.share == 1 or rate == 0:
@@ -337,11 +370,20 @@ class PoolDistillMethod:
         else:
             base, protected = self.adapter.view_plan["base_keep"], self.adapter.view_plan["protected_newlines"]
             anyres = pre - base - protected
-        return dict(plan, selection_mode=self.mode, observed_layer_token_sum=observed,
+        tail = self.tail_drop_layers
+        last_visual = raw["final_llm_visual_tokens"] if self.share > 0 else pre
+        if last_visual != (0 if tail else final):
+            raise RuntimeError("Tail image-drop result differs from the requested ablation")
+        return dict(plan, selection_mode=self.mode, predictor_input=self.predictor_input,
+                    tail_drop_layers=tail, tail_drop_first_layer=depth-tail+1 if tail else None,
+                    two_stage_average_prune_rate=plan["actual_average_prune_rate"],
+                    actual_tail_contribution=100*tail*final/(depth*original),
+                    observed_layer_token_sum=observed,
                     budget_source="observed_generation", planned_layer_token_sum=expected,
                     pre_base_tokens=base, pre_anyres_tokens=anyres, protected_newlines=protected,
-                    final_base_tokens=base, final_anyres_tokens=final - base - protected,
-                    final_llm_visual_tokens=final,
+                    stage2_llm_visual_tokens=final, stage2_anyres_tokens=final-base-protected,
+                    final_base_tokens=0 if tail else base, final_anyres_tokens=0 if tail else final-base-protected,
+                    final_llm_visual_tokens=last_visual,
                     actual_average_prune_rate=100 * (1 - observed / (depth * original)),
                     base_policy="MyPool compresses Base; stage2 protects remaining Base",
                     position_policy="MyPool consecutive prefill IDs; stage2 preserves these IDs",
@@ -372,12 +414,19 @@ class PoolDistillMethod:
         final = plan["final_llm_tokens"]
         if final < base + protected:
             raise ValueError("Legacy counts cannot preserve Base and newlines")
-        return dict(plan, selection_mode=self.mode, observed_layer_token_sum=None,
-                    planned_layer_token_sum=2*plan["pre_llm_tokens"]+(len(core.layers)-2)*final,
+        tail, depth = self.tail_drop_layers, len(core.layers)
+        expected = 2*plan["pre_llm_tokens"]+(depth-2-tail)*final
+        return dict(plan, selection_mode=self.mode, predictor_input=self.predictor_input,
+                    tail_drop_layers=tail, tail_drop_first_layer=depth-tail+1 if tail else None,
+                    two_stage_average_prune_rate=plan["actual_average_prune_rate"],
+                    actual_tail_contribution=100*tail*final/(depth*plan["baseline_packed_tokens"]),
+                    actual_average_prune_rate=100*(1-expected/(depth*plan["baseline_packed_tokens"])),
+                    observed_layer_token_sum=None, planned_layer_token_sum=expected,
                     budget_source="legacy_reconstructed_counts",
                     pre_base_tokens=base, pre_anyres_tokens=anyres, protected_newlines=protected,
-                    final_base_tokens=base, final_anyres_tokens=final-base-protected,
-                    final_llm_visual_tokens=final,
+                    stage2_llm_visual_tokens=final, stage2_anyres_tokens=final-base-protected,
+                    final_base_tokens=0 if tail else base, final_anyres_tokens=0 if tail else final-base-protected,
+                    final_llm_visual_tokens=0 if tail else final,
                     base_policy="MyPool compresses Base; stage2 protects remaining Base",
                     position_policy="MyPool consecutive prefill IDs; stage2 preserves these IDs",
                     source_policy="normalized original merge coefficients; Base backprojection preserves probability mass")

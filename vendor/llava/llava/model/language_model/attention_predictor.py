@@ -256,6 +256,24 @@ class CopiedAttentionPredictor(nn.Module):
             return spatial - torch.logsumexp(spatial, dim=0)
 
 
+def base_text_predictor_inputs(hidden, position_ids, start, end, base_indices):
+    """Select H2 Base/text rows, dropping the rest of the packed image span.
+
+    Positions retain their original RoPE IDs. Only the side input is shortened;
+    the backbone hidden states/cache are not changed. Image structural markers
+    are excluded together with AnyRes, because they are not Base spatial rows.
+    """
+    base = torch.as_tensor(base_indices, dtype=torch.long, device=hidden.device)
+    if (not 0 <= start < end < hidden.shape[1] or base.ndim != 1 or not len(base)
+            or int(base.min()) < 0 or int(base.max()) >= end-start
+            or (len(base) > 1 and not bool((base[1:] > base[:-1]).all()))):
+        raise ValueError("Base+Text side input requires ordered Base indices and trailing prompt text")
+    selected = torch.cat((torch.arange(start, device=hidden.device), base+start,
+                          torch.arange(end, hidden.shape[1], device=hidden.device)))
+    spatial = torch.arange(start, start+len(base), device=hidden.device)
+    return hidden.index_select(1, selected), position_ids.index_select(1, selected), spatial
+
+
 def student_autocast(device, precision):
     if precision == "float32":
         return nullcontext()
@@ -400,6 +418,10 @@ class AttentionPredictorMixin:
             indices = [start + i for i in base["indices"]]
         else:
             indices = [start + i for grid in grids for i in grid["indices"]]
+        if getattr(self, "_pool_predictor_input", "full") == "base_text":
+            if self._predictor_selection_mode != "base_full":
+                raise ValueError("Base+Text side input requires Base-mapped ranking")
+            hidden, ids, indices = base_text_predictor_inputs(hidden, ids, start, end, base["indices"])
         with student_autocast(hidden.device, self._predictor_precision):
             log_prob = self.attention_predictor(hidden, ids, indices)
         if not torch.isfinite(log_prob).all():

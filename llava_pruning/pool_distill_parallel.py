@@ -26,6 +26,8 @@ def worker_command(args, api, rate, share, mode, gpu, folder):
         "--allocation-temperature", str(args.allocation_temperature),
         "--spatial-mix-weight", str(args.spatial_mix_weight),
         "--pruning-audit", args.pruning_audit,
+        "--tail-drop-layers", str(args.tail_drop_layers),
+        "--predictor-input", args.predictor_input, "--summary-format", args.summary_format,
         "--redundancy-layers", *map(str, args.redundancy_layers),
         "--visionzip-layers", *map(str, args.visionzip_layers), "--output-dir", str(folder)]
     if args.resume:
@@ -119,7 +121,7 @@ def run_parallel_sweep(args, *, api, process_factory=None, poll_interval=.2):
 
     def save():
         rows = [row for key in order if key in completed for row in completed[key]]
-        api.write_csv(output/"summary.csv",rows)
+        api.write_csv(output/"summary.csv",api.summary_rows(rows,args.summary_format))
         api.write_json(manifest_path,manifest)
 
     save()

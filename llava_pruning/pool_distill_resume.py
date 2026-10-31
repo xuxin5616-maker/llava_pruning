@@ -14,7 +14,9 @@ from pathlib import Path
 
 TIMING_FIELDS = ("lat_seconds", "generation_seconds", "generated_tokens",
                  "peak_allocated_bytes", "peak_reserved_bytes")
+OPTION_DEFAULTS = dict(pruning_audit="full", tail_drop_layers=0, predictor_input="full")
 COMMON_FIELDS = ("model_path", "input_json", "data_root", "checkpoint", "prompt_version", "pruning_audit",
+                 "tail_drop_layers", "predictor_input",
                  "redundancy_layers", "visionzip_layers", "allocation_temperature",
                  "spatial_mix_weight", "warmup", "seed")
 PATH_FIELDS = frozenset(("model_path", "input_json", "data_root", "checkpoint"))
@@ -38,7 +40,7 @@ def validate_configuration(args, saved, rate, share, mode):
     expected = {name: getattr(args, name) for name in COMMON_FIELDS}
     expected.update(prune_rates=[rate], lambdas=[share], selection_modes=[mode])
     for name, value in expected.items():
-        previous = saved.get(name,"full") if name == "pruning_audit" else saved.get(name)
+        previous = saved.get(name, OPTION_DEFAULTS.get(name))
         if previous is None or not same_setting(name, value, previous):
             raise ValueError(f"Resume configuration differs for {name}; use the original experiment settings")
 

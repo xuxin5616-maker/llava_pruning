@@ -261,7 +261,23 @@ class CLSEMixin:
             ids = torch.tensor([[self._clse_next_position]], device=hidden.device)
             self._clse_next_position += 1
         all_hidden = () if (self.config.output_hidden_states if output_hidden_states is None else output_hidden_states) else None
+        tail_layers = getattr(self, "_pool_tail_drop_layers", 0)
+        if tail_layers and not 0 < tail_layers < len(self.layers)-self._clse_boundary():
+            raise ValueError("Tail image drop must follow the main pruning boundary")
         for index, layer in enumerate(self.layers):
+            if prefill and tail_layers and index == len(self.layers)-tail_layers:
+                # The whole surviving packed image is still contiguous after
+                # stage2. Remove Base/AnyRes/newlines from queries/hidden rows.
+                # Earlier-layer image KV must remain: future generated tokens
+                # still attend to images in those earlier layers. The final
+                # layers have not populated their caches yet and remain text-only.
+                selection = torch.cat((torch.arange(start, device=hidden.device),
+                    torch.arange(start+current, hidden.shape[1], device=hidden.device)))
+                hidden = hidden.index_select(1, selection).contiguous()
+                ids = ids.index_select(1, selection)
+                self._clse_stats.update(tail_drop_layers=tail_layers, tail_drop_first_layer=index+1,
+                                       tail_removed_image_tokens=current)
+                current = 0
             if all_hidden is not None:
                 all_hidden += (hidden,)
             physical_past = cache.get_seq_length(index)
@@ -288,7 +304,8 @@ class CLSEMixin:
                         cache.value_cache[cached_layer] = cache.value_cache[cached_layer].index_select(2, selection).contiguous()
                     cache._seen_tokens = hidden.shape[1]
                     current = retained
-                    self._clse_stats.update(protected_newline_tokens=protected, spatial_tokens=original - protected,
+                    self._clse_stats.update(stage2_llm_visual_tokens=retained,
+                                            protected_newline_tokens=protected, spatial_tokens=original - protected,
                                             kept_spatial_tokens=retained - protected)
                     stage = dict(after_layer=index + 1, scoring_layer=index + 1, target_keep_ratio=self.clse_keep_ratio,
                                  image_tokens_before=before, image_tokens_after=retained,
