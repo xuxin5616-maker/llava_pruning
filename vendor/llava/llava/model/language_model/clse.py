@@ -262,7 +262,7 @@ class CLSEMixin:
             self._clse_next_position += 1
         all_hidden = () if (self.config.output_hidden_states if output_hidden_states is None else output_hidden_states) else None
         tail_layers = getattr(self, "_pool_tail_drop_layers", 0)
-        if tail_layers and not 0 < tail_layers < len(self.layers)-self._clse_boundary():
+        if tail_layers and not 0 < tail_layers <= len(self.layers)-self._clse_boundary():
             raise ValueError("Tail image drop must follow the main pruning boundary")
         for index, layer in enumerate(self.layers):
             if prefill and tail_layers and index == len(self.layers)-tail_layers:

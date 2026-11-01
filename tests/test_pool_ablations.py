@@ -25,9 +25,9 @@ from test_pool_distill_parallel import Processes, Process
 from llava_pruning.pool_distill_parallel import run_parallel_sweep
 
 
-def model_and_options():
+def model_and_options(depth=8):
     config=tiny_config("sdpa")
-    config.num_hidden_layers=8
+    config.num_hidden_layers=depth
     config.eos_token_id,config.pad_token_id=None,0
     config.image_aspect_ratio,config.mm_patch_merge_type="anyres_max_9","spatial_unpad"
     config.image_grid_pinpoints,config.image_token_order=[[384,384]],"base_first"

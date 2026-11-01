@@ -286,9 +286,8 @@ class PoolDistillMethod:
             raise ValueError("pruning_audit must be lean or full")
         if base_mapping not in {"reference","fast"} or (base_mapping=="fast" and pruning_audit!="lean"):
             raise ValueError("Fast Base mapping requires pruning_audit=lean")
-        if (type(tail_drop_layers) is not int or tail_drop_layers not in {0,2,3,4}
-                or (tail_drop_layers and tail_drop_layers >= len(core.layers)-2)):
-            raise ValueError("Tail removal must be 0/2/3/4 blocks and begin after block2")
+        if type(tail_drop_layers) is not int or not 0 <= tail_drop_layers <= len(core.layers)-2:
+            raise ValueError("Tail removal must be nonnegative and begin after block2")
         if predictor_input not in {"full","base_text"} or (predictor_input=="base_text" and mode!="base_full"):
             raise ValueError("Base+Text predictor input requires base_full mode")
         if (tail_drop_layers or predictor_input=="base_text") and (share==0 or rate==0):

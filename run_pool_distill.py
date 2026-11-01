@@ -54,7 +54,7 @@ def build_parser():
     parser.add_argument("--spatial-mix-weight", type=float, default=0., help="MyPool spatial prior weight; independent of --lambdas")
     parser.add_argument("--pruning-audit",choices=("lean","full"),default="lean",
                         help="lean removes unused pre-LLM diagnostics and prepares static geometry before Lat; full preserves the old audit path")
-    parser.add_argument("--tail-drop-layers", type=int, choices=(0, 2, 3, 4), default=0,
+    parser.add_argument("--tail-drop-layers", type=int, choices=range(27), default=0,
                         help="Extra ablation: remove all remaining image tokens before the last N LLM blocks")
     parser.add_argument("--predictor-input", choices=("full", "base_text"), default="full",
                         help="Side branch context only; base_text excludes AnyRes/newlines and keeps original position IDs")
