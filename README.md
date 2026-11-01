@@ -9,6 +9,16 @@ For the **63-trial tail-image-drop / Base+Text side-input ablation suite**, use
 lambda0.7/0.8/0.9, writes a compact eight-column summary, and saves no images.
 See [exact command, boundaries and units](docs/pool_distill_ablations.md).
 
+Optional Base-mapping hotspot check: `python benchmark_base_mapping.py --gpu 5`
+(no 7B model loading). Keep the default reference implementation until the GPU
+checks pass; opt in with `--base-mapping fast` and a fresh output directory.
+See [latency explanation and validation scope](docs/base_mapping_latency.md).
+
+For **paired real-model Base+Text reference/fast results**, run
+`python compare_pool_mapping.py --gpus 7 6 5 4 3 2`. Defaults are rates30/70 and
+lambda0.7/0.8/0.9: 12 trials, each before/after pair fixed to one GPU.
+See [full command and eight-column output](docs/base_mapping_compare.md).
+
 For **MyPool before LLM + the existing distilled block2 predictor**, use:
 
 ```bash

@@ -14,9 +14,9 @@ from pathlib import Path
 
 TIMING_FIELDS = ("lat_seconds", "generation_seconds", "generated_tokens",
                  "peak_allocated_bytes", "peak_reserved_bytes")
-OPTION_DEFAULTS = dict(pruning_audit="full", tail_drop_layers=0, predictor_input="full")
+OPTION_DEFAULTS = dict(pruning_audit="full", tail_drop_layers=0, predictor_input="full", base_mapping="reference")
 COMMON_FIELDS = ("model_path", "input_json", "data_root", "checkpoint", "prompt_version", "pruning_audit",
-                 "tail_drop_layers", "predictor_input",
+                 "tail_drop_layers", "predictor_input", "base_mapping",
                  "redundancy_layers", "visionzip_layers", "allocation_temperature",
                  "spatial_mix_weight", "warmup", "seed")
 PATH_FIELDS = frozenset(("model_path", "input_json", "data_root", "checkpoint"))

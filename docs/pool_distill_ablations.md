@@ -1,5 +1,7 @@
 # MyPool＋蒸馏旁路消融实验
 
+Base映射延迟的解释、可选快路径及设备核对：[base_mapping_latency.md](base_mapping_latency.md)。
+
 入口：`run_pool_distill_ablations.py`。沿用已有checkpoint，不重新训练；全量读取指定JSON，
 不限制100张，不保存可视化。主模型仍使用原有FP16、FlashAttention2，旁路精度由checkpoint决定。
 

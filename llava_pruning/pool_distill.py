@@ -115,12 +115,16 @@ def mapped_scores(base_log, base_records, anyres_records, geometry):
 
 
 class PoolDistillAdapter(pool.CustomPruningAdapter):
-    def __init__(self, core, settings, *, rate, share, mode, lean=False, predictor_input="full"):
+    def __init__(self, core, settings, *, rate, share, mode, lean=False, predictor_input="full", base_mapping="reference"):
         super().__init__(core, settings)
         self.rate, self.share, self.mode = rate, share, mode
         self.plan, self.records = None, None
         self.lean = lean
         self.predictor_input = predictor_input
+        self.base_mapping = base_mapping
+        self.mapping_sources = None
+        self.mapping_geometry = None
+        self._mapping_geometry_cache = {}
         self._geometry_cache = {}
         self._prepared_shapes = {}
         self.prepared = None
@@ -130,6 +134,7 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         key = tuple(map(int,original_size))
         if self.lean and key in self._geometry_cache:
             self.original_size,self.geometry,self.plan,self.view_plan,self.prepared = self._geometry_cache[key]
+            self.prepare_mapping_geometry()
             return
         super().set_image_context(original_size)
         original = pool.baseline_packed_count(self.original_size, self.geometry.grid, 27,
@@ -149,6 +154,16 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
                 self._prepared_shapes[shape_key]=prepared
             self.prepared=self._prepared_shapes[shape_key]
             self._geometry_cache[key] = (self.original_size,self.geometry,self.plan,self.view_plan,self.prepared)
+        self.prepare_mapping_geometry()
+
+    def prepare_mapping_geometry(self):
+        if self.base_mapping!="fast" or self.mode!="base_full":
+            return
+        key=tuple(self.original_size)
+        if key not in self._mapping_geometry_cache:
+            from .pool_mapping import prepare_mapping_geometry
+            self._mapping_geometry_cache[key]=prepare_mapping_geometry(self.geometry,self.core.image_newline.device)
+        self.mapping_geometry=self._mapping_geometry_cache[key]
 
     def allocate_view_budgets(self, raw_redundancy, first, spatial):
         # Choose an interior point of the ceil interval to avoid FP/Decimal
@@ -171,11 +186,14 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         if self.lean:
             from .pool_lean import encode,export_source_decisions
             packed = encode(self,images)
-            if self.mode == "base_full":
+            if self.mode == "base_full" and self.base_mapping=="reference":
                 self.decisions = export_source_decisions(self.device_decisions)
                 self.records = source_records(self.decisions,self.geometry.grid,
                     final_newline=self.core.config.mm_patch_merge_type.endswith("_add_newl"),fast=True)
             else:
+                if self.mode=="base_full":
+                    from .pool_mapping import prepare_mapping_sources
+                    self.mapping_sources=prepare_mapping_sources(self.device_decisions,self.geometry.grid)
                 # Only roles are needed for own-AnyRes scoring; do not construct
                 # unused original-source lists/weights for every merged token.
                 self.records = [None if role==2 else dict(view=role) for role in self.roles.cpu().tolist()]
@@ -233,8 +251,12 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         with student_autocast(hidden.device, self.core._predictor_precision):
             scores = self.core.attention_predictor(hidden, ids, indices)
         if self.mode == "base_full":
-            scores = mapped_scores(scores, [self.records[i] for i in self.base],
-                                   [self.records[i] for i in self.anyres], self.geometry)
+            if self.base_mapping=="fast":
+                from .pool_mapping import mapped_scores_fast
+                scores=mapped_scores_fast(scores,self.mapping_sources,self.mapping_geometry)
+            else:
+                scores = mapped_scores(scores, [self.records[i] for i in self.base],
+                                       [self.records[i] for i in self.anyres], self.geometry)
         if scores.shape != (len(self.spatial),) or not torch.isfinite(scores).all():
             raise FloatingPointError("Invalid sparse predictor scores")
         return scores
@@ -255,13 +277,15 @@ class PoolDistillMethod:
     name = "pool_distill"
 
     def __init__(self, core, checkpoint, *, rate, share, mode, settings, pruning_audit="lean",
-                 tail_drop_layers=0, predictor_input="full"):
+                 tail_drop_layers=0, predictor_input="full", base_mapping="reference"):
         if mode not in {"base_full", "anyres_self"}:
             raise ValueError("Choose base_full or anyres_self")
         from .attention_predictor import AttentionPredictorMethod
         self.native = AttentionPredictorMethod(checkpoint, (rate,), frozenset(), selection_mode=mode)
         if pruning_audit not in {"lean","full"}:
             raise ValueError("pruning_audit must be lean or full")
+        if base_mapping not in {"reference","fast"} or (base_mapping=="fast" and pruning_audit!="lean"):
+            raise ValueError("Fast Base mapping requires pruning_audit=lean")
         if (type(tail_drop_layers) is not int or tail_drop_layers not in {0,2,3,4}
                 or (tail_drop_layers and tail_drop_layers >= len(core.layers)-2)):
             raise ValueError("Tail removal must be 0/2/3/4 blocks and begin after block2")
@@ -271,7 +295,7 @@ class PoolDistillMethod:
             raise ValueError("Ablations require an active distilled pruning stage")
         self.tail_drop_layers, self.predictor_input = tail_drop_layers, predictor_input
         self.adapter = PoolDistillAdapter(core, settings, rate=rate, share=share, mode=mode,
-            lean=pruning_audit=="lean", predictor_input=predictor_input)
+            lean=pruning_audit=="lean", predictor_input=predictor_input, base_mapping=base_mapping)
         self.rate, self.share, self.mode = rate, share, mode
 
     def prepare_inputs(self, original_size, tokens):

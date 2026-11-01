@@ -28,6 +28,7 @@ def worker_command(args, api, rate, share, mode, gpu, folder):
         "--pruning-audit", args.pruning_audit,
         "--tail-drop-layers", str(args.tail_drop_layers),
         "--predictor-input", args.predictor_input, "--summary-format", args.summary_format,
+        "--base-mapping",args.base_mapping,
         "--redundancy-layers", *map(str, args.redundancy_layers),
         "--visionzip-layers", *map(str, args.visionzip_layers), "--output-dir", str(folder)]
     if args.resume:

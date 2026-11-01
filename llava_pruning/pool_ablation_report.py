@@ -9,7 +9,8 @@ def compact_row(row):
     mode = row["selection_mode"]
     branch = row.get("predictor_input", "full")
     tail = int(row.get("tail_drop_layers", 0))
-    return dict(config=f"prune={rate:g}%;lambda={share:g};{mode};input={branch};tail={tail}",
+    mapping=";mapping=fast" if row.get("base_mapping")=="fast" and mode=="base_full" else ""
+    return dict(config=f"prune={rate:g}%;lambda={share:g};{mode};input={branch};tail={tail}{mapping}",
                 tp=row["tp"], fp=row["fp"], tn=row["tn"], fn=row["fn"],
                 acc=None if row["accuracy"] is None else 100 * float(row["accuracy"]),
                 Lat=row["lat_mean_ms"], mem=row["mem_peak_allocated_gib"])

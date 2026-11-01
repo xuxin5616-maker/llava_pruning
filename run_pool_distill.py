@@ -60,6 +60,8 @@ def build_parser():
                         help="Side branch context only; base_text excludes AnyRes/newlines and keeps original position IDs")
     parser.add_argument("--summary-format", choices=("full", "compact"), default="full",
                         help="compact: config,tp,fp,tn,fn,acc(percent),Lat(ms),mem(allocated GiB)")
+    parser.add_argument("--base-mapping", choices=("reference", "fast"), default="reference",
+                        help="Optional vectorized Base provenance + batched interpolation; benchmark on your GPU before adopting")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--baseline-acc", type=float, default=91.18,
@@ -120,6 +122,8 @@ def validate(args):
         raise ValueError("Duplicate selection modes")
     if args.predictor_input == "base_text" and args.selection_modes != ["base_full"]:
         raise ValueError("base_text side input requires --selection-modes base_full")
+    if args.base_mapping=="fast" and args.pruning_audit!="lean":
+        raise ValueError("--base-mapping fast requires --pruning-audit lean")
     if (args.tail_drop_layers or args.predictor_input == "base_text") and any(s == 0 for s in args.lambdas):
         raise ValueError("These ablations require an active distilled stage (lambda > 0)")
     if not math.isfinite(args.allocation_temperature) or args.allocation_temperature <= 0 or not 0 <= args.spatial_mix_weight <= 1:
@@ -344,6 +348,7 @@ def run_sweep(args, *, run_process=None, process_factory=None):
                            "--pruning-audit",args.pruning_audit,
                            "--tail-drop-layers",str(args.tail_drop_layers),
                            "--predictor-input",args.predictor_input,"--summary-format",args.summary_format,
+                           "--base-mapping",args.base_mapping,
                            "--redundancy-layers", *map(str, args.redundancy_layers),
                            "--visionzip-layers", *map(str, args.visionzip_layers), "--output-dir", str(trial_dir)]
                 if args.resume:
@@ -428,7 +433,7 @@ def run_worker(args):
         spatial_strength=args.spatial_mix_weight)
     method = PoolDistillMethod(core, args.checkpoint, rate=rate, share=share, mode=mode, settings=settings,
                               pruning_audit=args.pruning_audit, tail_drop_layers=args.tail_drop_layers,
-                              predictor_input=args.predictor_input)
+                              predictor_input=args.predictor_input, base_mapping=args.base_mapping)
     # Feasibility checks do not score images, skip records, or loosen budgets.
     if share == 1:
         method.native.validate_input_budgets(backend, samples, {rate: method.native.resolve_budget(rate, len(core.layers))})
@@ -451,6 +456,7 @@ def run_worker(args):
         auxiliary_policy=("static shape/budget/bin/prior metadata prepared before generate; unused diagnostic maps/lists are not produced"
                           if args.pruning_audit=="lean" else "legacy full diagnostic preparation inside generate"),
         ablation=dict(tail_drop_layers=args.tail_drop_layers, predictor_input=args.predictor_input,
+            base_mapping=args.base_mapping,
             tail_budget_policy="extra removal; original two-stage budgets unchanged",
             tail_cache_policy="earlier layers retain image KV; final layers encode/decode text only",
             side_input_policy="Base+Text means selecting H2 rows, preserving position IDs; H2 already contains multimodal information"),
@@ -538,6 +544,7 @@ def run_worker(args):
     metrics.pop("rule", None)
     metrics.update(selection_mode=mode, distill_share=share, gpu_id=args.gpu, warmup_samples=len(warmups),
                    tail_drop_layers=args.tail_drop_layers, predictor_input=args.predictor_input,
+                   base_mapping=args.base_mapping,
                    pruning_auxiliary_profile=auxiliary_profile(args.pruning_audit),
                    resumed_samples=resumed_samples, fresh_samples=len(samples)-resumed_samples,
                    budget_reconstructed_samples=sum(row.get("budget_source")=="legacy_reconstructed_counts" for row in budgets),
