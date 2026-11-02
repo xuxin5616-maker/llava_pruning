@@ -65,7 +65,8 @@ python benchmark_base_mapping.py \
 
 并使用新的输出目录。`run_pool_distill.py`和`run_pool_distill_ablations.py`均支持此参数。
 后者仍执行原63组实验，只改变Base映射实现；AnyRes自身评分路径不变。
-精简CSV仍只有8列，Base快路径配置末尾增加`mapping=fast`。
+精简CSV输出11列，新增百分数BACC、F1及相对原版91.18% ACC的百分比；
+Base快路径配置末尾增加`mapping=fast`。
 
 配置、metrics和断点记录包含实现选项；旧输出缺少此字段时视为reference，禁止将旧计时结果
 混入fast续跑。原参考结果和统计口径不作修改。

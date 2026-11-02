@@ -156,8 +156,22 @@ class PoolAblationTests(unittest.TestCase):
             tail_drop_layers=0,tp=12,fp=3,tn=5,fn=2,accuracy=17/22,lat_mean_ms=123,mem_peak_allocated_gib=20.5))
         self.assertEqual(tuple(row),FIELDS)
         self.assertAlmostEqual(row["acc"],100*17/22)
+        self.assertAlmostEqual(row["bacc"],100*(12/14+5/8)/2)
+        self.assertAlmostEqual(row["f1"],100*24/29)
+        self.assertAlmostEqual(row["relative_accuracy_pct"],100*(17/22)/.9118)
         self.assertEqual(row["Lat"],123);self.assertEqual(row["mem"],20.5)
         self.assertIn("input=base_text;tail=0",row["config"])
+
+    def test_legacy_compact_suite_summary_adds_metrics_with_supplied_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);folder=root/"tail_2";folder.mkdir()
+            entry.write_csv(folder/"summary.csv",[dict(config="old",tp=2,fp=1,tn=2,fn=1,
+                acc=50.,Lat=123.,mem=20.5)])
+            rows=suite.collect_summary(root,baseline_acc=90.)
+            self.assertEqual(tuple(rows[0]),FIELDS)
+            self.assertAlmostEqual(rows[0]["bacc"],100*2/3)
+            self.assertAlmostEqual(rows[0]["f1"],100*2/3)
+            self.assertAlmostEqual(rows[0]["relative_accuracy_pct"],100*.5/.9)
 
     def fixture(self,root):
         (root/"model").mkdir();(root/"data").mkdir()

@@ -15,7 +15,7 @@ import sys
 import time
 
 import run_pool_distill as entry
-from llava_pruning.pool_ablation_report import FIELDS
+from llava_pruning.pool_ablation_report import FIELDS, LEGACY_FIELDS, compact_metric_columns
 
 
 GROUPS = (("tail_2", 2, "full", ("anyres_self", "base_full")),
@@ -48,7 +48,7 @@ def group_command(args, group, root):
     return command
 
 
-def collect_summary(root):
+def collect_summary(root, baseline_acc=91.18):
     """Only read completed/committed child summaries; never infer missing rows."""
     rows = []
     for name,_,_,_ in GROUPS:
@@ -57,9 +57,15 @@ def collect_summary(root):
             continue
         with path.open(encoding="utf-8-sig",newline="") as stream:
             reader = csv.DictReader(stream)
-            if tuple(reader.fieldnames or ()) != FIELDS:
+            fields = tuple(reader.fieldnames or ())
+            if fields not in (FIELDS, LEGACY_FIELDS):
                 raise ValueError(f"Unexpected ablation summary columns: {path}")
-            rows.extend(reader)
+            for row in reader:
+                if fields == LEGACY_FIELDS:
+                    metrics = {key: int(row[key]) for key in ("tp", "fp", "tn", "fn")}
+                    metrics["accuracy"] = float(row["acc"]) / 100 if row["acc"] else None
+                    row.update(compact_metric_columns(metrics, baseline_acc / 100))
+                rows.append(row)
     if len({row["config"] for row in rows}) != len(rows):
         raise ValueError("Duplicate ablation configurations")
     entry.write_csv(root/"summary.csv",rows)
@@ -118,7 +124,7 @@ def run(args, *, process_factory=None, poll_interval=.2):
             process = factory(command,**options)
             try:
                 while process.poll() is None:
-                    collect_summary(root)
+                    collect_summary(root, args.baseline_acc)
                     time.sleep(poll_interval)
                 code = process.wait()
             except BaseException:
@@ -133,12 +139,12 @@ def run(args, *, process_factory=None, poll_interval=.2):
             if code in (130,-2): raise KeyboardInterrupt
             if code: raise RuntimeError(f"Group {name} failed with exit code {code}; see its terminal/logs")
             manifest["groups"][name]["status"]="complete"
-            manifest["completed_trials"]=len(collect_summary(root))
+            manifest["completed_trials"]=len(collect_summary(root, args.baseline_acc))
             entry.write_json(path,manifest)
         if manifest["completed_trials"] != manifest["expected_trials"]:
             raise RuntimeError("Suite finished without all expected result rows")
     except BaseException as error:
-        collect_summary(root)
+        collect_summary(root, args.baseline_acc)
         manifest.update(status="interrupted" if isinstance(error,KeyboardInterrupt) else "failed",error=str(error))
         entry.write_json(path,manifest)
         raise

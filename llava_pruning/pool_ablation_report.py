@@ -1,6 +1,18 @@
 """Presentation-only hybrid summaries; no changes to inference or raw metrics."""
 
-FIELDS = ("config", "tp", "fp", "tn", "fn", "acc", "Lat", "mem")
+from llava_pruning.extended_metrics import extended_metrics
+
+
+LEGACY_FIELDS = ("config", "tp", "fp", "tn", "fn", "acc", "Lat", "mem")
+FIELDS = (*LEGACY_FIELDS, "bacc", "f1", "relative_accuracy_pct")
+
+
+def compact_metric_columns(metrics, baseline=.9118):
+    """Percentage columns from exact counts; raw metrics keep fractional units."""
+    values = extended_metrics(metrics, baseline)
+    return dict(bacc=None if values["bacc"] is None else 100 * values["bacc"],
+                f1=None if values["f1"] is None else 100 * values["f1"],
+                relative_accuracy_pct=values["relative_accuracy_pct"])
 
 
 def compact_row(row):
@@ -13,7 +25,8 @@ def compact_row(row):
     return dict(config=f"prune={rate:g}%;lambda={share:g};{mode};input={branch};tail={tail}{mapping}",
                 tp=row["tp"], fp=row["fp"], tn=row["tn"], fn=row["fn"],
                 acc=None if row["accuracy"] is None else 100 * float(row["accuracy"]),
-                Lat=row["lat_mean_ms"], mem=row["mem_peak_allocated_gib"])
+                Lat=row["lat_mean_ms"], mem=row["mem_peak_allocated_gib"],
+                **compact_metric_columns(row, float(row.get("baseline_accuracy", .9118))))
 
 
 def summary_rows(rows, style):

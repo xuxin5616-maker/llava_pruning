@@ -6,7 +6,9 @@ A small, single-image inference scaffold for LLaVA OneVision/Qwen2 checkpoints. 
 
 For the **63-trial tail-image-drop / Base+Text side-input ablation suite**, use
 `python run_pool_distill_ablations.py --gpus 5 6 7`. It runs rates30/50/70 and
-lambda0.7/0.8/0.9, writes a compact eight-column summary, and saves no images.
+lambda0.7/0.8/0.9, writes a compact eleven-column summary, and saves no images.
+Compact summaries include percent ACC/BACC/F1, first-token Lat (ms), peak Mem
+(GiB), and ACC relative to the default unpruned 91.18% reference (percent).
 See [exact command, boundaries and units](docs/pool_distill_ablations.md).
 
 Optional Base-mapping hotspot check: `python benchmark_base_mapping.py --gpu 5`
@@ -17,7 +19,7 @@ See [latency explanation and validation scope](docs/base_mapping_latency.md).
 For **paired real-model Base+Text reference/fast results**, run
 `python compare_pool_mapping.py --gpus 7 6 5 4 3 2`. Defaults are rates30/70 and
 lambda0.7/0.8/0.9: 12 trials, each before/after pair fixed to one GPU.
-See [full command and eight-column output](docs/base_mapping_compare.md).
+See [full command and eleven-column output](docs/base_mapping_compare.md).
 
 For **Base+Text / fast mapping with tails0..15**, use
 `python run_pool_tail_sweep.py --gpus 7 6 5 4 3 2`. Defaults: rates30/50/70,

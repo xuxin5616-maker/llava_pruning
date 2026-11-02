@@ -43,14 +43,15 @@ tail是额外消融，30/50/70仍对应原有两阶段的层平均剪枝目标�
 上循环分配。本命令每卡32个独立配置。每个配置独立加载模型，加载和warmup不计入Lat。
 主模型精度和attention模式沿用原配置，旁路精度沿用checkpoint，实际剪枝处理仍计入Lat。
 
-顶层`summary.csv`保持八列：
+顶层`summary.csv`输出十一列：
 
 ```text
-config,tp,fp,tn,fn,acc,Lat,mem
+config,tp,fp,tn,fn,acc,Lat,mem,bacc,f1,relative_accuracy_pct
 ```
 
 示例：`prune=30%;lambda=0.6;base_full;input=base_text;tail=15;mapping=fast`。
-ACC为百分比，Lat为平均首token毫秒，Mem为完整生成期间峰值allocated GiB。
+ACC、BACC、F1均为百分比；`relative_accuracy_pct`为ACC相对原版91.18%的百分比
+（可用`--baseline-acc`修改参考值）。Lat为平均首token毫秒，Mem为完整生成期间峰值allocated GiB。
 日志在`logs/`，各子目录保留逐图答案、时间/显存、配置、预算和断点记录。
 父进程每30秒打印进度、elapsed和ETA；逐图进度在对应任务日志中。
 

@@ -129,6 +129,34 @@ class PoolDistillMetricTests(unittest.TestCase):
             self.assertEqual((root/"good/metrics.json").read_bytes(), before)
             self.assertFalse((root/"summary.csv").exists())
 
+    def test_compact_report_only_adds_percentage_metrics_preserving_raw_units_and_results(self):
+        from llava_pruning.pool_ablation_report import FIELDS
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            trial=self.make_old_report(root)
+            config=dict(summary_format="compact")
+            entry.write_json(root/"trial/run.json",dict(complete=True,configuration=config))
+            entry.write_json(root/"comparison.json",dict(complete=True,trials=[trial],configuration=config))
+            # A former eight-column CSV is rewritten from the saved exact counts.
+            entry.write_csv(root/"summary.csv",[dict(config="old",tp=2,fp=1,tn=2,fn=1,
+                acc=50.,Lat=100.,mem=20.)])
+            with patch.object(entry,"run_worker",side_effect=AssertionError("No inference")), \
+                    patch.object(entry,"run_sweep",side_effect=AssertionError("No sweep")), \
+                    patch("sys.argv",["run_pool_distill.py","--report-only",str(root),"--baseline-acc","91.18"]):
+                entry.main()
+            row=self.read_rows(root/"summary.csv")[0]
+            self.assertEqual(tuple(row),FIELDS)
+            self.assertAlmostEqual(float(row["bacc"]),100*2/3)
+            self.assertAlmostEqual(float(row["f1"]),100*2/3)
+            self.assertAlmostEqual(float(row["relative_accuracy_pct"]),100*.5/.9118)
+            self.assertEqual(row,self.read_rows(root/"trial/summary.csv")[0])
+            raw=json.loads((root/"trial/metrics.json").read_text(encoding="utf-8"))
+            self.assertAlmostEqual(raw["f1"],2/3)
+            self.assertAlmostEqual(raw["bacc"],2/3)
+            self.assertEqual((row["acc"],row["Lat"],row["mem"]),("50.0","100.0","20.0"))
+            self.assertEqual((root/"trial/predictions.jsonl").read_text(),"preserve predictions")
+            self.assertEqual((root/"trial/budgets.csv").read_text(),"preserve budgets")
+
     def test_worker_exports_metrics_for_all_images_and_excludes_warmups(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)

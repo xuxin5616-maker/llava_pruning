@@ -36,13 +36,14 @@ python compare_pool_mapping.py \
 若改变剪枝率/λ/GPU数量，则按配置顺序轮流分配GPU，每对仍固定在同一卡。
 多GPU实验共享服务器CPU和系统资源，因此速度结果仍会受其它任务负载影响。
 
-顶层`summary.csv`只含8列，成对排列：
+顶层`summary.csv`输出11列，成对排列：
 
 ```text
-config,tp,fp,tn,fn,acc,Lat,mem
+config,tp,fp,tn,fn,acc,Lat,mem,bacc,f1,relative_accuracy_pct
 ```
 
-配置末尾明确标注`mapping=reference`或`mapping=fast`。ACC为百分比，Lat为平均首token毫秒，
+配置末尾明确标注`mapping=reference`或`mapping=fast`。ACC、BACC、F1均为百分比；
+`relative_accuracy_pct`为ACC相对原版91.18%的百分比（可用`--baseline-acc`修改参考值）。Lat为平均首token毫秒，
 Mem为完整回答期间PyTorch峰值allocated GiB。结果包括驻留模型与输入，Mem不是计算利用率。
 逐任务日志在顶层`logs/`，完整配置、metrics、逐图预测和预算保存在各任务子目录。
 

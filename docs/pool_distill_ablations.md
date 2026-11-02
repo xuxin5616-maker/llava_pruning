@@ -79,14 +79,17 @@ python run_pool_distill_ablations.py \
 
 ## 输出和计时
 
-顶层及各子实验`summary.csv`只有八列：
+顶层及各子实验`summary.csv`输出十一列：
 
 ```text
-config,tp,fp,tn,fn,acc,Lat,mem
+config,tp,fp,tn,fn,acc,Lat,mem,bacc,f1,relative_accuracy_pct
 ```
 
 配置示例：`prune=30%;lambda=0.7;base_full;input=full;tail=2`。
-`acc`是百分比；`Lat`是平均首token延迟（毫秒）；`mem`是完整回答生成期间PyTorch峰值allocated
+`acc`、`bacc`、`f1`均为百分比；`relative_accuracy_pct = 100 × ACC / 0.9118`，其中ACC使用
+0～1的小数，默认以原版91.18%为参考（可用`--baseline-acc`修改）。该比例允许超过100%。
+BACC和F1由可解析答案的混淆计数计算；ACC仍将无法解析的有标签回答计为错误。无定义的指标留空。
+`Lat`是平均首token延迟（毫秒）；`mem`是完整回答生成期间PyTorch峰值allocated
 显存（GiB），包含驻留模型及输入，不代表GPU计算利用率。
 
 计时边界与现有实验相同：准备好的输入进入`model.generate`至第一个生成token。
@@ -96,6 +99,14 @@ config,tp,fp,tn,fn,acc,Lat,mem
 CSV仅精简展示；原始`metrics.json`、配置、逐图预测及预算日志继续保留，供核对和续跑。
 原`run_pool_distill.py`默认仍输出旧格式；单独需要精简可加`--summary-format compact`。
 也支持独立指定`--tail-drop-layers 2`或`--predictor-input base_text --selection-modes base_full`。
+
+已有普通实验的八列精简报表可以从保存的`metrics.json`补齐，无需重跑模型：
+
+```bash
+python run_pool_distill.py --report-only output/你的实验目录 --baseline-acc 91.18
+```
+
+精简CSV的BACC/F1使用百分数；完整格式CSV与原始`metrics.json`仍使用0～1小数。
 
 ## 中断续跑
 

@@ -59,7 +59,7 @@ def build_parser():
     parser.add_argument("--predictor-input", choices=("full", "base_text"), default="full",
                         help="Side branch context only; base_text excludes AnyRes/newlines and keeps original position IDs")
     parser.add_argument("--summary-format", choices=("full", "compact"), default="full",
-                        help="compact: config,tp,fp,tn,fn,acc(percent),Lat(ms),mem(allocated GiB)")
+                        help="compact: config,tp,fp,tn,fn,acc(percent),Lat(ms),mem(allocated GiB),bacc(percent),f1(percent),relative_accuracy_pct")
     parser.add_argument("--base-mapping", choices=("reference", "fast"), default="reference",
                         help="Optional vectorized Base provenance + batched interpolation; benchmark on your GPU before adopting")
     parser.add_argument("--warmup", type=int, default=10)
