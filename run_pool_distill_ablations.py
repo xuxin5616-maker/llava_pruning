@@ -37,7 +37,7 @@ def group_command(args, group, root):
     command = [sys.executable, str(entry.PROJECT/"run_pool_distill.py")]
     command += (["--gpus", *map(str,args.gpus)] if args.gpus else ["--gpu",str(args.gpu)])
     for name_arg in ("model_path","checkpoint","input_json","data_root","prompt_version",
-                     "pruning_audit","seed","warmup","baseline_acc","allocation_temperature","spatial_mix_weight","base_mapping"):
+                     "pruning_audit","seed","warmup","baseline_acc","allocation_temperature","spatial_mix_weight","base_mapping","base_policy"):
         command += ["--"+name_arg.replace("_","-"),str(getattr(args,name_arg))]
     command += ["--prune-rates",*map(str,args.prune_rates),"--lambdas",*map(str,args.lambdas),
                 "--selection-modes",*modes,"--redundancy-layers",*map(str,args.redundancy_layers),

@@ -12,7 +12,7 @@ import torch
 from torch.nn import functional as F
 
 import runMyPruningPoolSpatial as pool
-from .pool_distill_budget import hybrid_budget, pre_view_budget
+from .pool_distill_budget import hybrid_budget, pre_view_budget, stage2_view_budget
 
 
 def source_records(decisions, grid, side=27, final_newline=False, *, fast=False):
@@ -115,13 +115,15 @@ def mapped_scores(base_log, base_records, anyres_records, geometry):
 
 
 class PoolDistillAdapter(pool.CustomPruningAdapter):
-    def __init__(self, core, settings, *, rate, share, mode, lean=False, predictor_input="full", base_mapping="reference"):
+    def __init__(self, core, settings, *, rate, share, mode, lean=False, predictor_input="full", base_mapping="reference",
+                 base_policy="protect"):
         super().__init__(core, settings)
         self.rate, self.share, self.mode = rate, share, mode
         self.plan, self.records = None, None
         self.lean = lean
         self.predictor_input = predictor_input
         self.base_mapping = base_mapping
+        self.base_policy = base_policy
         self.mapping_sources = None
         self.mapping_geometry = None
         self._mapping_geometry_cache = {}
@@ -142,7 +144,8 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         self.plan = hybrid_budget(original, self.rate, self.share, len(self.core.layers))
         self.plan["raw_grid_height"] = self.geometry.grid[1]
         self.view_plan = pre_view_budget(self.plan, self.geometry.tile_count,
-                                        final_newline=self.core.config.mm_patch_merge_type.endswith("_add_newl"))
+                                        final_newline=self.core.config.mm_patch_merge_type.endswith("_add_newl"),
+                                        base_policy=self.base_policy)
         if self.lean:
             from .pool_lean import prepare_geometry
             shape_key=(tuple(self.geometry.grid),self.geometry.token_side)
@@ -238,8 +241,7 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
     def reference(self, hidden, start, end):
         if end - start != len(self.records):
             raise ValueError("Hybrid image span does not match provenance")
-        if self.plan["final_llm_tokens"] < len(self.base) + len(self.protected):
-            raise ValueError("Hybrid cannot preserve remaining Base and structural tokens")
+        stage2_view_budget(self.plan["final_llm_tokens"], len(self.base), len(self.protected), self.base_policy)
         return None, self.spatial
 
     def rank(self, hidden, start, ids):
@@ -266,10 +268,19 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
             raise ValueError("Hybrid selection mismatches sparse token order")
         full = ranking.new_zeros(original)
         full[torch.tensor(spatial, device=ranking.device)] = ranking
-        anyres = torch.tensor(self.anyres, device=ranking.device)
-        count = self.plan["final_llm_tokens"] - len(self.base) - len(self.protected)
-        order = torch.argsort(full[anyres], descending=True, stable=True)
-        selected = torch.cat((torch.tensor(self.base + self.protected, device=ranking.device), anyres[order[:count]])).long().sort().values
+        budget = stage2_view_budget(self.plan["final_llm_tokens"], len(self.base), len(self.protected), self.base_policy)
+        if budget["base_keep"] == len(self.base):
+            kept_base = torch.tensor(self.base + self.protected, device=ranking.device, dtype=torch.long)
+        else:
+            base = torch.tensor(self.base, device=ranking.device, dtype=torch.long)
+            base = base[torch.argsort(full[base], descending=True, stable=True)[:budget["base_keep"]]]
+            protected = torch.tensor(self.protected, device=ranking.device, dtype=torch.long)
+            kept_base = torch.cat((base, protected))
+        anyres = torch.tensor(self.anyres, device=ranking.device, dtype=torch.long)
+        order = torch.argsort(full[anyres], descending=True, stable=True) if budget["anyres_keep"] else anyres[:0]
+        selected = torch.cat((kept_base, anyres[order[:budget["anyres_keep"]]])).sort().values
+        if len(selected) != self.plan["final_llm_tokens"]:
+            raise RuntimeError("Stage2 selection changed the exact hybrid budget")
         return selected, self.plan["final_llm_tokens"], len(self.protected)
 
 
@@ -277,7 +288,7 @@ class PoolDistillMethod:
     name = "pool_distill"
 
     def __init__(self, core, checkpoint, *, rate, share, mode, settings, pruning_audit="lean",
-                 tail_drop_layers=0, predictor_input="full", base_mapping="reference"):
+                 tail_drop_layers=0, predictor_input="full", base_mapping="reference", base_policy="protect"):
         if mode not in {"base_full", "anyres_self"}:
             raise ValueError("Choose base_full or anyres_self")
         from .attention_predictor import AttentionPredictorMethod
@@ -286,6 +297,11 @@ class PoolDistillMethod:
             raise ValueError("pruning_audit must be lean or full")
         if base_mapping not in {"reference","fast"} or (base_mapping=="fast" and pruning_audit!="lean"):
             raise ValueError("Fast Base mapping requires pruning_audit=lean")
+        if base_policy not in {"protect", "anyres_first"}:
+            raise ValueError("Unknown stage2 Base policy")
+        if base_policy == "anyres_first" and not (0 < share < 1 and rate > 0):
+            raise ValueError("anyres_first requires an active two-stage hybrid (0 < lambda < 1)")
+        self.base_policy = base_policy
         if type(tail_drop_layers) is not int or not 0 <= tail_drop_layers <= len(core.layers)-2:
             raise ValueError("Tail removal must be nonnegative and begin after block2")
         if predictor_input not in {"full","base_text"} or (predictor_input=="base_text" and mode!="base_full"):
@@ -294,7 +310,7 @@ class PoolDistillMethod:
             raise ValueError("Ablations require an active distilled pruning stage")
         self.tail_drop_layers, self.predictor_input = tail_drop_layers, predictor_input
         self.adapter = PoolDistillAdapter(core, settings, rate=rate, share=share, mode=mode,
-            lean=pruning_audit=="lean", predictor_input=predictor_input, base_mapping=base_mapping)
+            lean=pruning_audit=="lean", predictor_input=predictor_input, base_mapping=base_mapping, base_policy=base_policy)
         self.rate, self.share, self.mode = rate, share, mode
 
     def prepare_inputs(self, original_size, tokens):
@@ -394,6 +410,7 @@ class PoolDistillMethod:
             base, protected = self.adapter.view_plan["base_keep"], self.adapter.view_plan["protected_newlines"]
             anyres = pre - base - protected
         tail = self.tail_drop_layers
+        stage2 = stage2_view_budget(final, base, protected, self.base_policy)
         last_visual = raw["final_llm_visual_tokens"] if self.share > 0 else pre
         if last_visual != (0 if tail else final):
             raise RuntimeError("Tail image-drop result differs from the requested ablation")
@@ -404,11 +421,14 @@ class PoolDistillMethod:
                     observed_layer_token_sum=observed,
                     budget_source="observed_generation", planned_layer_token_sum=expected,
                     pre_base_tokens=base, pre_anyres_tokens=anyres, protected_newlines=protected,
-                    stage2_llm_visual_tokens=final, stage2_anyres_tokens=final-base-protected,
-                    final_base_tokens=0 if tail else base, final_anyres_tokens=0 if tail else final-base-protected,
+                    stage2_llm_visual_tokens=final, stage2_base_tokens=stage2["base_keep"],
+                    stage2_anyres_tokens=stage2["anyres_keep"], stage2_base_pruned_tokens=base-stage2["base_keep"],
+                    final_base_tokens=0 if tail else stage2["base_keep"], final_anyres_tokens=0 if tail else stage2["anyres_keep"],
                     final_llm_visual_tokens=last_visual,
                     actual_average_prune_rate=100 * (1 - observed / (depth * original)),
-                    base_policy="MyPool compresses Base; stage2 protects remaining Base",
+                    stage2_base_policy=self.base_policy,
+                    base_policy=("MyPool compresses Base; stage2 protects remaining Base" if self.base_policy=="protect" else
+                                 "MyPool compresses Base; stage2 prunes AnyRes first, then lowest-scoring Base"),
                     position_policy="MyPool consecutive prefill IDs; stage2 preserves these IDs",
                     source_policy="normalized original merge coefficients; Base backprojection preserves probability mass")
 
@@ -435,8 +455,7 @@ class PoolDistillMethod:
             protected = self.adapter.view_plan["protected_newlines"]
             anyres = plan["pre_llm_tokens"] - base - protected
         final = plan["final_llm_tokens"]
-        if final < base + protected:
-            raise ValueError("Legacy counts cannot preserve Base and newlines")
+        stage2 = stage2_view_budget(final, base, protected, self.base_policy)
         tail, depth = self.tail_drop_layers, len(core.layers)
         expected = 2*plan["pre_llm_tokens"]+(depth-2-tail)*final
         return dict(plan, selection_mode=self.mode, predictor_input=self.predictor_input,
@@ -447,9 +466,12 @@ class PoolDistillMethod:
                     observed_layer_token_sum=None, planned_layer_token_sum=expected,
                     budget_source="legacy_reconstructed_counts",
                     pre_base_tokens=base, pre_anyres_tokens=anyres, protected_newlines=protected,
-                    stage2_llm_visual_tokens=final, stage2_anyres_tokens=final-base-protected,
-                    final_base_tokens=0 if tail else base, final_anyres_tokens=0 if tail else final-base-protected,
+                    stage2_llm_visual_tokens=final, stage2_base_tokens=stage2["base_keep"],
+                    stage2_anyres_tokens=stage2["anyres_keep"], stage2_base_pruned_tokens=base-stage2["base_keep"],
+                    final_base_tokens=0 if tail else stage2["base_keep"], final_anyres_tokens=0 if tail else stage2["anyres_keep"],
                     final_llm_visual_tokens=0 if tail else final,
-                    base_policy="MyPool compresses Base; stage2 protects remaining Base",
+                    stage2_base_policy=self.base_policy,
+                    base_policy=("MyPool compresses Base; stage2 protects remaining Base" if self.base_policy=="protect" else
+                                 "MyPool compresses Base; stage2 prunes AnyRes first, then lowest-scoring Base"),
                     position_policy="MyPool consecutive prefill IDs; stage2 preserves these IDs",
                     source_policy="normalized original merge coefficients; Base backprojection preserves probability mass")

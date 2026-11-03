@@ -35,7 +35,22 @@ def hybrid_budget(original, rate, share, depth=28, boundary=2):
                 stage2_remaining_prune_rate=100 * (1 - final / pre), depth=depth, pruning_layer=boundary)
 
 
-def pre_view_budget(plan, crop_count, side=27, final_newline=False, minimum=4):
+def stage2_view_budget(final, base, protected, base_policy="protect"):
+    """Reserve newlines, then prioritize Base before allocating AnyRes slots."""
+    if base_policy not in {"protect", "anyres_first"}:
+        raise ValueError("Unknown stage2 Base policy")
+    if any(type(value) is not int or value < 0 for value in (final, base, protected)):
+        raise ValueError("Invalid stage2 token counts")
+    if final <= protected:
+        raise ValueError("Distillation budget must preserve newlines plus at least one spatial token")
+    content = final - protected
+    if base_policy == "protect" and content < base:
+        raise ValueError("Distillation budget cannot protect the remaining Base and newlines")
+    base_keep = min(base, content)
+    return dict(base_keep=base_keep, anyres_keep=content-base_keep, protected_newlines=protected)
+
+
+def pre_view_budget(plan, crop_count, side=27, final_newline=False, minimum=4, base_policy="protect"):
     """Split the exact packed pre-budget proportionally between Base / AnyRes.
 
     MyPool's sparse row newlines are reserved BEFORE content apportionment.
@@ -57,6 +72,5 @@ def pre_view_budget(plan, crop_count, side=27, final_newline=False, minimum=4):
         keeps[i] += 1
     if keeps[0] < minimum or keeps[1] < crop_count * minimum:
         raise ValueError("Pre-budget cannot preserve independent Base / AnyRes minima")
-    if plan["final_llm_tokens"] < keeps[0] + protected:
-        raise ValueError("Distillation budget cannot protect the remaining Base and newlines")
+    stage2_view_budget(plan["final_llm_tokens"], keeps[0], protected, base_policy)
     return dict(base_keep=keeps[0], anyres_keep=keeps[1], protected_newlines=protected)

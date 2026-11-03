@@ -26,6 +26,11 @@ For **Base+Text / fast mapping with tails0..15**, use
 lambda0.6/0.7/0.8/0.9, 192 full-data trials with compact summaries and resume.
 See [fraction units and complete command](docs/base_text_fast_tail_sweep.md).
 
+For high-rate hybrid trials that cannot preserve all remaining Base tokens,
+use `--base-policy anyres_first`: remove AnyRes first, then retain the highest
+predicted Base scores if required. The default `protect` policy stays unchanged.
+See [90% / Base+Text / fast / tail9 / GPU5 command](docs/pool_anyres_first.md).
+
 For **MyPool before LLM + the existing distilled block2 predictor**, use:
 
 ```bash

@@ -29,6 +29,7 @@ def worker_command(args, api, rate, share, mode, gpu, folder):
         "--tail-drop-layers", str(args.tail_drop_layers),
         "--predictor-input", args.predictor_input, "--summary-format", args.summary_format,
         "--base-mapping",args.base_mapping,
+        "--base-policy",args.base_policy,
         "--redundancy-layers", *map(str, args.redundancy_layers),
         "--visionzip-layers", *map(str, args.visionzip_layers), "--output-dir", str(folder)]
     if args.resume:
@@ -79,7 +80,7 @@ def run_parallel_sweep(args, *, api, process_factory=None, poll_interval=.2):
             prune_rates=args.prune_rates, lambdas=args.lambdas, selection_modes=args.selection_modes,
             prompt_format=api.PROMPT_FORMAT, visualization=False,
             lambda_definition="distillation contribution / target WHOLE native-packed layer-average removal",
-            base_policy="MyPool compresses Base + AnyRes; block2 protects remaining Base",
+            base_policy=args.base_policy,
             checkpoint_policy="reuse existing predictor; no training")
     manifest.update(complete=False, gpus=list(args.gpus), isolated_sequential_processes=False,
         pruning_auxiliary_profile=api.auxiliary_profile(args.pruning_audit),
