@@ -187,11 +187,13 @@ class ViCoMethod:
 from .priortr import PriorTRMethod
 from .clse import CLSEMethod
 from .attention_predictor import AttentionPredictorMethod
+from .anchorprune import AnchorPruneMethod
 
 
 METHODS = {"fastv": FastVMethod.from_config, "vico": ViCoMethod.from_config,
            "priortr": PriorTRMethod.from_config, "clse": CLSEMethod.from_config,
-           "attention_predictor": AttentionPredictorMethod.from_config}
+           "attention_predictor": AttentionPredictorMethod.from_config,
+           "anchorprune": AnchorPruneMethod.from_config}
 
 
 def resolve_method_config(name: str, config_path=None) -> Path:

@@ -51,6 +51,10 @@ def build_parser():
     parser.add_argument("--warmup", type=int, default=10,
                         help="With --benchmark-metrics: warmup images per rate before evaluating ALL inputs (default 10; 0 disables warmup)")
     parser.add_argument("--output-dir", type=Path, default=PROJECT / "outputs" / "run")
+    parser.add_argument("--summary-format", choices=("full", "compact"), default="full",
+                        help="compact: eleven config/ACC/Lat/Mem/BACC/F1/relative-ACC columns; requires --benchmark-metrics")
+    parser.add_argument("--baseline-acc", type=float, default=91.18,
+                        help="Unpruned reference ACC in percent for relative accuracy (default 91.18)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Fixed seed for a repeatable run; default generates a new seed")
     return parser
@@ -71,6 +75,7 @@ def main():
         seed=args.seed, no_sample=args.no_sample, include_pruning_time=args.include_pruning_time,
         benchmark_metrics=args.benchmark_metrics, warmup=args.warmup,
         visualize_samples=args.visualize_samples,
+        summary_format=args.summary_format, baseline_acc=args.baseline_acc,
     )
     print(f"Saved results to {output}")
     if no_plots or args.no_metric_plot:

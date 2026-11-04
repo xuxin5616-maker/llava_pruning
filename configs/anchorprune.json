@@ -1,0 +1,10 @@
+{
+  "rate_semantics": "layer_average",
+  "prune_rates": [1, 50, 70, 90],
+  "visualize_rates": [],
+  "vision_layer": 26,
+  "anchor_min_ratio": 0.15625,
+  "tau": 0.2,
+  "patience": 3,
+  "query_chunk": 64
+}

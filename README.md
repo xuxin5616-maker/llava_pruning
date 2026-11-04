@@ -2,6 +2,18 @@
 
 A small, single-image inference scaffold for LLaVA OneVision/Qwen2 checkpoints. Choose **FastV** (`--method fastv`, the default), **ViCo / PyramidDrop** (`--method vico`), **PriorTR** (`--method priortr`), or **CLSE** (`--method clse`). It loads the model once and evaluates the configured rates sequentially on the same GPU. All methods use the original decoder forward at rate 0. Project and Python package names are now `llava_pruning`; import and redraw commands use this new name.
 
+## Independent AnchorPrune baseline
+
+Use `--method anchorprune --method-config configs/anchorprune.json` with
+`--roi-mode anyres_max_9`. The pinned official selector is adapted to SigLIP
+using the paper's non-CLIP post-projector relevance and independent received
+attention. Native packing is preserved; pruning happens before ALL LLM layers.
+Rates use the whole native packed-image layer-average definition, including
+protected image newlines. Defaults: 1/50/70/90 percent; no sample images.
+Add `--benchmark-metrics --summary-format compact --no-plots` to record Lat,
+peak Mem, BACC/F1 and accuracy relative to 91.18% in the eleven-column CSV.
+See [full GPU5 command, exact budget and documented adaptations](docs/anchorprune.md).
+
 ## Learned block2 -> block22 attention predictor
 
 For the **63-trial tail-image-drop / Base+Text side-input ablation suite**, use

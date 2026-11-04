@@ -2,6 +2,7 @@
 
 import csv
 import json
+import math
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,8 @@ from .metrics import Accuracy, METRIC_RULE
 from .prompts import resolve_prompt
 from .rates import format_prune_rate
 from .selection import resolve_visualization_ids, visualization_key
+from .extended_metrics import EXTRA_FIELDS, METRIC_DEFINITIONS, extended_metrics
+from .pool_ablation_report import FIELDS as COMPACT_FIELDS, compact_result_row
 
 
 BENCHMARK_SAMPLE_FIELDS = ("lat_seconds", "generation_seconds", "generated_tokens",
@@ -36,7 +39,11 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         method_config, roi_mode, save_prune_vis, save_attention_vis,
         output_dir, seed=None, no_sample=True, include_pruning_time=True,
         image_token_order="base_first", benchmark_metrics=False, warmup=10,
-        visualize_samples=None):
+        visualize_samples=None, summary_format="full", baseline_acc=91.18):
+    if summary_format not in {"full", "compact"} or (summary_format == "compact" and not benchmark_metrics):
+        raise ValueError("Compact result summaries require --benchmark-metrics")
+    if type(baseline_acc) not in (int, float) or not math.isfinite(baseline_acc) or not 0 < baseline_acc <= 100:
+        raise ValueError("--baseline-acc must be a percentage in (0,100]")
     if type(include_pruning_time) is not bool:
         raise ValueError("include_pruning_time must be a boolean")
     if type(benchmark_metrics) is not bool:
@@ -54,11 +61,15 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                                   and method.name == "attention_predictor")
     if benchmark_metrics and (save_prune_vis or save_attention_vis) and not deferred_visualization:
         raise ValueError("--benchmark-metrics requires no sample visualization for this method (use --no-plots)")
-    if method.name in {"clse", "attention_predictor"} and any(rate != 0 for rate in method.rates):
+    if method.name in {"clse", "attention_predictor", "anchorprune"} and any(rate != 0 for rate in method.rates):
         if roi_mode != "anyres_max_9":
             raise ValueError(f"{method.name} nonzero rates require --roi-mode anyres_max_9")
         if not no_sample:
             raise ValueError(f"{method.name} supports greedy decoding only; use --no-sample")
+    if method.name == "anchorprune" and (save_prune_vis or save_attention_vis):
+        raise ValueError("This AnchorPrune adapter exports results only; omit sample visualization flags")
+    if method.name == "anchorprune" and not include_pruning_time:
+        raise ValueError("AnchorPrune reports complete inference cost; use --include-pruning-time")
     if getattr(method, "budget_mode", "joint") == "base_anyres" and roi_mode != "anyres_max_9":
         raise ValueError("FastV base_anyres budget requires --roi-mode anyres_max_9")
     if roi_mode == "base_only":
@@ -123,6 +134,8 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                      if not no_sample else "greedy, max_new_tokens<=512 (LLaVA context budget)"),
         "inference": getattr(backend, "inference_config", {}),
         "metric_rule": METRIC_RULE,
+        "summary_format": summary_format,
+        "baseline_accuracy_reference": baseline_acc / 100,
     }
     if visualization_ids is not None:
         metadata["visualize_samples"] = sorted(visualization_ids)
@@ -139,6 +152,11 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
     if method.name == "clse":
         metadata["inference"] = dict(metadata["inference"], attention_source="none; pure CLSE spectral evolution",
                                      score_dtype="FP32 scoring branch; native decoder dtype/backend unchanged")
+    if method.name == "anchorprune":
+        metadata["inference"] = dict(metadata["inference"],
+            attention_source="independent SigLIP received QK attention; no LLM attention requests",
+            score_dtype="FP32 relevance, novelty and importance branch; native decoder dtype/backend unchanged")
+        metadata["extended_metric_definitions"] = METRIC_DEFINITIONS
     if method.name == "attention_predictor":
         metadata["inference"] = dict(metadata["inference"], attention_source="trained three-layer side Transformer",
                                      score_dtype="FP32 final QK/softmax/mapping; student precision in checkpoint; backbone untouched",
@@ -179,6 +197,10 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         summary_fields += BENCHMARK_SUMMARY_FIELDS
     if resolved_budgets:
         summary_fields += LAYER_AVERAGE_BUDGET_FIELDS
+    if method.name == "anchorprune" or summary_format == "compact":
+        summary_fields += EXTRA_FIELDS
+    if summary_format == "compact":
+        summary_fields = COMPACT_FIELDS
     with summary_path.open("w", encoding="utf-8", newline="") as summary_file:
         csv.writer(summary_file).writerow(summary_fields)
     deferred_images = []
@@ -205,6 +227,8 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
                 for field in ("actual_layer_prune_rate", "actual_average_prune_rate"):
                     values = [item[field] for item in sample_budgets if item.get(field) is not None]
                     metrics[field] = sum(values) / len(values) if values else None
+            if method.name == "anchorprune" or summary_format == "compact":
+                metrics = extended_metrics(metrics, baseline_acc / 100)
             return metrics
 
         if benchmark_metrics:
@@ -336,7 +360,9 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
         metrics = current_metrics(complete=True)
         _write_metrics(metrics_path, metrics)
         with summary_path.open("a", encoding="utf-8", newline="") as summary_file:
-            csv.writer(summary_file).writerow(metrics[field] for field in summary_fields)
+            report = (compact_result_row(metrics, f"prune={rate:g}%;{method.name};roi={roi_mode};rate=layer_average")
+                      if summary_format == "compact" else metrics)
+            csv.writer(summary_file).writerow(report[field] for field in summary_fields)
         score = "N/A" if metrics["accuracy"] is None else f"{metrics['accuracy']:.2%}"
         print(f"rate={rate_label} accuracy={score} "
               f"({metrics['correct']}/{metrics['labeled_samples']}, "

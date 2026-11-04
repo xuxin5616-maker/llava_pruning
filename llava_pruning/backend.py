@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -251,6 +252,8 @@ class LlavaBackend:
 
         if hasattr(method,"prepare_inputs"):
             method.prepare_inputs(image.size,tokens)
+        if hasattr(method, "prepare_prompt"):
+            method.prepare_prompt(prompt, self.tokenizer)
 
         # Match SimpleModelWorker's context budget, including its base-view
         # patch count approximation (not a newly chosen anyres token budget).
@@ -268,12 +271,14 @@ class LlavaBackend:
             "max_new_tokens": max_new_tokens,
             "use_cache": True,
         }
-        if benchmark_metrics:
-            from .benchmark_timing import generate_with_benchmark
-            generated, timing = generate_with_benchmark(self.model, generation_options)
-        else:
-            generated, timing = _generate_with_timing(
-                self.model, generation_options, include_pruning_time=include_pruning_time)
+        context = method.inference_context(self.model) if hasattr(method, "inference_context") else nullcontext()
+        with context:
+            if benchmark_metrics:
+                from .benchmark_timing import generate_with_benchmark
+                generated, timing = generate_with_benchmark(self.model, generation_options)
+            else:
+                generated, timing = _generate_with_timing(
+                    self.model, generation_options, include_pruning_time=include_pruning_time)
         answer = self.tokenizer.batch_decode(generated, skip_special_tokens=True)[0].strip()
         core = self.model.get_model()
         result = {

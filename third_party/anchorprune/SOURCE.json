@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/MULTI-cau/AnchorPrune",
+  "commit": "0e0098b591133433f787e870383ca7ad406e2486",
+  "paper": "https://arxiv.org/abs/2607.07033v5",
+  "license": "Apache-2.0",
+  "sha256_lf": {
+    "selection.py": "ba1cda0f6c1c723aa31b30eda73c953ca45a0d88440755ef14c524155cce5b89",
+    "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  }
+}
