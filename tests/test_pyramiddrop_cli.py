@@ -80,13 +80,42 @@ class PlanTests(unittest.TestCase):
         [thirty_two] = self.plan("--stage-keep-ratio", "0.5", depth=32)
         self.assertEqual(tuple(thirty_two["layers"]), (8, 16, 24))
 
-    def test_default_sweep_is_average_visual_token_retention(self):
+    def test_default_sweep_is_average_pruning50_and70(self):
         plans = self.plan()
-        self.assertEqual([plan["average_keep_rate"] for plan in plans], [100, 50, 70, 90])
-        self.assertFalse(plans[0]["enabled"])
-        self.assertTrue(all(plan["enabled"] for plan in plans[1:]))
-        self.assertTrue(all(plan["prune_rate"] is None for plan in plans))
-        self.assertEqual(len({plan["name"] for plan in plans}), 4)
+        self.assertEqual([plan["prune_rate"] for plan in plans], [50, 70])
+        self.assertEqual([plan["average_keep_rate"] for plan in plans], [50, 30])
+        self.assertTrue(all(plan["enabled"] for plan in plans))
+        self.assertTrue(all(plan["rate_semantics"]=="layer_average" for plan in plans))
+        self.assertEqual(len({plan["name"] for plan in plans}), 2)
+
+    def test_average_pruning_reuses_weighted_retention_and_explicit_legacy_stays_available(self):
+        for depth in (28,29,32):
+            plans=self.plan("--average-prune-rates","0","50","70",depth=depth)
+            legacy=self.plan("--average-keep-rates","100","50","30",depth=depth)
+            for plan,old,target in zip(plans,legacy,(0,50,70)):
+                self.assertEqual(plan["keep_ratios"],old["keep_ratios"])
+                self.assertEqual(plan["layers"],old["layers"])
+                self.assertEqual(plan["target_average_prune_rate"],target)
+                self.assertAlmostEqual(100*(1-plan["expected_average_keep_ratio"]),target,places=10)
+                self.assertEqual(plan["enabled"],target!=0)
+        legacy=self.plan("--average-keep-rates","100","50","70","90")
+        self.assertEqual([item["average_keep_rate"] for item in legacy],[100,50,70,90])
+        self.assertFalse(legacy[0]["enabled"])
+
+    def test_average_pruning_rejects_unreachable_and_conflicting_budgets(self):
+        for rate in ("-1","75","90","100","nan","inf"):
+            self.invalid("--average-prune-rates",rate)
+        self.invalid("--average-prune-rates","50","50")
+        self.invalid("--average-prune-rates","50","--average-keep-rates","50")
+        self.invalid("--average-prune-rates","50","--prune-rates","50","--rate-semantics","final_cumulative")
+        self.invalid("--average-prune-rates","50","--stage-keep-ratio",".5")
+        self.invalid("--average-prune-rates","50","--keep-ratios",".5",".25",".125")
+        self.invalid("--average-prune-rates","50","--rate-semantics","per_stage")
+        args=entry.build_parser().parse_args(["--layers","20","40","60","--average-prune-rates","70"])
+        self.assertEqual(entry.resolve_plan(args,61,validate_only=True),[])
+        self.assertAlmostEqual(entry.resolve_plan(args,80)[0]["expected_average_prune_rate"],70)
+        with self.assertRaisesRegex(ValueError,"unreachable"):
+            entry.resolve_plan(args,61)
 
     def test_average_budget_uses_each_stage_width_including_unequal_depth(self):
         for depth in (28, 29, 32):
@@ -201,7 +230,8 @@ class PlanTests(unittest.TestCase):
                 contextlib.redirect_stdout(stdout):
             entry.main()
         plans = json.loads(stdout.getvalue())
-        self.assertEqual([plan["average_keep_rate"] for plan in plans], [100, 50, 70, 90])
+        self.assertEqual([plan["prune_rate"] for plan in plans], [50,70])
+        self.assertTrue(all(plan["rate_semantics"]=="layer_average" for plan in plans))
         self.assertTrue(all(plan["layers"] == [7, 14, 21] for plan in plans))
 
 
@@ -238,7 +268,7 @@ class EntryPointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             inputs = self.create_input(root)
-            args = self.arguments(root, inputs)
+            args = self.arguments(root, inputs, "--average-keep-rates", "100", "50", "70", "90")
             expected_plans = entry.resolve_plan(args, 4)
             with contextlib.redirect_stdout(io.StringIO()):
                 actual = entry.run_experiment(args, backend_factory=FakeBackend)
@@ -314,6 +344,68 @@ class EntryPointTests(unittest.TestCase):
             self.assertFalse(backend.model.get_model().pyramiddrop_enabled)
             self.assertFalse(backend.model.get_model().pyramiddrop_capture_stages)
             self.assertEqual(backend.model.get_model().get_pyramiddrop_stats()["mode"], "disabled_baseline")
+
+    def test_default_average_pruning_sweep_reports_actual_counts_and_benchmark_for_both_rates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            args=self.arguments(root,self.create_input(root),"--benchmark-metrics","--warmup","1")
+            with patch("torch.cuda.is_available",return_value=True), \
+                    patch("torch.cuda.device_count",return_value=1), \
+                    patch("benchmark_fastv.validate_single_gpu"), \
+                    patch("torch.cuda.get_device_properties",return_value=types.SimpleNamespace(total_memory=10*1024**3)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                output=entry.run_experiment(args,backend_factory=FakeBackend)
+            self.assertEqual(len(FakeBackend.instances),1)
+            backend=FakeBackend.instances[0]
+            self.assertEqual(len(backend.calls),6)
+            self.assertTrue(all(not call[4]["capture_visualization"] and not call[4]["capture_attention"] for call in backend.calls))
+            with (output/"summary.csv").open(encoding="utf-8",newline="") as stream:
+                rows=list(csv.DictReader(stream))
+            self.assertEqual(len(rows),2)
+            for rate,row in zip((50,70),rows):
+                self.assertEqual(float(row["prune_rate"]),rate)
+                self.assertEqual(row["rate_semantics"],"layer_average")
+                self.assertEqual(float(row["target_average_prune_rate"]),rate)
+                self.assertAlmostEqual(float(row["expected_average_prune_rate"]),rate)
+                self.assertEqual(json.loads(row["pruning_layers"]),[1,2,3])
+                self.assertEqual(float(row["lat_mean_ms"]),7)
+                self.assertEqual(float(row["mem_peak_allocated_gib"]),1)
+                self.assertEqual(int(row["warmup_samples"]),1)
+                records=[json.loads(line) for line in (output/f"average_prune_{rate}/predictions.jsonl").read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(records),2)
+                actual=100*(1-sum(records[0]["pruning"]["layers"][i]["image_tokens_in"] for i in range(4))/(4*7))
+                self.assertAlmostEqual(float(row["actual_average_prune_rate"]),actual)
+                self.assertEqual(records[0]["target_average_prune_rate"],rate)
+                self.assertAlmostEqual(records[0]["actual_average_prune_rate"],actual)
+            # Short seven-token fixtures hit the one-token minimum: report the
+            # measured result instead of fabricating an exact70% actual rate.
+            self.assertNotEqual(float(rows[1]["actual_average_prune_rate"]),70)
+
+    def test_real28_block_prefill_and_cached_decode_follow_new_average_schedules(self):
+        for plan in entry.resolve_plan(entry.build_parser().parse_args([]),28):
+            torch.manual_seed(490)
+            config=tiny_config("sdpa");config.num_hidden_layers=28;config.max_position_embeddings=2048
+            core=TinyPyramidDrop(config).eval()
+            method=entry.PyramidDropMethod(plan);method.configure(core,plan["prune_rate"])
+            n=729;text=4;length=n+text
+            core.set_pyramiddrop_image_spans([[(2,2+n)]],length)
+            tokens=(torch.arange(length)%63+1)[None]
+            with torch.no_grad():
+                result=core(input_ids=tokens,use_cache=True)
+                stats=method.stats(core,plan["prune_rate"])
+                expected=[n]+[max(1,int(n*ratio)) for ratio in plan["keep_ratios"]]
+                self.assertEqual([row["image_tokens_in"] for row in stats["layers"]],
+                                 [count for count in expected for _ in range(7)])
+                measured=100*(1-sum(row["image_tokens_in"] for row in stats["layers"])/(28*n))
+                self.assertLess(abs(measured-plan["prune_rate"]),100/n)
+                self.assertEqual(stats["rate_semantics"],"layer_average")
+                self.assertEqual(stats["requested_average_prune_rate"],plan["prune_rate"])
+                self.assertEqual(result.last_hidden_state.shape[1],expected[-1]+text)
+                result=core(input_ids=torch.tensor([[5]]),past_key_values=result.past_key_values,use_cache=True)
+                self.assertEqual(result.last_hidden_state.shape,(1,1,32))
+                for stage,count in enumerate(expected):
+                    for layer in range(stage*7,(stage+1)*7):
+                        self.assertEqual(result.past_key_values.get_seq_length(layer),count+text+1)
 
     def test_warmup_is_excluded_from_predictions_and_metric_counts(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import copy
 import csv
 import hashlib
 import json
@@ -12,7 +13,7 @@ from pathlib import Path
 
 
 PROJECT = Path(__file__).resolve().parent
-SCRIPT_VERSION = "1.1-onevision-pyramiddrop-lat-mem"
+SCRIPT_VERSION = "1.2-onevision-pyramiddrop-average-pruning"
 SOURCE_COMMIT = "6444f304aee4b7edcb022839fb9e8cd07859704a"
 DEFAULT_MODEL = "/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/"
 DEFAULT_INPUT = "/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl"
@@ -23,6 +24,7 @@ SUMMARY_FIELDS = (
     "parsed_samples", "tp", "fp", "tn", "fn", "precision", "recall", "tnr",
     "mean_generation_seconds", "max_peak_memory_allocated_mb", "mean_final_llm_visual_tokens",
     "mean_layer_average_visual_tokens", "mean_actual_average_keep_ratio",
+    "target_average_prune_rate", "expected_average_prune_rate", "actual_average_prune_rate", "pruning_layers",
 )
 BENCHMARK_FIELDS = (
     "lat_mean_ms", "lat_p50_ms", "lat_p95_ms", "lat_std_ms",
@@ -55,14 +57,42 @@ def resolve_plan(args, model_depth, *, validate_only=False):
     rates = args.prune_rates if args.prune_rates is not None else (
         [args.prune_rate] if args.prune_rate is not None else None)
     average_rates = args.average_keep_rates
-    if (average_rates is None and rates is None and args.keep_ratios is None
+    average_prune_rates = args.average_prune_rates
+    if (average_prune_rates is None and average_rates is None and rates is None and args.keep_ratios is None
             and args.stage_keep_ratio is None and args.rate_semantics is None):
-        average_rates = [100, 50, 70, 90]
+        average_prune_rates = [50, 70]
     edges = (0, *layers, model_depth)
     widths = tuple(b - a for a, b in zip(edges, edges[1:]))
 
     def expected_average(ratios):
         return sum(width * ratio for width, ratio in zip(widths, (1.0, *ratios))) / model_depth
+
+    if average_prune_rates is not None:
+        if (average_rates is not None or rates is not None or args.keep_ratios is not None
+                or args.stage_keep_ratio is not None or args.rate_semantics is not None):
+            raise ValueError("average-prune-rates cannot be combined with other budget options")
+        if (not average_prune_rates or len(set(average_prune_rates)) != len(average_prune_rates)
+                or any(not math.isfinite(rate) or not 0 <= rate < 100 for rate in average_prune_rates)):
+            raise ValueError("average-prune-rates must be distinct finite percentages in [0,100)")
+        if not validate_only:
+            maximum = 100 * (1 - widths[0] / model_depth)
+            for rate in average_prune_rates:
+                if rate >= maximum:
+                    raise ValueError(f"Average pruning {rate}% is unreachable with layers {layers}: "
+                                     f"the first {widths[0]}/{model_depth} layers retain every token, "
+                                     f"so the target must be below {maximum:g}%; choose earlier layers")
+        # Reuse the existing stage-width-weighted solver, without changing the
+        # paper's equal per-stage retention schedule or the model implementation.
+        retention_args = copy(args)
+        retention_args.average_prune_rates = None
+        retention_args.average_keep_rates = [100 - rate for rate in average_prune_rates]
+        plan = resolve_plan(retention_args, model_depth, validate_only=validate_only)
+        for setting, rate in zip(plan, average_prune_rates):
+            label = str(int(rate)) if float(rate).is_integer() else repr(float(rate))
+            setting.update(name="average_prune_" + label.replace(".", "p"), prune_rate=rate,
+                           rate_semantics="layer_average", target_average_prune_rate=rate,
+                           expected_average_prune_rate=100 * (1 - setting["expected_average_keep_ratio"]))
+        return plan
 
     if average_rates is not None:
         if rates is not None or args.keep_ratios is not None or args.stage_keep_ratio is not None or args.rate_semantics is not None:
@@ -163,6 +193,7 @@ class PyramidDropMethod:
         result = dict(core.get_pyramiddrop_stats())
         result.update(setting=self.setting["name"], rate_semantics=self.setting["rate_semantics"],
                       requested_prune_rate=self.setting["prune_rate"],
+                      requested_average_prune_rate=self.setting.get("target_average_prune_rate"),
                       requested_average_keep_rate=self.setting["average_keep_rate"])
         return result
 
@@ -262,6 +293,8 @@ def run_experiment(args, *, backend_factory=None):
                    "per-sample PyTorch peak allocated/reserved in MiB, reset before CPU preprocessing/H2D; "
                    "sum of per-device peaks is not a simultaneous multi-device peak"),
         "comparison": "final cumulative and per-stage rates do not imply matched layer-average tokens or FLOPs across methods",
+        "average_pruning_definition": "100*(1-sum_l(N_visual_entering_layer_l)/(decoder_depth*N_original_packed_visual)); "
+                                      "includes Base/AnyRes/newlines; integer rounding/minimum one token reported as actual",
     })
     with (output / "summary.csv").open("w", encoding="utf-8", newline="") as stream:
         csv.DictWriter(stream, fieldnames=summary_fields).writeheader()
@@ -292,6 +325,11 @@ def run_experiment(args, *, backend_factory=None):
                            mean_final_llm_visual_tokens=sum(lengths) / len(lengths) if lengths else None,
                            mean_layer_average_visual_tokens=sum(layer_means) / len(layer_means) if layer_means else None,
                            mean_actual_average_keep_ratio=sum(actual_ratios) / len(actual_ratios) if actual_ratios else None)
+            metrics.update(target_average_prune_rate=setting.get("target_average_prune_rate"),
+                           expected_average_prune_rate=100 * (1-setting["expected_average_keep_ratio"]),
+                           actual_average_prune_rate=100 * (1-metrics["mean_actual_average_keep_ratio"])
+                               if metrics["mean_actual_average_keep_ratio"] is not None else None,
+                           pruning_layers=list(setting["layers"]))
             if args.benchmark_metrics:
                 metrics.update({key: None for key in BENCHMARK_FIELDS})
                 metrics.update(measurement_summary(measurements, total_memory), warmup_samples=len(warmups))
@@ -300,6 +338,7 @@ def run_experiment(args, *, backend_factory=None):
 
         save_metrics(False)
         fields = ("question_id", "image", "gt", "prediction", "answer", "setting", "prune_rate", "average_keep_rate",
+                  "rate_semantics", "target_average_prune_rate", "actual_average_prune_rate",
                   "generation_seconds", "original_image_tokens", "final_llm_visual_tokens",
                   "layer_average_visual_tokens", "actual_average_keep_ratio", "peak_memory_allocated_mb")
         if args.benchmark_metrics:
@@ -335,6 +374,8 @@ def run_experiment(args, *, backend_factory=None):
                               gt=sample.gt, answer=answer, prediction=prediction,
                               prediction_label={0: "Normal", 1: "Abnormal"}.get(prediction, "Unparsed"),
                               setting=setting["name"], prune_rate=rate, average_keep_rate=setting["average_keep_rate"], method=method.name,
+                              rate_semantics=setting["rate_semantics"], target_average_prune_rate=setting.get("target_average_prune_rate"),
+                              actual_average_prune_rate=100*(1-actual_average_ratio) if actual_average_ratio is not None else None,
                               generation_seconds=result["generation_seconds"], max_new_tokens=result.get("max_new_tokens"),
                               layer_average_visual_tokens=layer_average, actual_average_keep_ratio=actual_average_ratio,
                               pruning=stats, **memory)
@@ -387,8 +428,10 @@ def build_parser():
     rates = parser.add_mutually_exclusive_group()
     rates.add_argument("--prune-rate", type=int)
     rates.add_argument("--prune-rates", type=int, nargs="+")
+    rates.add_argument("--average-prune-rates", type=float, nargs="+",
+                       help="Layer-average visual token REMOVAL percentages, default: 50 70; e.g. 70 means retain30% on average")
     rates.add_argument("--average-keep-rates", type=float, nargs="+",
-                       help="Layer-average visual token RETENTION percentages, e.g. 100 50 70 90; default sweep")
+                       help="Legacy layer-average visual token RETENTION percentages, e.g. 100 50 70 90")
     parser.add_argument("--rate-semantics", choices=("final_cumulative", "per_stage"),
                         help="Required with prune-rate(s); final_cumulative=final removed fraction, per_stage=removed at each boundary")
     parser.add_argument("--stage-keep-ratio", type=float, help="Per-stage retention lambda, default .5; cannot combine with prune-rate(s)")

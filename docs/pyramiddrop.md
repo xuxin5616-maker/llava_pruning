@@ -16,7 +16,9 @@ PyramidDrop 在浅层保留全部视觉 token，随后分阶段删除与当前�
 
 ## 本项目表格的百分比定义
 
-保留补丁原有的默认设置：**各 decoder 层平均视觉 token 保留率**。默认的 50/70/90 表示保留 50%/70%/90%，不是删除这些比例。建议表头使用 `Average token retention`。未剪枝基线为 100%。这是该入口的默认预算口径，并非用户对后续比较预算的确认；另提供显式的最终累计剪枝率选项。
+当前默认实验是 **LLM各层平均视觉token剪枝率50%、70%**，明确使用
+`--average-prune-rates 50 70`。70%表示平均删除70%、平均保留30%，不是最终累计删除70%。
+原有`--average-keep-rates`平均保留率接口及显式`final_cumulative`接口继续兼容，含义保持原样。
 
 设原始视觉段长度为 N0，阶段 s 的层数为 Ls，则平均保留率为：
 
@@ -26,7 +28,19 @@ PyramidDrop 在浅层保留全部视觉 token，随后分阶段删除与当前�
 
 `R = (1 + λ + λ² + λ³) / 4`。
 
-入口反解 λ，得到以下配置；不等长边界则使用真实层数加权求解。
+平均剪枝率为`P = 100 * (1-R)`。入口按目标`R=1-P/100`反解λ，保留每阶段相同相对保留系数的
+金字塔策略；不等长边界使用实际层数加权。28层模型在第7、14、21层后剪枝，新实验的阶段累计保留率为：
+
+| 目标平均剪枝率 | 第7层后 / N0 | 第14层后 / N0 | 第21层后 / N0 |
+|---|---:|---:|---:|
+| 50% | 54.3689% | 29.5598% | 16.0713% |
+| 70% | 16.7320% | 2.7996% | 0.4684% |
+
+平均剪枝70%对应最终累计删除约99.5316%，因此与此前最终累计70%的实验不是相同预算。
+使用原来的模型精度、attention模式、独立Q/K评分和剪枝层号；仅改变预算目标与对应的阶段保留数量。
+所有packed视觉token（Base、AnyRes和newline）都计入原始分母，与现有PyramidDrop处理一致。
+
+下面的表格仅解释旧的显式`--average-keep-rates`接口，这里的数值是**平均保留率**：
 
 | 各层平均保留率 | 第一次剪后 / N0 | 第二次剪后 / N0 | 第三次剪后 / N0 |
 |---|---:|---:|---:|
@@ -35,13 +49,39 @@ PyramidDrop 在浅层保留全部视觉 token，随后分阶段删除与当前�
 | 90% | 93.0136% | 86.5153% | 80.4710% |
 | 论文 λ=0.5 | 50% | 25% | 12.5% |
 
-论文默认 λ=0.5 的平均保留率是 46.875%，需单独报告。每阶段数量遵循官方 `floor(N0 * ratio)`，极短视觉段额外确保至少保留一个 token；这项安全扩展会记录在统计中。整数取整使实际平均保留率与连续目标略有差异，每张图及汇总都输出实际比例，不能把目标比例伪装成精确实测。固定前 1/4 层完整保留时，平均保留率必须大于 25%；若将 90% 误解为平均删除率，原四等分设置无法达到。
+论文默认 λ=0.5 的平均保留率是46.875%，平均剪枝率为53.125%，需单独报告。
+每阶段数量仍遵循`floor(N0 * ratio)`，极短视觉段至少保留一个token；整数取整及最小数量保护会影响实际平均值。
+逐图和汇总同时输出目标、连续求解值和实际值。固定前7/28层完整保留时，平均剪枝目标必须小于75%，
+因此这组层号无法运行平均剪枝90%；代码明确报错，不降低目标或跳过样本。
 
 平均视觉 token 一致不代表 FLOPs、端到端时间或显存一致。最终比较使用同样输入、分辨率、提示词、生成长度上限、硬件、预热和测量方式，并报告实测结果。
 
 ## 服务器运行
 
-在原项目环境、项目根目录执行。默认权重和 MVTec 路径沿用项目已有设置。先验证少量样本：
+在原项目环境、项目根目录执行。默认权重和MVTec路径沿用项目已有设置。
+新实验：GPU5、全量数据、平均剪枝50%和70%、不保存图片，统计首token Lat和完整生成峰值Mem：
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python runPyramidDrop.py \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \
+  --data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
+  --prompt-version v0 \
+  --roi-mode anyres_max_9 \
+  --average-prune-rates 50 70 \
+  --benchmark-metrics \
+  --warmup 10 \
+  --output-dir output/pyramiddrop_avg_prune_50_70_gpu5_01
+```
+
+一次加载模型，按50%、70%顺序运行；固定greedy解码。输出目录必须为空或不存在。无需修改JSON配置或重新训练。
+只检查预算、无需模型或GPU：
+
+```bash
+python runPyramidDrop.py --plan-only --model-depth 28 --average-prune-rates 50 70
+```
+
+`--average-prune-rates 0`运行原始不剪枝路径。旧平均保留率接口的小样本验证仍可显式运行：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python runPyramidDrop.py \
@@ -94,16 +134,22 @@ CUDA_VISIBLE_DEVICES=5 python runPyramidDrop.py \
   --output-dir output/pyramiddrop_final_lat_mem_01
 ```
 
-默认关闭采样、关闭可视化，输入全部运行，无固定 100 张限制。此处 0/50/70/90 均指最终累计剪枝率；中间阶段按剩余比例的 1/3、2/3、1 次幂分配，整数取 floor。层号由真实模型深度确定，28 层时为 7/14/21，可用 `--layers` 覆盖。
+默认关闭采样、关闭可视化，输入全部运行，无固定100张限制。上面的兼容命令显式选择了
+`final_cumulative`，因此其中0/50/70/90表示最终累计剪枝率；它们不是新默认实验的平均剪枝目标。
+该兼容模式的中间阶段按剩余比例的1/3、2/3、1次幂分配，整数取floor。
+层号由实际模型深度确定，28层时为7/14/21，可用`--layers`覆盖。
 
 ## 输出与测量
 
-默认一次加载权重，依次运行 100/50/70/90% 平均保留率。输出目录必须为空或不存在，避免覆盖结果。
+默认一次加载权重，依次运行50%和70%平均剪枝率。旧平均保留率实验必须显式使用`--average-keep-rates`。
 
 - `run.json`：官方来源和哈希、模型层数、求解后的阶段比例、平均预算目标、环境、提示词、数据路径、计时和指标定义。
-- `summary.csv`：ACC、PRE、Recall、TNR、未解析数量、平均生成秒数、峰值 allocated 显存、最终视觉 token 数、全层平均视觉 token 数与实际平均保留率。
+- `summary.csv`：ACC、PRE、Recall、TNR、未解析数量、平均生成秒数、峰值allocated显存、最终视觉token数、全层平均视觉token数与实际平均保留率。
+  新实验的`prune_rate`和`target_average_prune_rate`是目标平均剪枝率，`rate_semantics=layer_average`；
+  `expected_average_prune_rate`是连续求解值，`actual_average_prune_rate`由实际每层token数量统计；`pruning_layers`记录剪枝边界。
 - 加 `--benchmark-metrics` 后，另保存 `lat_mean_ms`、`lat_p50_ms`、`lat_p95_ms`、`lat_std_ms`、`mem_peak_allocated_gib`、`mem_peak_reserved_gib`、`mem_peak_allocated_pct`、生成 token 数与预热数；单样本记录包含首 token 秒数和显存字节数。
-- `average_keep_XX/predictions.jsonl`：每张图答案、分类、每层 token 数、每阶段剪枝量、实际平均比例、时间、显存。
+- `average_prune_50/`和`average_prune_70/`：新实验目录；其中`predictions.jsonl`保存每图答案、每层token数、
+  目标/实际平均剪枝率、时间和显存。旧平均保留率仍使用`average_keep_XX/`，最终累计接口仍使用`prune_XX/`。
 - 每个设置目录的 `metrics.json`、`classification_results.csv`：中断时保留 `complete=false`，全部完成后才置为 true。
 - 可选 `visualizations/sample_*/image_0/comparison.png`、`attention_overlay.png`、`decisions.json`：每个剪枝边界一行，全部映射回原始图像；较早已删除 token 在后续注意力图中明确标为无当前评分。
 

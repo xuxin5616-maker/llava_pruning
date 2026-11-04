@@ -240,7 +240,20 @@ The supplied OneVision patch is integrated as `runPyramidDrop.py`, with its own
 core and pinned source snapshot. Existing `run.py --method vico` keeps its
 previous implementation/configuration. See [PyramidDrop details](docs/pyramiddrop.md).
 
-For the same **final cumulative removal** convention used by earlier experiments:
+For **50% and70% layer-average removal**, using the original7/14/21 boundaries:
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python runPyramidDrop.py \
+  --average-prune-rates 50 70 \
+  --roi-mode anyres_max_9 --benchmark-metrics --warmup 10 \
+  --output-dir output/pyramiddrop_avg_prune_50_70_gpu5_01
+```
+
+These are now the default two rates. The schedule solves the original geometric
+per-stage retention factor against the layer-weighted target. CSV records both
+target and actual average removal; integer token counts/minimum-one safety can
+cause a difference. With the first7/28 blocks unpruned, targets must be below75%.
+Explicit legacy **final cumulative removal** remains available:
 
 ```bash
 CUDA_VISIBLE_DEVICES=5 python runPyramidDrop.py \
@@ -262,10 +275,11 @@ It requires one visible GPU and visualization disabled. For images, omit that
 flag and add `--save-prune-vis --save-attention-vis`: each sample gets the two
 multi-stage PNG types, with one row per pruning boundary.
 
-The patch's unchanged default sweep is `--average-keep-rates 100 50 70 90`:
-those numbers mean **layer-average retention**, not final removal. Use explicit
-budget options when comparing methods. `--stage-keep-ratio 0.5` selects the
-reference 50%/25%/12.5% stage retention schedule.
+The legacy `--average-keep-rates 100 50 70 90` interface still means
+**layer-average retention** and must now be requested explicitly. The new
+default is `--average-prune-rates 50 70`, meaning average removal.
+`--stage-keep-ratio 0.5` selects the reference50%/25%/12.5% cumulative stage
+retention schedule; it is a separate preset.
 
 ## FastV 70% independent Base/AnyRes budgets, layer=2..21
 
