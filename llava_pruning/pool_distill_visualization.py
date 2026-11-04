@@ -7,6 +7,7 @@ selection; exporting provenance and drawing happen after generation.
 
 from contextlib import contextmanager
 import csv
+import json
 import math
 from pathlib import Path
 
@@ -173,6 +174,99 @@ def overview(views, masks, grid, *, title, caption, packed_count, patch_size=14,
     return canvas
 
 
+STAGES = (("input", "Original input", "original_tokens"),
+          ("pre_llm", "After MyPool", "pre_llm_kept"),
+          ("post_distill", "After distillation (before tail)", "post_distill_kept"))
+
+
+def save_individual_views(views, grid, output, *, stage, caption, counts):
+    """One actual-size Base/crop per PNG, with short GT/prediction labels."""
+    width, height = grid
+    if len(views) != 1+width*height or len(counts) != len(views):
+        raise ValueError("Individual views/counts disagree with the native AnyRes grid")
+    title = dict((key, title) for key,title,_ in STAGES)[stage]
+    output = Path(output)
+    font = ImageFont.load_default(size=14)
+    files = []
+    for view, rgb in enumerate(views):
+        rgb = np.asarray(rgb)
+        if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise ValueError("Individual images must be RGB8")
+        name = "base" if view == 0 else f"anyres_{view:02d}"
+        display = "Base" if view == 0 else f"AnyRes {view:02d} (r{(view-1)//width+1},c{(view-1)%width+1})"
+        lines = []
+        for paragraph in (title, f"{display} | {int(counts[view])}/729 tokens", caption):
+            line = ""
+            for word in paragraph.split():
+                candidate = f"{line} {word}".strip()
+                if line and font.getlength(candidate) > rgb.shape[1]-12:
+                    lines.append(line);line = word
+                else:
+                    line = candidate
+            lines.append(line)
+        line_height = font.getbbox("Ag")[3]+5
+        header = len(lines)*line_height+10
+        panel = Image.new("RGB",(rgb.shape[1],header+rgb.shape[0]),"white")
+        draw = ImageDraw.Draw(panel)
+        for index,line in enumerate(lines):
+            draw.text((6,5+index*line_height),line,fill="black",font=font)
+        panel.paste(Image.fromarray(rgb),(0,header))
+        filename = f"{stage}_{name}.png"
+        panel.save(output/filename)
+        files.append(filename)
+    return files
+
+
+def split_existing_overviews(output):
+    """Lossless CPU export beside the old overviews; no model/data paths needed."""
+    from .visualization import prediction_caption
+    output = Path(output).expanduser().resolve()
+    metadata = json.loads((output/"run.json").read_text(encoding="utf-8"))
+    grid = tuple(metadata["native_grid"])
+    if len(grid) != 2 or any(type(n) is not int or n < 1 for n in grid):
+        raise ValueError("Saved native_grid must contain positive integer width/height")
+    width,height = grid
+    with (output/"view_counts.csv").open(encoding="utf-8-sig",newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    expected_names = ["base"]+[f"anyres_{i:02d}" for i in range(1,1+width*height)]
+    if [row["view"] for row in rows] != expected_names:
+        raise ValueError("Saved view counts do not match Base + the native crop grid")
+    sources = ("input_views.png","pre_llm_pruning.png","post_distill_pruning.png")
+    extracted = []
+    # Validate all three source images before writing any new files. Both
+    # original overview versions have gap12, label30 and unscaled square views;
+    # infer header height from the canvas rather than guessing its text/font.
+    for filename in sources:
+        with Image.open(output/filename) as source:
+            if (source.width-12) % (width+1):
+                raise ValueError(f"Unrecognized saved overview geometry: {filename}")
+            tile = (source.width-12)//(width+1)-12
+            cell_w,cell_h = tile+12,tile+30+12
+            header = source.height-height*cell_h-12
+            if tile < 1 or header < 1:
+                raise ValueError(f"Invalid saved overview dimensions: {filename}")
+            views = []
+            source_rgb = source.convert("RGB")
+            for view in range(1+width*height):
+                if view == 0:
+                    x,y = 12,header+(height*cell_h-cell_h)//2
+                else:
+                    row,col = divmod(view-1,width)
+                    x,y = 12+(col+1)*cell_w,header+row*cell_h
+                views.append(np.asarray(source_rgb.crop((x,y+30,x+tile,y+30+tile))).copy())
+            extracted.append(views)
+    caption = f"ID: {metadata['question_id']} | {prediction_caption(metadata.get('gt'),metadata.get('answer'))}"
+    files = []
+    for (stage,_,field),views in zip(STAGES,extracted):
+        files += save_individual_views(views,grid,output,stage=stage,caption=caption,
+                                       counts=[int(row[field]) for row in rows])
+    (output/"individual_views.json").write_text(json.dumps(dict(question_id=metadata["question_id"],
+        native_grid=list(grid),export_mode="lossless_from_existing_overviews_no_inference",
+        sources=list(sources),outputs=files),ensure_ascii=False,indent=2),encoding="utf-8")
+    print(f"Exported {len(files)} individual PNGs beside the existing overviews; CPU only: {output}",flush=True)
+    return output
+
+
 def save_baseline_visualizations(method, trace, processor, result, sample, output):
     from .pool_lean import export_source_decisions
     from .visualization import prediction_caption
@@ -188,17 +282,13 @@ def save_baseline_visualizations(method, trace, processor, result, sample, outpu
     plan = adapter.plan
     if int(before.sum())+newlines != plan["pre_llm_tokens"] or int(after.sum())+newlines != plan["final_llm_tokens"]:
         raise RuntimeError("Visualization decisions differ from the actual two-stage budget")
-    caption = (f"ID: {sample.sample_id} | {prediction_caption(sample.gt, result['answer'])} | "
-               f"target={method.rate:g}%, lambda=0.7, base_text, base_full, fast, tail=9")
+    caption = f"ID: {sample.sample_id} | {prediction_caption(sample.gt, result['answer'])}"
     output = Path(output)
-    stages = (("input_views.png", "Original encoder inputs", np.ones_like(before), len(views)*729),
-              ("pre_llm_pruning.png", "After MyPool / before LLM", before, plan["pre_llm_tokens"]),
-              ("post_distill_pruning.png", "After block2 distillation / before tail removal (cumulative)", after, len(selected)))
-    for filename, title, masks, count in stages:
-        overview(views, masks, grid, title=title, caption=caption, packed_count=count,
-                 patch_size=int(adapter.geometry.patch_size),
-                 count_label=("Raw encoder spatial tokens (no newlines)" if filename == "input_views.png"
-                              else "Packed image tokens (including newlines)")).save(output/filename)
+    files = []
+    for (stage,_,_),masks in zip(STAGES,(np.ones_like(before),before,after)):
+        masked = [white_positions(rgb,mask,int(adapter.geometry.patch_size)) for rgb,mask in zip(views,masks)]
+        files += save_individual_views(masked,grid,output,stage=stage,caption=caption,
+                                       counts=[int(mask.sum()) for mask in masks])
     rows = []
     for view in range(len(views)):
         rows.append(dict(view="base" if view == 0 else f"anyres_{view:02d}", original_tokens=729,
@@ -213,4 +303,4 @@ def save_baseline_visualizations(method, trace, processor, result, sample, outpu
         baseline_packed_tokens=plan["baseline_packed_tokens"],
         pre_llm_tokens=plan["pre_llm_tokens"], post_distill_tokens=len(selected), protected_newlines=newlines,
         mask_semantics="independent retained token anchors only; merged sources also white; RGB255; post mask cumulative",
-        post_snapshot="after block2 selection, before tail=9 removal", outputs=[stage[0] for stage in stages])
+        post_snapshot="after block2 selection, before tail=9 removal", outputs=files)

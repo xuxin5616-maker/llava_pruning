@@ -18,9 +18,11 @@ See [full GPU5 command, exact budget and documented adaptations](docs/anchorprun
 
 To visualize **only ID48 at 50%** with the agreed hybrid baseline, use
 `python visualize_pool_distill.py --gpu 5`. It fixes lambda0.7, Base+Text,
-fast Base mapping, `anyres_first` and tail9, and saves three overviews of the
-actual encoder inputs, pre-LLM anchors and post-distillation anchors before
-tail removal. Removed/merged-away positions are RGB255 white. Native crop
+fast Base mapping, `anyres_first` and tail9, and saves each Base/AnyRes view
+as a separate PNG at the input, pre-LLM and post-distillation stages before
+tail removal. Use `--split-existing --output-dir <previous-directory>` to
+losslessly export single views beside old overviews on CPU, without inference.
+Removed/merged-away positions are RGB255 white. Native crop
 count is preserved; no full-dataset evaluation or Lat/Mem benchmark is run.
 See [exact command and white-mask semantics](docs/baseline_single_visualization.md).
 

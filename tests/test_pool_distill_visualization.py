@@ -4,6 +4,8 @@ import csv
 import json
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -17,7 +19,7 @@ from llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor
 from llava_pruning.backend import LlavaBackend
 from llava_pruning.pool_distill import PoolDistillMethod, source_records
 from llava_pruning.pool_distill_visualization import (anchor_masks, capture_baseline_views,
-    find_record, input_rgb, white_positions, overview)
+    find_record, input_rgb, white_positions, overview, split_existing_overviews, STAGES)
 from test_attention_predictor import make_checkpoint
 from test_pool_ablations import model_and_options
 import runMyPruningPoolSpatial as pool
@@ -121,7 +123,7 @@ class VisualizationTests(unittest.TestCase):
                 self.assertGreater(report["post_distill_tokens"],0)
                 self.assertGreater(report["actual_average_prune_rate_with_tail"],report["two_stage_average_prune_rate"])
                 self.assertEqual(set(p.name for p in (root/"vis").glob("*.png")),
-                    {"input_views.png","pre_llm_pruning.png","post_distill_pruning.png"})
+                    {f"{stage}_{view}.png" for stage,_,_ in STAGES for view in ("base","anyres_01")})
                 reference=PoolDistillMethod(core,checkpoint,rate=50,share=.7,mode="base_full",
                     settings=pool.MethodSettings(prune_rate=0),pruning_audit="lean",tail_drop_layers=9,
                     predictor_input="base_text",base_mapping="fast",base_policy="anyres_first")
@@ -139,6 +141,49 @@ class VisualizationTests(unittest.TestCase):
                 raise RuntimeError("forced")
             self.assertIs(mm_utils.process_images,original_process)
             self.assertNotIn("select",reference.adapter.__dict__)
+
+    def test_cpu_export_is_lossless_beside_old_overviews_and_never_loads_model(self):
+        for grid in ((1,1),(2,1),(3,3)):
+            with tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);width,height=grid;count=1+width*height
+                yy,xx=np.mgrid[:384,:384]
+                views=np.stack([np.stack(((xx+i*5)%256,(yy+i*7)%256,np.full_like(xx,70+i)),axis=-1)
+                    .astype(np.uint8) for i in range(count)])
+                before=np.stack([np.arange(729)%3!=i%3 for i in range(count)])
+                after=before&(np.arange(729)%5!=0)[None]
+                stages_masks=(np.ones_like(before),before,after)
+                source_names=("input_views.png","pre_llm_pruning.png","post_distill_pruning.png")
+                for name,mask in zip(source_names,stages_masks):
+                    overview(views,mask,grid,title=name,caption="ID: 000000048 | GT: Normal | Pred: Normal",
+                        packed_count=int(mask.sum())+height*27).save(root/name)
+                (root/"run.json").write_text(json.dumps(dict(question_id="000000048",native_grid=list(grid),gt=0,answer="B")))
+                rows=[dict(view="base" if i==0 else f"anyres_{i:02d}",original_tokens=729,
+                    pre_llm_kept=int(before[i].sum()),post_distill_kept=int(after[i].sum())) for i in range(count)]
+                with (root/"view_counts.csv").open("w",encoding="utf-8-sig",newline="") as stream:
+                    writer=csv.DictWriter(stream,fieldnames=tuple(rows[0]));writer.writeheader();writer.writerows(rows)
+                originals={name:(root/name).read_bytes() for name in (*source_names,"run.json","view_counts.csv")}
+                args=entry.build_parser().parse_args(["--split-existing","--output-dir",str(root)])
+                with patch("llava_pruning.backend.LlavaBackend",side_effect=AssertionError("No model load")):
+                    entry.run(args)
+                for (stage,_,_),masks in zip(STAGES,stages_masks):
+                    for view in range(count):
+                        name="base" if view==0 else f"anyres_{view:02d}"
+                        with Image.open(root/f"{stage}_{name}.png") as image:
+                            self.assertEqual(image.width,384)
+                            content=np.asarray(image.crop((0,image.height-384,384,image.height)))
+                        self.assertTrue(np.array_equal(content,white_positions(views[view],masks[view])))
+                self.assertEqual(len(list(root.glob("*.png"))),3+3*count)
+                self.assertTrue(all((root/name).read_bytes()==value for name,value in originals.items()))
+                manifest=json.loads((root/"individual_views.json").read_text(encoding="utf-8"))
+                self.assertEqual(len(manifest["outputs"]),3*count)
+                if grid==(1,1):
+                    # A fresh interpreter proves the offline CLI does not even
+                    # import Torch, and can use missing server model/data paths.
+                    code=("import sys; import visualize_pool_distill as v; "
+                        f"a=v.build_parser().parse_args(['--split-existing','--output-dir',{str(root)!r}]); "
+                        "v.run(a); assert 'torch' not in sys.modules")
+                    completed=subprocess.run([sys.executable,"-B","-c",code],cwd=entry.PROJECT,capture_output=True,text=True)
+                    self.assertEqual(completed.returncode,0,completed.stderr)
 
 
 if __name__=="__main__": unittest.main()

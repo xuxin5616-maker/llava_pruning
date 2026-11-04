@@ -28,10 +28,15 @@ def build_parser():
     parser.add_argument("--prompt-version", choices=("v0","v1","v2","v3"), default="v0")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=Path, default=PROJECT/"output/baseline_vis_48_prune50_01")
+    parser.add_argument("--split-existing",action="store_true",
+                        help="CPU only: extract individual Base/AnyRes PNGs beside the old three overviews in --output-dir")
     return parser
 
 
 def run(args, *, backend_factory=None):
+    if getattr(args,"split_existing",False):
+        from llava_pruning.pool_distill_visualization import split_existing_overviews
+        return split_existing_overviews(args.output_dir)
     from llava_pruning.rates import is_prune_rate
     if args.gpu < 0 or not is_prune_rate(args.prune_rate) or args.prune_rate == 0:
         raise ValueError("Use a nonnegative GPU and a pruning percentage strictly between0 and100")
@@ -85,13 +90,14 @@ def run(args, *, backend_factory=None):
         generation_count=1,lat_mem_benchmark=False,
         timing_note="Diagnostic visualization only; no Lat/Mem benchmark or dataset accuracy estimate")
     (output/"run.json").write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding="utf-8")
-    print(f"Saved Base + {details['encoder_views']-1} actual AnyRes views; 3 PNGs: {output}",flush=True)
+    print(f"Saved {len(details['outputs'])} individual PNGs, Base + {details['encoder_views']-1} actual AnyRes views per stage: {output}",flush=True)
     return output
 
 
 def main():
     args = build_parser().parse_args()
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    if not args.split_existing:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     run(args)
 
 
