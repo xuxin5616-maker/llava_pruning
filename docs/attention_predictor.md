@@ -1,5 +1,9 @@
 # 第2层旁路预测第22层 attention
 
+MVTec全图训练、无验证、后续独立VisA评估的新入口为 `train_attention_predictor_mvtec.py`；
+具体命令、`last.pt`保存口径见 [MVTec蒸馏训练说明](mvtec_distillation_for_visa.md)。
+下文原VisA训练／MVTec评估流程继续保留。
+
 当前默认策略已更新为 **`base_full`：Base全保留，Base预测概率映射到整个AnyRes后统一Top-k**。
 整体层平均目标不变，删除额度全部由AnyRes承担；运行前检查所有图片的目标可行性。
 本次不接通前置剪枝，训练目标/权重不改。Lat/Mem与可视化可在同一命令中请求，采用先全部干净

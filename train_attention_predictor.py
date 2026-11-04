@@ -18,13 +18,15 @@ from llava_pruning.training_schedule import training_step_plan
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Frozen LLaVA H2 -> three-layer side attention, supervised by block22")
+    parser.add_argument("--dataset", choices=("visa","mvtec"), default="visa")
     parser.add_argument("--model-path", default="/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/")
     parser.add_argument("--data-root", default="/home/yz/xxy/data/datasets/VisA")
     parser.add_argument("--visa-split-csv", default=None, help="FULL CSV, not test-only list; defaults to data-root/split_csv/1cls.csv")
     parser.add_argument("--output-dir", type=Path, default=Path("output/attention_predictor_copied_train_01"))
     parser.add_argument("--cache-dir", type=Path, default=None,
                         help="Optional teacher H2 cache. Can consume hundreds of GB; omitted = recompute teacher each epoch")
-    parser.add_argument("--validation-fraction", type=float, default=.1)
+    parser.add_argument("--validation-fraction", type=float, default=.1,
+                        help="Internal held-out fraction; 0 trains on every image and saves last.pt without validation")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=5e-5, help="Peak LR after linear warmup; then cosine decay to zero")
@@ -45,8 +47,10 @@ def build_parser():
     return parser
 
 
-def main():
-    args = build_parser().parse_args()
+def main(argv=None, *, defaults=None):
+    parser = build_parser()
+    if defaults: parser.set_defaults(**defaults)
+    args = parser.parse_args(argv)
     if args.epochs < 1 or args.gradient_accumulation < 1 or args.log_every < 1:
         raise ValueError("epochs, gradient-accumulation and log-every must be positive")
     if (not math.isfinite(args.learning_rate) or args.learning_rate <= 0
@@ -58,8 +62,18 @@ def main():
     output = args.output_dir.resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Training output must be empty: {output}")
-    samples, data_info = load_visa_distillation(args.data_root, args.visa_split_csv)
-    train, validation = split_samples(samples, args.validation_fraction, args.seed)
+    if not math.isfinite(args.validation_fraction) or not 0 <= args.validation_fraction < 1:
+        raise ValueError("validation-fraction must be in [0,1)")
+    if args.dataset=="mvtec":
+        if args.visa_split_csv: raise ValueError("--visa-split-csv applies only to --dataset visa")
+        from llava_pruning.mvtec_distillation import load_mvtec_distillation
+        samples,data_info = load_mvtec_distillation(args.data_root)
+    else:
+        samples,data_info = load_visa_distillation(args.data_root, args.visa_split_csv)
+    train,validation = (list(samples),[]) if args.validation_fraction==0 else split_samples(samples,args.validation_fraction,args.seed)
+    phases = [("train",train,True)] + ([("validation",validation,False)] if validation else [])
+    final_dataset = "independent VisA" if args.dataset=="mvtec" else "independent MVTec"
+    checkpoint_name = "best.pt" if validation else "last.pt"
     plan = training_step_plan(len(train), args.epochs, args.gradient_accumulation, args.warmup_ratio)
     import numpy as np
     import torch
@@ -104,7 +118,7 @@ def main():
     examples = TeacherExamples(backend, teacher_layer=args.teacher_layer, cache_dir=args.cache_dir, identity=identity)
     output.mkdir(parents=True, exist_ok=True)
     split_hashes = {}
-    for name, split in (("train", train), ("validation", validation)):
+    for name, split, _ in phases:
         path = output / f"{name}.jsonl"
         with path.open("w", encoding="utf-8") as stream:
             for sample in split:
@@ -116,7 +130,10 @@ def main():
                     prompt=GENERIC_PROMPT_V0, architecture=asdict(architecture), backbone_signature=signature,
                     inference=backend.inference_config, objective="KL(teacher last-prompt mean-head spatial attention || side block3 attention)",
                     teacher_layer=args.teacher_layer, student_source_layer=2, backbone_frozen=True,
-                    original_visa_test_is_training_source=True, final_test_dataset="independent MVTec",
+                    original_visa_test_is_training_source=args.dataset=="visa",
+                    original_mvtec_test_is_training_source=args.dataset=="mvtec", final_test_dataset=final_dataset,
+                    validation_enabled=bool(validation),
+                    checkpoint_selection="lowest internal validation KL" if validation else "last epoch; no validation or test-based selection",
                     cache_policy="optional H2 + target; keys include prompt/layers/backbone+image file identity and inference config",
                     initialization="independent pretrained copies of original Qwen2 decoder blocks 3, 4, 5; no LM head",
                     optimization=optimization,
@@ -125,10 +142,12 @@ def main():
                     student_trainable_parameters=sum(p.numel() for p in student.parameters() if p.requires_grad))
     (output / "train_run.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     # Relative checkpoint makes this config portable when the training folder moves.
-    method_config = dict(checkpoint="best.pt", layer=2, rate_semantics="layer_average", selection_mode="base_full",
+    method_config = dict(checkpoint=checkpoint_name, layer=2, rate_semantics="layer_average", selection_mode="base_full",
                          prune_rates=[30, 50, 70], visualize_rates=[70])
     (output / "method.json").write_text(json.dumps(method_config, indent=2), encoding="utf-8")
-    print(f"VisA ALL-CSV pool: {len(samples)} images -> train={len(train)}, validation={len(validation)}; no GT/masks", flush=True)
+    label = "MVTec-AD ALL train+test" if args.dataset=="mvtec" else "VisA ALL-CSV"
+    print(f"{label} pool: {len(samples)} images -> train={len(train)}, validation={len(validation)}; no GT/masks", flush=True)
+    if not validation: print("Validation disabled; all images train the student. Evaluation checkpoint: last.pt.",flush=True)
     print(f"Frozen teacher block{args.teacher_layer}; H2 -> copied native blocks 3/4/5, "
           f"width={architecture.input_size}, attention={architecture.attention_implementation}; "
           f"student={metadata['student_parameters']:,} parameters "
@@ -145,15 +164,16 @@ def main():
           "Approximate, especially during cache warm-up; future checkpoint-save overhead is not estimated.", flush=True)
     fieldnames = ["epoch", "split", "samples", "seconds", "kl", "optimizer_steps", "global_step", "lr_next"]
     fieldnames += [f"{metric}_prune{rate}" for rate in (50, 70, 90) for metric in ("topk_overlap", "teacher_mass")]
-    best = float("inf")
-    eta = TrainingETA(args.epochs, {"train": len(train), "validation": len(validation)})
+    best = float("inf") if validation else None
+    eta = TrainingETA(args.epochs, {name:len(split) for name,split,_ in phases})
     with (output / "history.csv").open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
         for epoch in range(1, args.epochs + 1):
             order = list(train)
             random.Random(args.seed + epoch).shuffle(order)
-            for name, split, training in (("train", order, True), ("validation", validation, False)):
+            for name, original_split, training in phases:
+                split = order if training else original_split
                 def progress(index, total, sample_id, metrics):
                     estimate = eta.update(index)
                     if index == 1 or index % args.log_every == 0 or index == total:
@@ -179,22 +199,29 @@ def main():
                                      global_step=scheduler.last_epoch, lr_next=optimizer.param_groups[0]["lr"], **metrics))
                 stream.flush()
                 print(f"epoch={epoch} {name}: mean_loss={metrics['kl']:.6f}(KL), seconds={seconds:.2f}", flush=True)
-                if not training:
+                if not training or not validation:
                     options = dict(student_precision=args.student_precision, backbone_depth=len(core.layers),
                                    teacher_layer=args.teacher_layer, signature=signature, provenance=dict(
                                        source_sha256=data_info["source_sha256"], split_sha256=split_hashes,
                                        backbone_path=str(Path(args.model_path).resolve()), prompt=GENERIC_PROMPT_V0,
                                        image_token_order="base_first", optimization=optimization,
-                                       global_step=scheduler.last_epoch), epoch=epoch, validation_kl=metrics["kl"])
+                                       global_step=scheduler.last_epoch,training_dataset=args.dataset,
+                                       validation_enabled=bool(validation),final_test_dataset=final_dataset),
+                                   epoch=epoch, validation_kl=metrics["kl"] if not training else None)
                     save_student(output / "last.pt", student, **options)
-                    if metrics["kl"] < best:
+                    if not training and metrics["kl"] < best:
                         best = metrics["kl"]
                         save_student(output / "best.pt", student, **options)
                     (output / "training_status.json").write_text(json.dumps(dict(completed_epochs=epoch, best_validation_kl=best,
                                                                                 global_step=scheduler.last_epoch,
                                                                                 total_steps=plan["total_steps"],
+                                                                                validation_enabled=bool(validation),
+                                                                                evaluation_checkpoint=checkpoint_name,
                                                                                 complete=epoch == args.epochs), indent=2), encoding="utf-8")
-    print(f"Done. Best validation loss={best:.6f}(KL); evaluate MVTec with --method attention_predictor --method-config {output / 'method.json'}", flush=True)
+    if validation:
+        print(f"Done. Best validation loss={best:.6f}(KL); evaluate {final_dataset} with --method attention_predictor --method-config {output / 'method.json'}", flush=True)
+    else:
+        print(f"Done. No validation; final student: {output/'last.pt'}. Evaluate only on {final_dataset}.",flush=True)
 
 
 if __name__ == "__main__":
