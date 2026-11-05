@@ -179,12 +179,13 @@ STAGES = (("input", "Original input", "original_tokens"),
           ("post_distill", "After distillation (before tail)", "post_distill_kept"))
 
 
-def save_individual_views(views, grid, output, *, stage, caption, counts):
+def save_individual_views(views, grid, output, *, stage, caption, counts, title=None, count_label="tokens"):
     """One actual-size Base/crop per PNG, with short GT/prediction labels."""
     width, height = grid
     if len(views) != 1+width*height or len(counts) != len(views):
         raise ValueError("Individual views/counts disagree with the native AnyRes grid")
-    title = dict((key, title) for key,title,_ in STAGES)[stage]
+    if title is None:
+        title = dict((key, title) for key,title,_ in STAGES)[stage]
     output = Path(output)
     font = ImageFont.load_default(size=14)
     files = []
@@ -195,7 +196,7 @@ def save_individual_views(views, grid, output, *, stage, caption, counts):
         name = "base" if view == 0 else f"anyres_{view:02d}"
         display = "Base" if view == 0 else f"AnyRes {view:02d} (r{(view-1)//width+1},c{(view-1)%width+1})"
         lines = []
-        for paragraph in (title, f"{display} | {int(counts[view])}/729 tokens", caption):
+        for paragraph in (title, f"{display} | {int(counts[view])}/729 {count_label}", caption):
             line = ""
             for word in paragraph.split():
                 candidate = f"{line} {word}".strip()
