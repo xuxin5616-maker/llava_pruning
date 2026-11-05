@@ -1,7 +1,8 @@
 """Stretched VisA MyPool+distillation with joint Base/AnyRes spatial Top-k.
 
-50/70/90 layer-average %, lambda .7/.9/.99, tail0/9; GPUs5/6 by default.
+50/70/90 layer-average %, lambda .7/.9/.99, tail0; GPUs5/6 by default.
 One new unpruned Base+AnyRes reference. No group quotas or Base protection.
+Full Base+AnyRes+Text student input; every spatial token uses its own prediction.
 """
 
 import json
@@ -13,7 +14,7 @@ import benchmark_visa_stretch as stretch
 
 
 PROJECT = Path(__file__).resolve().parent
-KIND = "visa-stretch-joint-distillation-v1"
+KIND = "visa-stretch-joint-self-distillation-v2"
 COUNT_FIELDS = ("pre_base_tokens", "pre_anyres_tokens", "stage2_base_tokens", "stage2_anyres_tokens", "stage2_base_policy")
 
 
@@ -24,8 +25,8 @@ def parser():
     source.add_argument("--checkpoint", type=Path)
     source.add_argument("--previous-output", type=Path, help="Prior VisA summary directory containing run.json and checkpoint identity")
     p.add_argument("--lambdas", nargs="+", type=float, default=[.7, .9, .99])
-    p.add_argument("--tails", nargs="+", type=int, default=[0, 9])
-    p.set_defaults(gpus=[5,6], output_dir=Path("output/visa_joint_50_70_90_lambda07_09_099_tail0_9_01"))
+    p.add_argument("--tails", nargs="+", type=int, default=[0])
+    p.set_defaults(gpus=[5,6], output_dir=Path("output/visa_joint_self_50_70_90_lambda07_09_099_tail0_01"))
     return p
 
 
@@ -40,9 +41,10 @@ def schedule(rates, shares, tails, gpus):
             share_tag = f"{share:g}".replace(".","p")
             jobs.append(dict(job_id=f"joint_{rate:g}_lambda{share_tag}_tail{tail}", method="hybrid_baseline",
                 roi_mode="anyres_max_9", prune_rate=rate, distill_share=share, tail=tail,
+                selection_mode="anyres_self", predictor_input="full", base_mapping="reference",
                 base_policy="joint", gpu=gpu, status="pending", reason="",
-                config=f"resize=stretch;prune={rate:g}%;lambda={share:g};base_full;input=base_text;"
-                       f"mapping=fast;base_policy=joint;tail={tail};canvas=1152;grid=3x3;gpu={gpu}"))
+                config=f"resize=stretch;prune={rate:g}%;lambda={share:g};anyres_self;input=full;"
+                       f"base_policy=joint;tail={tail};canvas=1152;grid=3x3;gpu={gpu}"))
     return jobs
 
 
@@ -80,11 +82,12 @@ def setup(args):
     # Reuse the exact tested stretch preparation; no GPU job is started here.
     output, spec = stretch.setup(args)
     spec.update(kind=KIND, checkpoint=identity, lambdas=args.lambdas, tails=args.tails,
-        base_policy="joint", jobs=schedule(args.prune_rates,args.lambdas,args.tails,args.gpus))
+        base_policy="joint", selection_mode="anyres_self", predictor_input="full",
+        jobs=schedule(args.prune_rates,args.lambdas,args.tails,args.gpus))
     spec["definitions"].update(methods="MyPool before LLM, then joint Base+AnyRes Top-k after block2",
-        selection="Existing Base prediction and Base-mapped AnyRes scores, concatenated/global-normalized; no group-specific normalization, quota or minimum",
+        selection="Student input is full Base+AnyRes+Text; jointly rank each Base/AnyRes token's own predicted attention, with no Base mapping, group-specific normalization, quota or minimum",
         counts="Observed Base/AnyRes kept counts before tail; structural newlines protected; no count-only reconstruction",
-        parallelism="One sequential worker per GPU; each rate/lambda tail0/9 pair stays on the same GPU",
+        parallelism="One sequential worker per GPU; rate/lambda combinations are assigned round-robin",
         tail="EXTRA removal; original two-stage layer-average budgets unchanged")
     common.save_json(output/"run.json",spec)
     common.save_json(output/"worker.json",worker_spec(spec))

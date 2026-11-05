@@ -359,9 +359,9 @@ def make_method(core, job, spec):
     from llava_pruning.pool_distill import PoolDistillMethod
     from runMyPruningPoolSpatial import MethodSettings
     return PoolDistillMethod(core, spec["checkpoint"]["path"], rate=job["prune_rate"],
-        share=job.get("distill_share",spec.get("distill_share",.7)), mode="base_full", settings=MethodSettings(prune_rate=0),
-        pruning_audit="lean", tail_drop_layers=job["tail"], predictor_input="base_text",
-        base_mapping="fast", base_policy=job.get("base_policy","anyres_first"))
+        share=job.get("distill_share",spec.get("distill_share",.7)), mode=job.get("selection_mode","base_full"), settings=MethodSettings(prune_rate=0),
+        pruning_audit="lean", tail_drop_layers=job["tail"], predictor_input=job.get("predictor_input","base_text"),
+        base_mapping=job.get("base_mapping","fast"), base_policy=job.get("base_policy","anyres_first"))
 
 
 def visual_counts(core, job):

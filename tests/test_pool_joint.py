@@ -57,16 +57,18 @@ class JointTests(unittest.TestCase):
                 self.assertAlmostEqual(plan["actual_average_prune_rate"],rate,delta=.03)
 
     def test_real_joint_generation_and_decode_keeps_exact_topk_and_observed_counts(self):
-        cases=[(50,.9,0,False),(70,.7,9,False),(90,.99,0,False),(90,.99,9,False),(90,.9,0,True)]
-        for rate,share,tail,force_anyres in cases:
+        cases=[(*case,"base_full") for case in [(50,.9,0,False),(70,.7,9,False),(90,.99,0,False),(90,.99,9,False),(90,.9,0,True)]]
+        cases += [(50,.7,0,False,"anyres_self"),(70,.9,0,False,"anyres_self"),(90,.99,0,False,"anyres_self")]
+        for rate,share,tail,force_anyres,mode in cases:
             torch.manual_seed(1801)
             model,options=model_and_options(28);core=model.get_model();lengths=[]
             handles=[layer.register_forward_pre_hook(lambda m,a,k:lengths.append((a[0].shape[1],k["position_ids"].clone())),
                                                      with_kwargs=True) for layer in core.layers]
             with tempfile.TemporaryDirectory() as temporary,torch.no_grad():
                 checkpoint=Path(temporary)/"best.pt";make_checkpoint(checkpoint,core)
-                method=PoolDistillMethod(core,checkpoint,rate=rate,share=share,mode="base_full",
-                    settings=pool.MethodSettings(prune_rate=0),predictor_input="base_text",base_mapping="fast",
+                method=PoolDistillMethod(core,checkpoint,rate=rate,share=share,mode=mode,
+                    settings=pool.MethodSettings(prune_rate=0),predictor_input="full" if mode=="anyres_self" else "base_text",
+                    base_mapping="reference" if mode=="anyres_self" else "fast",
                     tail_drop_layers=tail,base_policy="joint")
                 method.configure(core,rate);method.prepare_inputs((384,384),options["inputs"])
                 if force_anyres:
@@ -81,7 +83,9 @@ class JointTests(unittest.TestCase):
                     observed["base"]=len(set(expected.tolist())&set(method.adapter.base))
                     observed["anyres"]=len(set(expected.tolist())&set(method.adapter.anyres))
                     return selected
-                with patch.object(method.adapter,"select",side_effect=checked),method.generation_context(model):
+                with patch.object(method.adapter,"select",side_effect=checked),\
+                     patch.object(core.attention_predictor,"forward",wraps=core.attention_predictor.forward) as predict,\
+                     method.generation_context(model):
                     generated=model.generate(**options)
                 stats=method.stats(core,rate)
                 pre,final=stats["pre_llm_tokens"],stats["final_llm_tokens"]
@@ -94,6 +98,10 @@ class JointTests(unittest.TestCase):
                 self.assertEqual([n for n,_ in lengths[:28]],[pre+4]*2+[final+4]*(26-tail)+[4]*tail)
                 self.assertEqual(lengths[27][1][0,-1].item(),pre+3)
                 self.assertEqual(stats["final_base_tokens"],0 if tail else observed["base"])
+                if mode=="anyres_self":
+                    self.assertEqual(predict.call_count,1)
+                    self.assertEqual(predict.call_args.args[0].shape[1],pre+4)
+                    self.assertEqual(len(predict.call_args.args[2]),len(method.adapter.spatial))
                 if force_anyres: self.assertEqual(observed["base"],0)
                 with self.assertRaisesRegex(ValueError,"cannot reconstruct"):
                     method.recover_legacy_budget((384,384))
@@ -108,15 +116,19 @@ class JointTests(unittest.TestCase):
             lat_mean_ms=10,mem_peak_allocated_gib=1)
         self.assertIn("base_policy=joint",compact_row(row)["config"])
 
-    def test_visa_schedule_is_baseline_plus_18_joint_trials_with_paired_tails(self):
-        jobs=entry.schedule([50,70,90],[.7,.9,.99],[0,9],[5,6])
-        self.assertEqual(len(jobs),19)
+    def test_visa_defaults_are_baseline_plus_nine_self_scored_tail0_trials(self):
+        args=entry.parser().parse_args([])
+        self.assertEqual(args.tails,[0])
+        jobs=entry.schedule(args.prune_rates,args.lambdas,args.tails,args.gpus)
+        self.assertEqual(len(jobs),10)
         for rate in (50,70,90):
             for share in (.7,.9,.99):
                 pair=[j for j in jobs if j["prune_rate"]==rate and j["distill_share"]==share]
-                self.assertEqual([j["tail"] for j in pair],[0,9])
+                self.assertEqual([j["tail"] for j in pair],[0])
                 self.assertEqual(len({j["gpu"] for j in pair}),1)
                 self.assertTrue(all(j["base_policy"]=="joint" for j in pair))
+                self.assertTrue(all(j["selection_mode"]=="anyres_self" and j["predictor_input"]=="full" for j in pair))
+                self.assertTrue(all("base_full" not in j["config"] and "base_text" not in j["config"] for j in pair))
         self.assertEqual({j["gpu"] for j in jobs},{5,6})
 
     def test_visa_manifests_worker_factory_and_resume_use_same_checkpoint_and_cache(self):
@@ -126,7 +138,7 @@ class JointTests(unittest.TestCase):
                 "--checkpoint",str(fixture.checkpoint),"--output-dir",str(fixture.output_dir)])
             output,spec=entry.setup(args)
             self.assertEqual(spec["sample_count"],4)
-            self.assertEqual(len(spec["jobs"]),19)
+            self.assertEqual(len(spec["jobs"]),10)
             child=json.loads((output/"worker.json").read_text(encoding="utf-8"))
             grid3.verify(child,checkpoint_hash=True)
             calls=[]
@@ -135,6 +147,10 @@ class JointTests(unittest.TestCase):
                 for job in child["jobs"][1:]: grid3.make_method(object(),job,child)
             self.assertEqual({c["share"] for c in calls},{.7,.9,.99})
             self.assertEqual({c["base_policy"] for c in calls},{"joint"})
+            self.assertEqual({c["mode"] for c in calls},{"anyres_self"})
+            self.assertEqual({c["predictor_input"] for c in calls},{"full"})
+            self.assertEqual({c["base_mapping"] for c in calls},{"reference"})
+            self.assertEqual({c["tail_drop_layers"] for c in calls},{0})
             args.resume=True
             self.assertEqual(entry.setup(args),(output,spec))
 
@@ -151,12 +167,22 @@ class JointTests(unittest.TestCase):
                 rows=list(csv.DictReader(stream))
             self.assertTrue(all(row["stage2_base_tokens"]=="123" and row["stage2_anyres_tokens"]=="456" for row in rows))
 
+    def test_existing_grid3_jobs_keep_base_mapping_and_base_text_defaults(self):
+        job=dict(method="hybrid_baseline",prune_rate=70,tail=9)
+        spec=dict(checkpoint=dict(path="existing.pt"),distill_share=.7)
+        with patch("llava_pruning.pool_distill.PoolDistillMethod") as factory:
+            grid3.make_method(object(),job,spec)
+        self.assertEqual(factory.call_args.kwargs["mode"],"base_full")
+        self.assertEqual(factory.call_args.kwargs["predictor_input"],"base_text")
+        self.assertEqual(factory.call_args.kwargs["base_mapping"],"fast")
+        self.assertEqual(factory.call_args.kwargs["base_policy"],"anyres_first")
+
     def test_scheduler_launches_joint_manifest_on_only_gpu5_6_and_reuses_complete_trials(self):
         events=[]
         with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
             output=Path(temporary)
             spec=dict(gpus=[5,6],sample_count=2,input_sha256="test",
-                      jobs=entry.schedule([50,70,90],[.7,.9,.99],[0,9],[5,6]))
+                      jobs=entry.schedule([50,70,90],[.7,.9,.99],[0],[5,6]))
             class Process:
                 def __init__(self,command,**options):
                     self.job=command[command.index("--worker")+1];self.polled=False
@@ -171,16 +197,16 @@ class JointTests(unittest.TestCase):
             with patch.object(entry,"setup",return_value=(output,spec)),patch.object(entry.stretch.time,"sleep"):
                 self.assertEqual(entry.run(None,process_factory=Process),0)
                 self.assertEqual(entry.run(None,process_factory=Process),0)
-            self.assertEqual(len(events),19)
+            self.assertEqual(len(events),10)
             self.assertTrue(all(command[2].endswith("benchmark_visa_grid3.py") and command[-1]==str(output/"worker.json")
                                 for command,_ in events))
             self.assertEqual({options["env"]["CUDA_VISIBLE_DEVICES"] for _,options in events},{"5","6"})
             saved=json.loads((output/"run.json").read_text(encoding="utf-8"))
             self.assertTrue(saved["complete"])
-            self.assertEqual(saved["completed_trials"],19)
+            self.assertEqual(saved["completed_trials"],10)
             with (output/"summary.csv").open(encoding="utf-8-sig",newline="") as stream:
                 rows=list(csv.DictReader(stream))
-            self.assertEqual(len(rows),19)
+            self.assertEqual(len(rows),10)
             self.assertTrue(all(float(row["relative_accuracy_pct"])==100 for row in rows))
 
 
