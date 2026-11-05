@@ -37,7 +37,7 @@ class Grid3Tests(unittest.TestCase):
         with (data / "split_csv/1cls.csv").open("w", newline="") as stream:
             writer = csv.writer(stream); writer.writerow(["object", "split", "label", "image"]); writer.writerows(rows)
         args = entry.parser().parse_args(["--model-path", str(model), "--data-root", str(data),
-            "--checkpoint", str(checkpoint), "--output-dir", str(root / "output")])
+            "--checkpoint", str(checkpoint), "--resize-modes", "letterbox", "--output-dir", str(root / "output")])
         return args
 
     def test_letterbox_preserves_aspect_and_content_in_all_eight_visa_shapes(self):
@@ -59,16 +59,32 @@ class Grid3Tests(unittest.TestCase):
         from llava.mm_utils import process_images
         from llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor
         processor = SigLipImageProcessor(size=(384,384), crop_size={"height":384,"width":384})
-        image, _ = entry.letterbox(Image.fromarray(np.random.RandomState(3).randint(0,256,(91,143,3),dtype=np.uint8)))
+        source = Image.fromarray(np.random.RandomState(3).randint(0,256,(91,143,3),dtype=np.uint8))
         configs = [SimpleNamespace(image_aspect_ratio=mode, image_grid_pinpoints=[[1152,1152]],
                                    mm_patch_merge_type="spatial_unpad")
                    for mode in ("base_only","anyres_only","anyres_max_9")]
-        base, anyres, full = [process_images([image],processor,c)[0] for c in configs]
-        self.assertEqual(tuple(base.shape),(3,384,384))
-        self.assertEqual(tuple(anyres.shape),(9,3,384,384))
-        self.assertEqual(tuple(full.shape),(10,3,384,384))
-        self.assertTrue(torch.equal(base,full[0]))
-        self.assertTrue(torch.equal(anyres,full[1:]))
+        for mode in ("letterbox","stretch"):
+            image, _ = entry.resize_image(source,mode)
+            base, anyres, full = [process_images([image],processor,c)[0] for c in configs]
+            self.assertEqual(tuple(base.shape),(3,384,384))
+            self.assertEqual(tuple(anyres.shape),(9,3,384,384))
+            self.assertEqual(tuple(full.shape),(10,3,384,384))
+            self.assertTrue(torch.equal(base,full[0]))
+            self.assertTrue(torch.equal(anyres,full[1:]))
+
+    def test_stretch_is_direct_bicubic_without_padding_and_differs_from_letterbox(self):
+        source = Image.new("RGB",(150,100),(200,50,20))
+        stretched, geometry = entry.resize_image(source,"stretch")
+        padded, _ = entry.resize_image(source,"letterbox")
+        self.assertEqual(stretched.size,(1152,1152))
+        self.assertEqual(stretched.getpixel((0,0)),(200,50,20))
+        self.assertEqual(padded.getpixel((0,0)),(0,0,0))
+        np.testing.assert_array_equal(np.array(stretched),np.array(source.resize((1152,1152),Image.Resampling.BICUBIC)))
+        self.assertEqual(geometry["resize_mode"],"stretch")
+        self.assertEqual(geometry["resized_size"],[1152,1152])
+        self.assertEqual(geometry["paste_xy"],[0,0])
+        self.assertEqual(source.size,(150,100))
+        with self.assertRaises(ValueError): entry.resize_image(source,"other")
 
     def test_native_llava_packing_lengths_and_base_identity(self):
         from test_reference import ToyPacking
@@ -120,6 +136,22 @@ class Grid3Tests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,"prepared image changed"):
                 entry.setup(args)
 
+    def test_two_resize_caches_have_same_ids_labels_but_different_pixels(self):
+        with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
+            root=Path(temporary);args=self.fixture(root);specs={}
+            for mode in ("letterbox","stretch"):
+                args.resize_modes=[mode];args.output_dir=root/mode
+                _,specs[mode]=entry.setup(args)
+            records={mode:[json.loads(line) for line in Path(spec["input_json"]).read_text().splitlines()]
+                     for mode,spec in specs.items()}
+            keys=lambda rows:[(r["question_id"],r["gt"],r["text"]) for r in rows]
+            self.assertEqual(keys(records["letterbox"]),keys(records["stretch"]))
+            self.assertNotEqual(specs["letterbox"]["prepared_images_sha256"],specs["stretch"]["prepared_images_sha256"])
+            for mode,spec in specs.items():
+                entry.verify(spec)
+                self.assertTrue(all(j["config"].startswith(f"resize={mode};") for j in spec["jobs"]))
+                self.assertEqual(spec["transform"]["mode"],mode)
+
     def test_shared_measurement_checks_views_excludes_warmup_and_resumes(self):
         from llava_pruning.data import Sample
         layers = torch.nn.ModuleList([torch.nn.Identity() for _ in range(28)])
@@ -167,6 +199,70 @@ class Grid3Tests(unittest.TestCase):
             self.assertEqual(len(rows),5)
             self.assertEqual(float(rows[2]["relative_accuracy_pct"]),100)
             self.assertAlmostEqual(float(rows[0]["relative_accuracy_pct"]),75)
+
+    def test_pair_merged_ratios_keep_independent_denominators(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            for mode,baseline in (("letterbox",.8),("stretch",.5)):
+                output=root/mode;output.mkdir();jobs=entry.schedule([70],[0,9],.7,[3])
+                for job in jobs:
+                    job["config"]=f"resize={mode};"+job["config"]
+                    folder=output/job["job_id"];folder.mkdir()
+                    common.save_json(folder/"metrics.json",dict(job_id=job["job_id"],input_sha256="test",
+                        status="success",complete=True,accuracy=baseline if job["job_id"]=="base_anyres" else .6,
+                        tp=3,tn=3,fp=2,fn=2,lat_mean_ms=20,mem_peak_allocated_gib=2,budget={}))
+                entry.write_reports(output,dict(jobs=jobs,input_sha256="test"))
+            entry.merge_resize_reports(root,["letterbox","stretch"])
+            with (root/"summary.csv").open(encoding="utf-8-sig",newline="") as stream:
+                rows=list(csv.DictReader(stream))
+            self.assertEqual(len(rows),10)
+            self.assertAlmostEqual(float(rows[0]["relative_accuracy_pct"]),75)
+            self.assertAlmostEqual(float(rows[5]["relative_accuracy_pct"]),120)
+            self.assertEqual(float(rows[2]["relative_accuracy_pct"]),100)
+            self.assertEqual(float(rows[7]["relative_accuracy_pct"]),100)
+
+    def test_pair_starts_two_single_gpu_controllers_and_preserves_all_settings(self):
+        events=[]
+        with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
+            args=self.fixture(Path(temporary));args.resize_modes=["letterbox","stretch"]
+            output=args.output_dir
+            class Process:
+                def __init__(self,command,**options):
+                    self.mode=command[command.index("--resize-modes")+1]
+                    self.folder=Path(command[command.index("--output-dir")+1])
+                    events.append(("spawn",self.mode,command,options));self.polled=False
+                def poll(self):
+                    events.append(("poll",self.mode))
+                    if not self.polled:
+                        self.polled=True;return None
+                    self.folder.mkdir(exist_ok=True)
+                    rows=[dict(config=f"resize={self.mode};trial={i}",acc=50,relative_accuracy_pct=100) for i in range(5)]
+                    common.save_csv(self.folder/"summary.csv",rows,common.FIELDS)
+                    common.save_csv(self.folder/"budget_summary.csv",[],common.BUDGET_FIELDS)
+                    common.save_json(self.folder/"run.json",dict(resize_mode=self.mode))
+                    return 0
+            with patch.object(entry.time,"sleep"):
+                self.assertEqual(entry.run(args,process_factory=Process),0)
+            self.assertEqual([e[0] for e in events[:2]],["spawn","spawn"])
+            starts=[e for e in events if e[0]=="spawn"]
+            self.assertEqual(len(starts),2)
+            for start,gpu in zip(starts,("3","4")):
+                command,options=start[2:]
+                self.assertEqual(command[command.index("--gpus")+1],gpu)
+                self.assertEqual(options["env"]["CUDA_VISIBLE_DEVICES"],gpu)
+                self.assertEqual(command[command.index("--prune-rates")+1],"70.0")
+                self.assertEqual(command[command.index("--distill-share")+1],"0.7")
+                index=command.index("--tails");self.assertEqual(command[index+1:index+3],["0","9"])
+            with (output/"summary.csv").open(encoding="utf-8-sig",newline="") as stream:
+                self.assertEqual(len(list(csv.DictReader(stream))),10)
+            self.assertTrue(json.loads((output/"run.json").read_text(encoding="utf-8"))["complete"])
+            args.resume=True;args.gpus=[7];events.clear()
+            with patch.object(entry.time,"sleep"):
+                self.assertEqual(entry.run(args,process_factory=Process),0)
+            resumed=[e for e in events if e[0]=="spawn"]
+            self.assertEqual(len(resumed),2)
+            self.assertTrue(all("--resume" in e[2] for e in resumed))
+            self.assertEqual([e[3]["env"]["CUDA_VISIBLE_DEVICES"] for e in resumed],["3","4"])
 
     def test_two_workers_start_before_poll_and_never_share_a_gpu(self):
         events=[]

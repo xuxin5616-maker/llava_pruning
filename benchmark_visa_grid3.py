@@ -1,4 +1,4 @@
-"""Matched VisA letterbox-1152 / fixed-3x3 input and tail ablation.
+"""Matched VisA letterbox/stretch-1152 / fixed-3x3 input and tail ablation.
 
 Independent entry point: existing training, inference and benchmark defaults stay
 unchanged. CPU image preparation happens once, outside all generate timings.
@@ -23,13 +23,16 @@ import benchmark_visa_methods as common
 
 
 PROJECT = Path(__file__).resolve().parent
-VERSION = "1.0-visa-letterbox-grid3"
+VERSION = "2.0-visa-letterbox-stretch-grid3"
 CANVAS = 1152
 
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--gpus", nargs="+", type=int, default=[3, 4])
+    p.add_argument("--resize-modes", nargs="+", choices=("letterbox", "stretch"),
+                   default=["letterbox", "stretch"],
+                   help="letterbox preserves aspect ratio and pads; stretch directly resizes. Default: BOTH")
     source = p.add_mutually_exclusive_group()
     source.add_argument("--checkpoint", type=Path)
     source.add_argument("--previous-output", type=Path,
@@ -42,7 +45,7 @@ def parser():
     p.add_argument("--tails", nargs="+", type=int, default=[0, 9])
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--output-dir", type=Path, default=Path("output/visa_grid3_prune70_tail0_9_01"))
+    p.add_argument("--output-dir", type=Path, default=Path("output/visa_grid3_letterbox_stretch_70_tail0_9_01"))
     p.add_argument("--resume", action="store_true")
     p.add_argument("--worker", help=argparse.SUPPRESS)
     p.add_argument("--manifest", type=Path, help=argparse.SUPPRESS)
@@ -61,6 +64,20 @@ def letterbox(image):
     result = Image.new("RGB", (CANVAS, CANVAS), (0, 0, 0))
     result.paste(image.resize(resized, Image.Resampling.BICUBIC), offset)
     return result, dict(original_size=[width, height], resized_size=list(resized), paste_xy=list(offset))
+
+
+def resize_image(image, mode):
+    """Use identical interpolation; change only aspect preservation / padding."""
+    from PIL import Image
+    if mode == "letterbox":
+        result, geometry = letterbox(image)
+    elif mode == "stretch":
+        image = image.convert("RGB")
+        geometry = dict(original_size=list(image.size), resized_size=[CANVAS, CANVAS], paste_xy=[0, 0])
+        result = image.resize((CANVAS, CANVAS), Image.Resampling.BICUBIC)
+    else:
+        raise ValueError(f"Unknown resize mode: {mode}")
+    return result, dict(geometry, resize_mode=mode)
 
 
 def schedule(rates, tails, share, gpus):
@@ -127,6 +144,9 @@ def setup(args):
         if input_fingerprint(samples) != spec["raw_inputs_sha256"] or info != spec["dataset_info"]:
             raise ValueError("Original VisA input/split changed")
         return output, spec
+    if len(args.resize_modes) != 1:
+        raise ValueError("Single-mode setup requires exactly one resize mode")
+    mode = args.resize_modes[0]
     if (not 1 <= len(args.gpus) <= 2 or len(set(args.gpus)) != len(args.gpus) or min(args.gpus) < 0
             or args.warmup < 0 or not 0 <= args.seed < 2**32
             or not math.isfinite(args.distill_share) or not 0 < args.distill_share < 1):
@@ -158,7 +178,7 @@ def setup(args):
     started = time.perf_counter()
     for index, sample in enumerate(samples):
         with Image.open(sample.image) as image:
-            image, geometry = letterbox(image)
+            image, geometry = resize_image(image, mode)
         relative = f"images/{index:06d}.png"
         image.save(prepared / relative, compress_level=1)
         records.append(dict(sample.source, image=relative, image_size=[CANVAS, CANVAS], transform=geometry))
@@ -168,19 +188,25 @@ def setup(args):
             print(f"Prepare {index+1}/{len(samples)} elapsed={elapsed:.1f}s ETA={eta:.1f}s", flush=True)
     input_path = output / "visa_test_grid3.jsonl"
     input_path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records), encoding="utf-8")
-    spec = dict(version=VERSION, created_utc=datetime.now(timezone.utc).isoformat(),
+    jobs = schedule(args.prune_rates, args.tails, args.distill_share, args.gpus)
+    for job in jobs:
+        job["config"] = f"resize={mode};" + job["config"]
+    spec = dict(version=VERSION, resize_mode=mode, created_utc=datetime.now(timezone.utc).isoformat(),
         model_path=str(model), model_config_sha256=common.digest(model / "config.json"),
         checkpoint=identity, raw_data_root=str(data), visa_split_csv=split, dataset_info=info,
         raw_inputs_sha256=input_fingerprint(samples), prepared_root=str(prepared), input_json=str(input_path),
         input_sha256=common.digest(input_path), prepared_images_sha256=cache_fingerprint(records, prepared),
         sample_count=len(samples), source_identity=common.source_identity(), gpus=args.gpus,
         seed=args.seed, warmup=args.warmup, distill_share=args.distill_share,
-        jobs=schedule(args.prune_rates, args.tails, args.distill_share, args.gpus),
-        transform=dict(size=[CANVAS, CANVAS], resample="BICUBIC", padding_rgb=[0, 0, 0],
-            alignment="center", grid_pinpoints=[[CANVAS, CANVAS]],
-            padding_policy="Padding is part of the shared square input; image_sizes is 1152x1152 in ALL trials"),
+        jobs=jobs,
+        transform=dict(mode=mode, size=[CANVAS, CANVAS], resample="BICUBIC",
+            padding_rgb=[0, 0, 0] if mode == "letterbox" else None,
+            alignment="center" if mode == "letterbox" else None, grid_pinpoints=[[CANVAS, CANVAS]],
+            padding_policy=("Padding is part of the shared square input" if mode == "letterbox" else
+                            "Direct resize; no aspect preservation or added padding"),
+            image_sizes_policy="1152x1152 in ALL trials"),
         definitions=dict(common.DEFINITIONS,
-            relative_accuracy="100*ACC / measured letterboxed Base+AnyRes unpruned ACC in THIS run",
+            relative_accuracy="100*ACC / measured Base+AnyRes unpruned ACC with the SAME resize mode",
             timing_policy="Shared resident-input TTFT and full-generation peak memory; CPU preparation, PNG saving, loading, H2D and warmups excluded; ALL online pruning included",
             tail_policy="Extra removal; original two-stage layer-average pruning budget unchanged",
             parallelism="One process per GPU; separate GPUs run concurrently; GPU ID saved in each config"),
@@ -340,7 +366,140 @@ def write_reports(output, spec):
     common.save_csv(output / "budget_summary.csv", budgets, common.BUDGET_FIELDS)
 
 
+def merge_resize_reports(output, modes):
+    """Keep per-mode ratios as computed from each mode's own reference."""
+    for name, fields in (("summary.csv", common.FIELDS), ("budget_summary.csv", common.BUDGET_FIELDS)):
+        import csv
+        rows = []
+        for mode in modes:
+            path = output / mode / name
+            if path.is_file():
+                with path.open(encoding="utf-8-sig", newline="") as stream:
+                    rows.extend(csv.DictReader(stream))
+        common.save_csv(output / name, rows, fields)
+
+
+def run_both(args, *, process_factory=None):
+    """One single-GPU controller per resize mode; all five jobs stay on that GPU."""
+    output = args.output_dir.expanduser().resolve()
+    if args.resume:
+        spec = json.loads((output / "run.json").read_text(encoding="utf-8"))
+        if (spec.get("kind") != "paired_resize" or spec["version"] != VERSION
+                or spec["source_identity"] != common.source_identity()):
+            raise ValueError("Paired benchmark version/source changed; use a new output directory")
+        if common.checkpoint_identity(spec["checkpoint"]["path"]) != spec["checkpoint"]:
+            raise ValueError("Student checkpoint/provenance changed")
+        for key, value in spec["configuration"].items():
+            setattr(args, key, Path(value) if key in {"checkpoint", "output_dir"} and value is not None else value)
+    else:
+        if (len(args.resize_modes) != 2 or len(set(args.resize_modes)) != 2
+                or not 1 <= len(args.gpus) <= 2 or len(set(args.gpus)) != len(args.gpus) or min(args.gpus) < 0):
+            raise ValueError("Select distinct resize modes and one/two distinct nonnegative GPUs")
+        if output.exists() and any(output.iterdir()):
+            raise FileExistsError(f"Use a new/empty output directory or --resume: {output}")
+        checkpoint = args.checkpoint
+        if args.previous_output:
+            prior = json.loads((args.previous_output / "run.json").read_text(encoding="utf-8"))
+            checkpoint = prior["checkpoint"]["path"]
+        if checkpoint is None:
+            raise ValueError("Supply --checkpoint or --previous-output")
+        identity = common.checkpoint_identity(checkpoint)
+        configuration = {key:str(value) if isinstance(value, Path) else value for key,value in vars(args).items()
+                         if key not in {"worker", "manifest", "resume"}}
+        configuration.update(checkpoint=identity["path"], previous_output=None, output_dir=str(output))
+        spec = dict(version=VERSION, kind="paired_resize", source_identity=common.source_identity(),
+            checkpoint=identity, configuration=configuration, resize_modes=args.resize_modes,
+            gpu_by_mode={mode:args.gpus[index % len(args.gpus)] for index,mode in enumerate(args.resize_modes)},
+            interpretation="Each resize mode has its OWN full unpruned ACC denominator. All jobs within a mode use the same GPU.",
+            complete=False)
+        output.mkdir(parents=True)
+        common.save_json(output / "run.json", spec)
+
+    factory = process_factory or subprocess.Popen
+    active, failures = {}, []
+    expected_rows = 3 + len(args.prune_rates) * len(args.tails)
+    # A single selected GPU runs both modes sequentially; two GPUs run in parallel.
+    pending = deque(spec["resize_modes"])
+    last_progress = time.perf_counter()
+    try:
+        while pending or active:
+            busy = {spec["gpu_by_mode"][mode] for mode in active}
+            for mode in list(pending):
+                gpu = spec["gpu_by_mode"][mode]
+                if gpu in busy:
+                    continue
+                folder = output / mode
+                command = [sys.executable, "-u", str(Path(__file__).resolve()), "--resize-modes", mode,
+                    "--gpus", str(gpu), "--checkpoint", spec["checkpoint"]["path"],
+                    "--model-path", args.model_path, "--data-root", args.data_root,
+                    "--prune-rates", *map(str,args.prune_rates), "--distill-share", str(args.distill_share),
+                    "--tails", *map(str,args.tails), "--warmup", str(args.warmup), "--seed", str(args.seed),
+                    "--output-dir", str(folder)]
+                if args.visa_split_csv:
+                    command.extend(["--visa-split-csv", args.visa_split_csv])
+                if args.resume and (folder / "run.json").is_file():
+                    command.append("--resume")
+                log_path = output / (mode + ".log")
+                log = log_path.open("a", encoding="utf-8")
+                try:
+                    process = factory(command, cwd=PROJECT, stdout=log, stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL, start_new_session=os.name != "nt",
+                        env=dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), PYTHONUNBUFFERED="1"))
+                except BaseException:
+                    log.close(); raise
+                active[mode] = (process, log, time.perf_counter())
+                pending.remove(mode); busy.add(gpu)
+                print(f"Start {mode}: GPU {gpu}, {expected_rows} trials; log={log_path}", flush=True)
+            for mode, (process, log, started) in list(active.items()):
+                code = process.poll()
+                if code is None:
+                    continue
+                log.close(); del active[mode]
+                import csv
+                table = output / mode / "summary.csv"
+                rows = []
+                if table.is_file():
+                    with table.open(encoding="utf-8-sig", newline="") as stream:
+                        rows = list(csv.DictReader(stream))
+                complete = len(rows) == expected_rows and all(row.get("acc") not in (None, "") for row in rows)
+                if code or not complete:
+                    failures.append(mode)
+                    if not complete:
+                        print(f"Incomplete {mode} summary: expected {expected_rows} completed rows", flush=True)
+                print(f"Finished {mode}: exit={code}, elapsed={time.perf_counter()-started:.1f}s", flush=True)
+                merge_resize_reports(output, spec["resize_modes"])
+            if time.perf_counter() - last_progress >= 30:
+                merge_resize_reports(output, spec["resize_modes"])
+                for mode, (_, _, started) in active.items():
+                    print(f"{mode}: GPU {spec['gpu_by_mode'][mode]}, elapsed={time.perf_counter()-started:.0f}s; "
+                          f"progress and ETA: {output/(mode+'.log')}", flush=True)
+                last_progress = time.perf_counter()
+            if active:
+                time.sleep(.25)
+    except BaseException:
+        for process, log, _ in active.values():
+            if process.poll() is None:
+                if os.name == "posix": process.send_signal(signal.SIGINT)
+                else: process.terminate()
+                try: process.wait(timeout=30)
+                except subprocess.TimeoutExpired: process.kill(); process.wait()
+            log.close()
+        raise
+    merge_resize_reports(output, spec["resize_modes"])
+    spec.update(complete=not failures, failed_modes=failures)
+    common.save_json(output / "run.json", spec)
+    print(f"Combined summary: {output/'summary.csv'}; separate tables: letterbox/ and stretch/", flush=True)
+    return 1 if failures else 0
+
+
 def run(args, *, process_factory=None):
+    if getattr(args, "resume", False):
+        saved = json.loads((args.output_dir.expanduser().resolve() / "run.json").read_text(encoding="utf-8"))
+        if saved.get("kind") == "paired_resize":
+            return run_both(args, process_factory=process_factory)
+        args.resize_modes = [saved.get("resize_mode", "letterbox")]
+    if len(getattr(args, "resize_modes", ["letterbox"])) > 1:
+        return run_both(args, process_factory=process_factory)
     output, spec = setup(args)
     write_reports(output, spec)
     queues = {gpu:deque() for gpu in spec["gpus"]}
