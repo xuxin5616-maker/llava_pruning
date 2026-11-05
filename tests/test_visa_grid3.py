@@ -4,7 +4,10 @@ from contextlib import redirect_stdout
 import csv
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -458,6 +461,33 @@ class Grid3Tests(unittest.TestCase):
                 with self.assertRaises(ValueError): entry.repair_grid_output(output)
                 self.assertFalse((output/"run_before_grid_config_fix.json").exists())
                 self.assertTrue((output/"letterbox/hybrid_70_tail0/metrics.json").exists())
+
+    def test_repair_cli_bootstraps_vendor_in_fresh_process_without_vendor_pythonpath(self):
+        with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
+            output,_,specs=self.legacy_pair(Path(temporary))
+            preserved={path:path.read_bytes() for mode,spec in specs.items() for job in spec["jobs"][:3]
+                for path in (output/mode/job["job_id"]).iterdir() if path.is_file()}
+            code="""
+import importlib.util,sys
+import benchmark_visa_grid3 as entry
+assert importlib.util.find_spec('llava') is None, 'Test must start without llava on the search path'
+def no_gpu_run(args):
+    assert args.resume
+    import torch
+    assert not torch.cuda.is_initialized()
+    print('REPAIR_OK_NO_GPU')
+    return 0
+entry.run=no_gpu_run
+raise SystemExit(entry.main())
+"""
+            environment=dict(os.environ,PYTHONPATH=str(entry.PROJECT/".test-deps"),
+                             PYTHONDONTWRITEBYTECODE="1",PYTHONIOENCODING="utf-8")
+            result=subprocess.run([sys.executable,"-B","-c",code,"--repair-grid-config","--output-dir",str(output)],
+                cwd=entry.PROJECT,env=environment,capture_output=True,text=True,encoding="utf-8",timeout=60)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            self.assertIn("REPAIR_OK_NO_GPU",result.stdout)
+            for path,content in preserved.items(): self.assertEqual(path.read_bytes(),content)
+            self.assertTrue((output/"letterbox/hybrid_70_tail0/before_grid_config_fix/metrics.json").is_file())
 
 
 if __name__ == "__main__": unittest.main()

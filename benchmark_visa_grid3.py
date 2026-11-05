@@ -121,6 +121,11 @@ def cache_fingerprint(records, root):
 
 def validate_grid(config, tile_size=384):
     """The square input selects 3x3 naturally; NEVER mutate the model config."""
+    # Repair runs BEFORE LlavaBackend.__init__, which normally registers this
+    # vendored package. Bootstrap it here too; never require caller PYTHONPATH.
+    vendor = str(PROJECT / "vendor" / "llava")
+    if vendor not in sys.path:
+        sys.path.insert(0, vendor)
     from llava.mm_utils import get_anyres_image_grid_shape
     grid = get_anyres_image_grid_shape((CANVAS, CANVAS), config.image_grid_pinpoints, tile_size)
     if tile_size != 384 or tuple(grid) != (3, 3):

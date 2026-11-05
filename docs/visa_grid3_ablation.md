@@ -71,6 +71,8 @@ python benchmark_visa_grid3.py --resume --output-dir output/visa_grid3_letterbox
 v2.0版本曾将运行时 `image_grid_pinpoints` 改成只有1152方图，导致与训练权重中记录的
 原候选列表不同，报 `Predictor backbone architecture/AnyRes packing/order does not match training`。
 修复版保持原配置，仍自然选中3×3；不跳过签名检查，不改权重或推理精度。
+恢复入口会自行加入项目的 `vendor/llava` 模块路径，无需额外设置PYTHONPATH；
+此路径初始化也覆盖了尚未创建LlavaBackend的CPU校验阶段。
 
 若两套的三组不剪枝均成功，剪枝任务因上述同一错误失败，更新代码后使用**原输出目录**：
 
