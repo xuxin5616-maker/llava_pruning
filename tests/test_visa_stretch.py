@@ -59,6 +59,8 @@ class StretchComparisonTests(unittest.TestCase):
             output,spec=entry.setup(args)
             self.assertEqual(spec["sample_count"],4)
             self.assertIsNone(spec["checkpoint"])
+            self.assertEqual(Path(spec["runtime_source"]["root"]),output/"_runtime")
+            self.assertEqual(spec["source_identity"],common.source_identity(output/"_runtime"))
             self.assertEqual(spec["dataset_info"]["normal"],2)
             self.assertEqual(spec["dataset_info"]["abnormal"],2)
             rows=[json.loads(line) for line in Path(spec["input_json"]).read_text(encoding="utf-8").splitlines()]
@@ -156,6 +158,7 @@ class StretchComparisonTests(unittest.TestCase):
                 return dict(complete=True,evaluated_samples=4,accuracy=.75,tp=1,tn=2,fp=0,fn=1,
                             lat_mean_ms=10,mem_peak_allocated_gib=1,budget={})
             with patch("llava_pruning.backend.LlavaBackend",Backend),\
+                 patch.object(common,"PROJECT",Path(spec["runtime_source"]["root"])),\
                  patch.object(common,"validate_single_gpu"),\
                  patch("llava_pruning.visa_comparison_methods.make_method",return_value=object()),\
                  patch.object(common,"evaluate_samples",side_effect=evaluate),\
@@ -169,7 +172,10 @@ class StretchComparisonTests(unittest.TestCase):
             output=Path(temporary);captured=io.StringIO()
             spec=dict(gpus=[3],sample_count=2,checkpoint=None,input_sha256="test",jobs=entry.schedule([50],[3]))
             class Process:
-                def __init__(self,command,**options): self.job=command[command.index("--worker")+1]
+                def __init__(self,command,**options):
+                    self.job=command[command.index("--worker")+1]
+                    if self.job=="visionzip_50":
+                        options["stdout"].write("Error: test worker initialization failed\n")
                 def poll(self):
                     if self.job=="visionzip_50":return 1
                     folder=output/self.job;folder.mkdir()
@@ -179,6 +185,7 @@ class StretchComparisonTests(unittest.TestCase):
             with patch.object(entry,"setup",return_value=(output,spec)),patch.object(entry.time,"sleep"),redirect_stdout(captured):
                 self.assertEqual(entry.run(None,process_factory=Process),1)
             self.assertIn("FAILED visionzip_50",captured.getvalue())
+            self.assertIn("test worker initialization failed",captured.getvalue())
             saved=json.loads((output/"run.json").read_text(encoding="utf-8"))
             self.assertFalse(saved["complete"])
             self.assertEqual(saved["completed_trials"],6)

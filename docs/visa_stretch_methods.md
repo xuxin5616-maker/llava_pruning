@@ -2,7 +2,7 @@
 
 独立入口 `benchmark_visa_stretch.py`，不运行MyPool+蒸馏，不需要学生权重、λ或tail。
 复用原 `benchmark_visa_methods.py` 的原有worker、六种算法、层平均预算、Lat/Mem和报表逻辑。
-这是新实验，旧原分辨率或补边结果不会被复用或覆盖。
+这是新实验，旧结果不会被复用或覆盖。这轮从头重跑，输出到新的 `_02` 目录。
 
 ```bash
 python benchmark_visa_stretch.py \
@@ -11,7 +11,7 @@ python benchmark_visa_stretch.py \
   --data-root /home/yz/xxy/data/datasets/VisA \
   --visa-split-csv /home/yz/xxy/data/datasets/VisA/split_csv/1cls.csv \
   --prune-rates 50 70 90 \
-  --output-dir output/visa_stretch_methods_50_70_90_01
+  --output-dir output/visa_stretch_methods_50_70_90_02
 ```
 
 ## 范围与预处理
@@ -43,6 +43,8 @@ FastV保持mask版本，有效剪枝与物理长度分开记录；其它算法�
 - Ratio使用**本轮新测的拉伸不剪枝ACC**，不用69.29%、70.12%或91.18%常数。
 - `budget_summary.csv`：目标与实际层平均率、有效／物理率、token数量及不可达原因。
 - `run.json`：预处理、原图／缓存／输入／源码指纹、GPU和方法设置。
+- `_runtime/`：启动时冻结的源码和必要配置／第三方来源文件；子进程实际从这里运行。
+  不复制模型权重、数据集或旧输出；冻结与核对源码的时间不计入Lat。
 - `visa_test_stretch.jsonl`、`prepared/images/`：冻结输入与预处理缓存，不是可视化。
 - 每任务的日志、metrics.json、predictions.jsonl：回答、逐样本时间/显存/预算与完整统计。
 
@@ -54,8 +56,11 @@ Mem为完整回答生成的PyTorch peak allocated GiB，另存reserved和占设�
 中断后沿用原目录：
 
 ```bash
-python benchmark_visa_stretch.py --resume --output-dir output/visa_stretch_methods_50_70_90_01
+python benchmark_visa_stretch.py --resume --output-dir output/visa_stretch_methods_50_70_90_02
 ```
 
-恢复检查原图、CSV、缓存、模型配置和源码，跳过已完成任务并继续已保存样本。
+恢复检查原图、CSV、缓存、模型配置和冻结的源码，跳过已完成任务并继续已保存样本。
+后续在原工程更新蒸馏或其它代码，不会改变本轮的 `_runtime`，也不会阻止后续任务启动。
+`_runtime` 中的源码或来源文件如果被修改，仍会明确报错；不要改动该实验快照。
+旧版 `_01` 没有冻结源码，本次不修改它的指纹、不混用旧结果。
 本地测试覆盖输入、调度、报表和恢复；真实7B GPU准确率／Lat／Mem需要在服务器运行。

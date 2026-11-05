@@ -77,11 +77,12 @@ def save_csv(path, rows, fields):
     temporary.replace(path)
 
 
-def source_identity():
-    files = list(PROJECT.glob("*.py"))
+def source_identity(root=None):
+    root = Path(root) if root is not None else PROJECT
+    files = list(root.glob("*.py"))
     for name in ("llava_pruning", "vendor/llava/llava", "third_party"):
-        files.extend((PROJECT/name).rglob("*.py"))
-    entries = [p.relative_to(PROJECT).as_posix()+":"+hashlib.sha256(p.read_bytes().replace(b"\r\n",b"\n")).hexdigest()
+        files.extend((root/name).rglob("*.py"))
+    entries = [p.relative_to(root).as_posix()+":"+hashlib.sha256(p.read_bytes().replace(b"\r\n",b"\n")).hexdigest()
                for p in sorted(set(files))]
     return dict(files=len(entries),sha256=hashlib.sha256("\n".join(entries).encode()).hexdigest())
 
@@ -297,10 +298,18 @@ def evaluate_samples(backend, method, samples, spec, job, output, total_memory):
         fresh_samples=len(records)-resumed,warmup_samples=len(indices))
 
 
+def verify_worker_source(spec):
+    if spec.get("runtime_source"):
+        from llava_pruning.benchmark_source import verify_snapshot
+        verify_snapshot(spec["runtime_source"], executing_root=PROJECT)
+    if source_identity()!=spec["source_identity"]:
+        raise ValueError("Source changed since experiment setup")
+
+
 def worker(manifest, job_id):
     spec = json.loads(manifest.read_text(encoding="utf-8"))
     verify_inputs(spec)
-    if source_identity()!=spec["source_identity"]: raise ValueError("Source changed since experiment setup")
+    verify_worker_source(spec)
     job = next(j for j in spec["jobs"] if j["job_id"]==job_id and j["status"]=="pending")
     output = manifest.parent/job_id
     output.mkdir(exist_ok=True)
