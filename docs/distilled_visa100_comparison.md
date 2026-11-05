@@ -62,3 +62,61 @@ python compare_distilled_visa100.py --resume \
 
 恢复使用保存的权重、样本、GPU和参数，跳过完整实验、保留部分实验的已保存样本。
 权重、输入、源码或运行精度/库/GPU身份发生变化时拒绝混用。CPU测试不能代替服务器GPU验证。
+
+## 两份权重、100张、三个剪枝率全部可视化
+
+新实验在原命令中加 `--save-prune-vis`。先完成全部7组干净测量，再额外前向推理绘图，
+不把快照、PNG保存或图片重放的开销加入原CSV中的Lat/Mem。
+原来的测量进程不启用可视化hook。绘图仍保持fast映射、原生精度/attention和完整基准配置。
+
+```bash
+python compare_distilled_visa100.py \
+  --gpu 5 \
+  --mvtec-checkpoint output/mvtec_train_visa_two_gpu_01/student/last.pt \
+  --visa-checkpoint output/attention_predictor_twig_train_01/best.pt \
+  --samples 100 --prune-rates 50 70 90 \
+  --save-prune-vis \
+  --output-dir output/distilled_mvtec_vs_visa_100_vis_01
+```
+
+如果原来的100张已经跑完，只补图：
+
+```bash
+python compare_distilled_visa100.py --visualize-only \
+  --output-dir output/distilled_mvtec_vs_visa_100_01
+```
+
+这个用法读取原目录冻结的100张、两份权重、全部三个剪枝率及GPU配置；不重新取样，
+不改原 `run.json`、CSV、回答和计时文件。原结果未保存全部token选择索引，补图需要额外模型推理，
+不是仅靠旧的回答JSON在CPU上还原图片。允许从旧版已完成结果补图，绘图代码的指纹另存，
+不会把旧计时记录冒充为新代码测量。仍检查学生权重、输入、模型配置和推理库/精度设置。
+
+默认输出为：
+
+```text
+<原输出目录>/visualizations/
+├── sample_index.csv
+├── mvtec/prune_50/sample_000000000/
+│   ├── input_base.png
+│   ├── input_anyres_01.png ...
+│   ├── pre_llm_base.png
+│   ├── pre_llm_anyres_01.png ...
+│   ├── post_distill_base.png
+│   ├── post_distill_anyres_01.png ...
+│   ├── view_counts.csv
+│   └── run.json
+├── mvtec/prune_70/ ...
+├── mvtec/prune_90/ ...
+└── visa/prune_50/ ... prune_70/ ... prune_90/ ...
+```
+
+每个样本按固定清单中的0～99号建文件夹，`sample_index.csv` 映射真实question_id和图像路径。
+每张PNG只保存一个Base或AnyRes视图，不拼接；AnyRes按实际原生块数逐张保存，不强制9张。
+三个阶段为原始输入、MyPool LLM前剪枝、蒸馏后累计剪枝（tail9删除之前）。
+剪掉或被合并后不再独立保留的位置标RGB(255,255,255)，保留之前确认的anchor位置语义。
+每张图顶部显示GT及本次重放的模型判断。若重放回答与原测量不同，两份答案及匹配标志都会记录，
+不覆盖原回答；逐样本预算不一致则停止，避免把不同预算画成原结果。
+
+同样执行 `--visualize-only` 可补齐中断的绘图，完整图片会复用。如果要保留另一版绘图，
+加 `--vis-output-dir /新的图片目录`。一张Base＋9张AnyRes时，每个样本每个剪枝率保存30张PNG；
+两份权重×100张×三个剪枝率，按此块数共18000张PNG，实际数量以原生输入视图数为准。

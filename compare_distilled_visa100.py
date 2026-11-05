@@ -41,6 +41,11 @@ def parser():
     p.add_argument("--warmup",type=int,default=10)
     p.add_argument("--output-dir",type=Path,default=Path("output/distilled_mvtec_vs_visa_100_01"))
     p.add_argument("--resume",action="store_true",help="Reuse the saved subset/configuration and resume incomplete trials")
+    p.add_argument("--save-prune-vis",action="store_true",help="After ALL measurements, replay both students/all rates to save separate white-mask views")
+    p.add_argument("--visualize-only",action="store_true",help="Draw the saved comparison only; preserve existing CSV and Lat/Mem, even after a visualization code update")
+    p.add_argument("--vis-output-dir",type=Path,help="Default: OUTPUT_DIR/visualizations")
+    p.add_argument("--visualization-worker",help=argparse.SUPPRESS)
+    p.add_argument("--comparison-manifest",type=Path,help=argparse.SUPPRESS)
     return p
 
 
@@ -195,8 +200,11 @@ def write_reports(output, spec):
 
 
 def run(args):
+    if getattr(args,"visualize_only",False):
+        from llava_pruning.distilled_visa100_visualization import run as visualize
+        return visualize(args.output_dir,args.vis_output_dir)
     output,spec = setup(args)
-    print(f"SAME {spec['sample_count']} official VisA test images; GPU {spec['gpu']}; 2 students; no images saved.",flush=True)
+    print(f"SAME {spec['sample_count']} official VisA test images; GPU {spec['gpu']}; 2 students; clean measurement first.",flush=True)
     print("VisA-trained student is a diagnostic comparison with possible training/test overlap; see run.json.",flush=True)
     write_reports(output,spec)
     active = None
@@ -242,11 +250,19 @@ def run(args):
     finally: write_reports(output,spec)
     print(f"Summary: {output/'summary.csv'}",flush=True)
     if failures: print("Failed jobs (see logs): "+", ".join(failures),flush=True)
+    if not failures and getattr(args,"save_prune_vis",False):
+        from llava_pruning.distilled_visa100_visualization import run as visualize
+        return visualize(output,args.vis_output_dir)
     return int(bool(failures))
 
 
 def main():
-    try: return run(parser().parse_args())
+    try:
+        args = parser().parse_args()
+        if args.visualization_worker:
+            from llava_pruning.distilled_visa100_visualization import worker
+            return worker(args.comparison_manifest,args.visualization_worker,args.vis_output_dir)
+        return run(args)
     except (ValueError,OSError) as error:
         print(f"Error: {error}",file=sys.stderr);return 1
 
