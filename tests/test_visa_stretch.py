@@ -59,8 +59,10 @@ class StretchComparisonTests(unittest.TestCase):
             output,spec=entry.setup(args)
             self.assertEqual(spec["sample_count"],4)
             self.assertIsNone(spec["checkpoint"])
-            self.assertEqual(Path(spec["runtime_source"]["root"]),output/"_runtime")
-            self.assertEqual(spec["source_identity"],common.source_identity(output/"_runtime"))
+            self.assertNotIn("runtime_source",spec)
+            self.assertFalse((output/"_runtime").exists())
+            self.assertEqual(spec["source_policy"],"current_directory")
+            self.assertEqual(spec["source_identity"],common.source_identity())
             self.assertEqual(spec["dataset_info"]["normal"],2)
             self.assertEqual(spec["dataset_info"]["abnormal"],2)
             rows=[json.loads(line) for line in Path(spec["input_json"]).read_text(encoding="utf-8").splitlines()]
@@ -158,13 +160,15 @@ class StretchComparisonTests(unittest.TestCase):
                 return dict(complete=True,evaluated_samples=4,accuracy=.75,tp=1,tn=2,fp=0,fn=1,
                             lat_mean_ms=10,mem_peak_allocated_gib=1,budget={})
             with patch("llava_pruning.backend.LlavaBackend",Backend),\
-                 patch.object(common,"PROJECT",Path(spec["runtime_source"]["root"])),\
                  patch.object(common,"validate_single_gpu"),\
                  patch("llava_pruning.visa_comparison_methods.make_method",return_value=object()),\
                  patch.object(common,"evaluate_samples",side_effect=evaluate),\
                  patch("torch.cuda.get_device_properties",return_value=SimpleNamespace(name="CPU-test",total_memory=2**30)):
                 for job in spec["jobs"]:
                     self.assertEqual(common.worker(output/"run.json",job["job_id"]),0)
+                    saved=json.loads((output/job["job_id"]/"metrics.json").read_text(encoding="utf-8"))
+                    self.assertEqual(saved["source_policy"],"current_directory")
+                    self.assertEqual(saved["source_identity"],common.source_identity())
             self.assertEqual(set(calls),{"llava_unpruned",*entry.METHODS})
 
     def test_failure_is_printed_and_saved_without_discarding_other_results(self):

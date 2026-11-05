@@ -299,21 +299,21 @@ def evaluate_samples(backend, method, samples, spec, job, output, total_memory):
 
 
 def verify_worker_source(spec):
-    if spec.get("runtime_source"):
-        from llava_pruning.benchmark_source import verify_snapshot
-        verify_snapshot(spec["runtime_source"], executing_root=PROJECT)
-    if source_identity()!=spec["source_identity"]:
+    current = source_identity()
+    if spec.get("source_policy") != "current_directory" and current!=spec["source_identity"]:
         raise ValueError("Source changed since experiment setup")
+    return current
 
 
 def worker(manifest, job_id):
     spec = json.loads(manifest.read_text(encoding="utf-8"))
     verify_inputs(spec)
-    verify_worker_source(spec)
+    current_source = verify_worker_source(spec)
     job = next(j for j in spec["jobs"] if j["job_id"]==job_id and j["status"]=="pending")
     output = manifest.parent/job_id
     output.mkdir(exist_ok=True)
-    report = dict(job_id=job_id,status="failed",complete=False,input_sha256=spec["input_sha256"])
+    report = dict(job_id=job_id,status="failed",complete=False,input_sha256=spec["input_sha256"],
+                  source_identity=current_source,source_policy=spec.get("source_policy","strict"))
     try:
         import torch
         from llava_pruning.backend import LlavaBackend

@@ -80,7 +80,7 @@ def setup(args):
         raise ValueError("Supply --checkpoint or --previous-output for the SAME MVTec-trained student")
     identity = common.checkpoint_identity(checkpoint)
     # Reuse the exact tested stretch preparation; no GPU job is started here.
-    output, spec = stretch.setup(args, freeze_runtime=False)
+    output, spec = stretch.setup(args, source_policy="strict")
     spec.update(kind=KIND, checkpoint=identity, lambdas=args.lambdas, tails=args.tails,
         base_policy="joint", selection_mode="anyres_self", predictor_input="full",
         jobs=schedule(args.prune_rates,args.lambdas,args.tails,args.gpus))

@@ -34,7 +34,7 @@ def parser():
     p.add_argument("--prune-rates", nargs="+", type=int, choices=(50, 70, 90), default=[50, 70, 90])
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--output-dir", type=Path, default=Path("output/visa_stretch_methods_50_70_90_02"))
+    p.add_argument("--output-dir", type=Path, default=Path("output/visa_stretch_methods_50_70_90_03"))
     p.add_argument("--resume", action="store_true")
     return p
 
@@ -51,11 +51,7 @@ def schedule(rates, gpus):
 def verify(spec):
     if spec.get("kind") != KIND or spec["version"] != common.VERSION:
         raise ValueError("Not this stretched six-method benchmark")
-    runtime = None
-    if spec.get("runtime_source"):
-        from llava_pruning.benchmark_source import verify_snapshot
-        runtime = verify_snapshot(spec["runtime_source"])
-    if spec["source_identity"] != common.source_identity(runtime):
+    if spec.get("source_policy") != "current_directory" and spec["source_identity"] != common.source_identity():
         raise ValueError("Inference source changed; use a new output directory")
     common.verify_inputs(spec)
     records = [json.loads(line) for line in Path(spec["input_json"]).read_text(encoding="utf-8").splitlines()]
@@ -69,7 +65,7 @@ def verify(spec):
         raise ValueError("Original images or official test split changed")
 
 
-def setup(args, *, freeze_runtime=True):
+def setup(args, *, source_policy="current_directory"):
     output = args.output_dir.expanduser().resolve()
     if args.resume:
         spec = json.loads((output / "run.json").read_text(encoding="utf-8"))
@@ -79,6 +75,8 @@ def setup(args, *, freeze_runtime=True):
             or not args.prune_rates or len(set(args.prune_rates)) != len(args.prune_rates)
             or args.warmup < 0 or not 0 <= args.seed < 2**32):
         raise ValueError("Invalid GPUs, rates, warmup or seed")
+    if source_policy not in {"current_directory", "strict"}:
+        raise ValueError("Unknown benchmark source policy")
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Use a new/empty directory or --resume: {output}")
     model = Path(args.model_path).expanduser().resolve()
@@ -86,11 +84,6 @@ def setup(args, *, freeze_runtime=True):
     if config.get("num_hidden_layers") != 28:
         raise ValueError("Expected the existing 28-layer Qwen2 model")
     validate_grid(SimpleNamespace(**config))  # Original candidates; no mutation.
-    runtime_source = None
-    if freeze_runtime:
-        from llava_pruning.benchmark_source import freeze_source
-        runtime_source = freeze_source(PROJECT, output / "_runtime")
-        print(f"Frozen experiment source: {runtime_source['root']} ({runtime_source['files']} files)", flush=True)
     from PIL import Image
     from llava_pruning.visa_data import load_visa_test
     raw = Path(args.data_root).expanduser().resolve()
@@ -120,7 +113,7 @@ def setup(args, *, freeze_runtime=True):
         raw_data_root=str(raw), data_root=str(prepared), dataset_info=info, raw_inputs_sha256=raw_identity,
         input_json=str(input_path), input_sha256=common.digest(input_path),
         prepared_images_sha256=cache_fingerprint(rows, prepared), sample_count=len(samples),
-        source_identity=common.source_identity(runtime_source["root"] if runtime_source else None), checkpoint=None, gpus=args.gpus,
+        source_identity=common.source_identity(), source_policy=source_policy, checkpoint=None, gpus=args.gpus,
         seed=args.seed, warmup=args.warmup, jobs=schedule(args.prune_rates, args.gpus),
         preprocessing=dict(mode="stretch", size=[1152,1152], resample="BICUBIC", padding=False,
             candidate_policy="Preserve checkpoint grid candidates; natural 3x3 selection verified"),
@@ -131,9 +124,9 @@ def setup(args, *, freeze_runtime=True):
             methods="Six existing methods only; no hybrid, student training, lambda or tail",
             parallelism="Separate GPU workers; all rates of a method stay on the same GPU, saved in config"),
         preparation_seconds=time.perf_counter()-started)
-    if runtime_source:
-        spec["runtime_source"] = runtime_source
-        spec["definitions"]["source_policy"] = "Workers execute the frozen _runtime snapshot; edits in the original project do not affect this run. Snapshot, input, model and inference identities remain checked."
+    spec["definitions"]["source_policy"] = (
+        "Each worker uses current project code at startup and records its source identity; no source copy or source-change blocking. Input, model and inference identities remain checked."
+        if source_policy == "current_directory" else "Source identity must match experiment setup.")
     common.save_json(output / "run.json", spec)
     return output, spec
 
@@ -151,7 +144,6 @@ def run(args, *, process_factory=None, setup_function=None, worker_script=None,
             print(f"SKIP {job['job_id']}: {job['reason']}", flush=True)
     active, failures = {}, []
     factory = process_factory or subprocess.Popen
-    worker_project = Path(spec["runtime_source"]["root"]) if spec.get("runtime_source") else PROJECT
     total = sum(len(queue) for queue in queues.values())
     completed = 0
     last_progress = time.perf_counter()
@@ -169,12 +161,12 @@ def run(args, *, process_factory=None, setup_function=None, worker_script=None,
                     if old.get("status") == "success" and old.get("complete"):
                         completed += 1
                         print(f"Reuse completed {job['job_id']}", flush=True); continue
-                    command = [sys.executable, "-u", str(worker_script or worker_project / "benchmark_visa_methods.py"),
+                    command = [sys.executable, "-u", str(worker_script or PROJECT / "benchmark_visa_methods.py"),
                                "--worker", job["job_id"], "--manifest", str(output / manifest_name)]
                     logfile = output / (job["job_id"] + ".log")
                     log = logfile.open("a", encoding="utf-8")
                     try:
-                        process = factory(command, cwd=worker_project, stdout=log, stderr=subprocess.STDOUT,
+                        process = factory(command, cwd=PROJECT, stdout=log, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL, start_new_session=os.name != "nt",
                             env=dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), PYTHONUNBUFFERED="1"))
                     except BaseException:
