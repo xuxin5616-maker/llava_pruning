@@ -36,14 +36,18 @@ def hybrid_budget(original, rate, share, depth=28, boundary=2):
 
 
 def stage2_view_budget(final, base, protected, base_policy="protect"):
-    """Reserve newlines, then prioritize Base before allocating AnyRes slots."""
-    if base_policy not in {"protect", "anyres_first"}:
+    """Reserve newlines; group counts are fixed by policy or observed for joint."""
+    if base_policy not in {"protect", "anyres_first", "joint"}:
         raise ValueError("Unknown stage2 Base policy")
     if any(type(value) is not int or value < 0 for value in (final, base, protected)):
         raise ValueError("Invalid stage2 token counts")
     if final <= protected:
         raise ValueError("Distillation budget must preserve newlines plus at least one spatial token")
     content = final - protected
+    if base_policy == "joint":
+        # These counts depend on scores and must be observed, never fabricated
+        # from the integer budget alone.
+        return dict(base_keep=None, anyres_keep=None, protected_newlines=protected, spatial_keep=content)
     if base_policy == "protect" and content < base:
         raise ValueError("Distillation budget cannot protect the remaining Base and newlines")
     base_keep = min(base, content)

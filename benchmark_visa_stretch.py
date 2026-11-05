@@ -126,9 +126,11 @@ def setup(args):
     return output, spec
 
 
-def run(args, *, process_factory=None):
-    output, spec = setup(args)
-    common.write_reports(output, spec)
+def run(args, *, process_factory=None, setup_function=None, worker_script=None,
+        manifest_name="run.json", report_writer=None):
+    output, spec = (setup_function or setup)(args)
+    save_reports = report_writer or common.write_reports
+    save_reports(output, spec)
     queues = {gpu:deque() for gpu in spec["gpus"]}
     for job in spec["jobs"]:
         if job["status"] == "pending":
@@ -154,8 +156,8 @@ def run(args, *, process_factory=None):
                     if old.get("status") == "success" and old.get("complete"):
                         completed += 1
                         print(f"Reuse completed {job['job_id']}", flush=True); continue
-                    command = [sys.executable, "-u", str(PROJECT / "benchmark_visa_methods.py"),
-                               "--worker", job["job_id"], "--manifest", str(output / "run.json")]
+                    command = [sys.executable, "-u", str(worker_script or PROJECT / "benchmark_visa_methods.py"),
+                               "--worker", job["job_id"], "--manifest", str(output / manifest_name)]
                     logfile = output / (job["job_id"] + ".log")
                     log = logfile.open("a", encoding="utf-8")
                     try:
@@ -183,7 +185,7 @@ def run(args, *, process_factory=None):
                 else:
                     completed += 1
                 print(f"Finished GPU {gpu}: {job['job_id']}; exit={code}; elapsed={time.perf_counter()-started:.1f}s", flush=True)
-                common.write_reports(output, spec)
+                save_reports(output, spec)
             if time.perf_counter() - last_progress >= 30:
                 for gpu, (_, _, job, started) in active.items():
                     count = len(common.read_prefix(output / job["job_id"] / "predictions.jsonl")[0])
@@ -202,7 +204,7 @@ def run(args, *, process_factory=None):
             log.close()
         raise
     finally:
-        common.write_reports(output, spec)
+        save_reports(output, spec)
     spec.update(complete=not failures, completed_trials=completed, failed_trials=failures)
     common.save_json(output / "run.json", spec)
     print(f"Completed {completed}/{total} valid trials; failed={len(failures)}; "

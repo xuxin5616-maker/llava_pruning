@@ -22,7 +22,8 @@ def compact_row(row):
     branch = row.get("predictor_input", "full")
     tail = int(row.get("tail_drop_layers", 0))
     mapping=";mapping=fast" if row.get("base_mapping")=="fast" and mode=="base_full" else ""
-    policy=";base_policy=anyres_first" if row.get("stage2_base_policy")=="anyres_first" else ""
+    selected_policy=row.get("stage2_base_policy")
+    policy=f";base_policy={selected_policy}" if selected_policy in {"anyres_first","joint"} else ""
     return compact_result_row(row, f"prune={rate:g}%;lambda={share:g};{mode};input={branch};tail={tail}{mapping}{policy}")
 
 

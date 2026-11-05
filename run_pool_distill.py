@@ -62,8 +62,8 @@ def build_parser():
                         help="compact: config,tp,fp,tn,fn,acc(percent),Lat(ms),mem(allocated GiB),bacc(percent),f1(percent),relative_accuracy_pct")
     parser.add_argument("--base-mapping", choices=("reference", "fast"), default="reference",
                         help="Optional vectorized Base provenance + batched interpolation; benchmark on your GPU before adopting")
-    parser.add_argument("--base-policy", choices=("protect", "anyres_first"), default="protect",
-                        help="Stage2: protect Base, or remove AnyRes first and prune Base only if the budget requires it")
+    parser.add_argument("--base-policy", choices=("protect", "anyres_first", "joint"), default="protect",
+                        help="Stage2: protect Base, AnyRes-first fallback, or joint Base+AnyRes score Top-k")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--baseline-acc", type=float, default=91.18,
@@ -126,8 +126,8 @@ def validate(args):
         raise ValueError("base_text side input requires --selection-modes base_full")
     if args.base_mapping=="fast" and args.pruning_audit!="lean":
         raise ValueError("--base-mapping fast requires --pruning-audit lean")
-    if args.base_policy=="anyres_first" and any(not 0 < share < 1 for share in args.lambdas):
-        raise ValueError("--base-policy anyres_first requires 0 < lambda < 1")
+    if args.base_policy in {"anyres_first", "joint"} and any(not 0 < share < 1 for share in args.lambdas):
+        raise ValueError(f"--base-policy {args.base_policy} requires 0 < lambda < 1")
     if (args.tail_drop_layers or args.predictor_input == "base_text") and any(s == 0 for s in args.lambdas):
         raise ValueError("These ablations require an active distilled stage (lambda > 0)")
     if not math.isfinite(args.allocation_temperature) or args.allocation_temperature <= 0 or not 0 <= args.spatial_mix_weight <= 1:

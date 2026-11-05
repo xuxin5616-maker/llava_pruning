@@ -266,6 +266,22 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
     def select(self, ranking, spatial, original):
         if spatial != self.spatial or original != len(self.records):
             raise ValueError("Hybrid selection mismatches sparse token order")
+        if self.base_policy == "joint":
+            budget = stage2_view_budget(self.plan["final_llm_tokens"], len(self.base), len(self.protected), "joint")
+            if self.spatial[:len(self.base)] != self.base:
+                raise RuntimeError("Joint selection expects the existing Base-first spatial order")
+            order = torch.argsort(ranking, descending=True, stable=True)[:budget["spatial_keep"]]
+            candidates = torch.tensor(spatial, device=ranking.device, dtype=torch.long)
+            protected = torch.tensor(self.protected, device=ranking.device, dtype=torch.long)
+            selected = torch.cat((candidates[order], protected)).sort().values
+            # Keep GPU scalar counts; transfer only in stats(), AFTER generation
+            # timing. No synchronization just to count Base inside Lat.
+            base_kept = (order < len(self.base)).sum()
+            self.stage2_counts = dict(base_keep=base_kept, anyres_keep=len(order)-base_kept,
+                                      protected_newlines=len(self.protected))
+            if len(selected) != self.plan["final_llm_tokens"]:
+                raise RuntimeError("Joint selection changed the exact hybrid budget")
+            return selected, self.plan["final_llm_tokens"], len(self.protected)
         full = ranking.new_zeros(original)
         full[torch.tensor(spatial, device=ranking.device)] = ranking
         budget = stage2_view_budget(self.plan["final_llm_tokens"], len(self.base), len(self.protected), self.base_policy)
@@ -297,10 +313,10 @@ class PoolDistillMethod:
             raise ValueError("pruning_audit must be lean or full")
         if base_mapping not in {"reference","fast"} or (base_mapping=="fast" and pruning_audit!="lean"):
             raise ValueError("Fast Base mapping requires pruning_audit=lean")
-        if base_policy not in {"protect", "anyres_first"}:
+        if base_policy not in {"protect", "anyres_first", "joint"}:
             raise ValueError("Unknown stage2 Base policy")
-        if base_policy == "anyres_first" and not (0 < share < 1 and rate > 0):
-            raise ValueError("anyres_first requires an active two-stage hybrid (0 < lambda < 1)")
+        if base_policy in {"anyres_first", "joint"} and not (0 < share < 1 and rate > 0):
+            raise ValueError(f"{base_policy} requires an active two-stage hybrid (0 < lambda < 1)")
         self.base_policy = base_policy
         if type(tail_drop_layers) is not int or not 0 <= tail_drop_layers <= len(core.layers)-2:
             raise ValueError("Tail removal must be nonnegative and begin after block2")
@@ -326,6 +342,7 @@ class PoolDistillMethod:
 
     def configure(self, core, rate, **capture):
         self.adapter.prepared_prompt_split = None
+        self.adapter.stage2_counts = None
         if rate != self.rate:
             raise ValueError("Wrong runtime hybrid rate")
         if any(capture.values()):
@@ -410,7 +427,14 @@ class PoolDistillMethod:
             base, protected = self.adapter.view_plan["base_keep"], self.adapter.view_plan["protected_newlines"]
             anyres = pre - base - protected
         tail = self.tail_drop_layers
-        stage2 = stage2_view_budget(final, base, protected, self.base_policy)
+        if self.base_policy == "joint":
+            if self.adapter.stage2_counts is None:
+                raise RuntimeError("Joint Base/AnyRes counts were not observed")
+            stage2 = {key:int(value) for key,value in self.adapter.stage2_counts.items()}
+            if stage2["base_keep"] + stage2["anyres_keep"] + protected != final:
+                raise RuntimeError("Observed joint counts disagree with the image budget")
+        else:
+            stage2 = stage2_view_budget(final, base, protected, self.base_policy)
         last_visual = raw["final_llm_visual_tokens"] if self.share > 0 else pre
         if last_visual != (0 if tail else final):
             raise RuntimeError("Tail image-drop result differs from the requested ablation")
@@ -427,7 +451,8 @@ class PoolDistillMethod:
                     final_llm_visual_tokens=last_visual,
                     actual_average_prune_rate=100 * (1 - observed / (depth * original)),
                     stage2_base_policy=self.base_policy,
-                    base_policy=("MyPool compresses Base; stage2 protects remaining Base" if self.base_policy=="protect" else
+                    base_policy=("MyPool compresses Base; stage2 ranks Base and AnyRes jointly, with no group quotas" if self.base_policy=="joint" else
+                                 "MyPool compresses Base; stage2 protects remaining Base" if self.base_policy=="protect" else
                                  "MyPool compresses Base; stage2 prunes AnyRes first, then lowest-scoring Base"),
                     position_policy="MyPool consecutive prefill IDs; stage2 preserves these IDs",
                     source_policy="normalized original merge coefficients; Base backprojection preserves probability mass")
@@ -439,6 +464,8 @@ class PoolDistillMethod:
         save per-image budgets until the entire trial finished. Mark these
         reconstructed counts explicitly; original Lat/Mem are never recomputed.
         """
+        if self.base_policy == "joint":
+            raise ValueError("Joint Base/AnyRes counts require the saved observed budget; cannot reconstruct from rates")
         core = self.adapter.core
         if self.share == 1:
             from llava.mm_utils import get_anyres_image_grid_shape

@@ -359,9 +359,9 @@ def make_method(core, job, spec):
     from llava_pruning.pool_distill import PoolDistillMethod
     from runMyPruningPoolSpatial import MethodSettings
     return PoolDistillMethod(core, spec["checkpoint"]["path"], rate=job["prune_rate"],
-        share=spec["distill_share"], mode="base_full", settings=MethodSettings(prune_rate=0),
+        share=job.get("distill_share",spec.get("distill_share",.7)), mode="base_full", settings=MethodSettings(prune_rate=0),
         pruning_audit="lean", tail_drop_layers=job["tail"], predictor_input="base_text",
-        base_mapping="fast", base_policy="anyres_first")
+        base_mapping="fast", base_policy=job.get("base_policy","anyres_first"))
 
 
 def visual_counts(core, job):
@@ -412,6 +412,9 @@ def evaluate(backend, method, samples, spec, job, output, total_memory):
             raise RuntimeError(f"Expected {expected_views} encoded views, got {views}")
         budget = observed_budget(job["method"], job["prune_rate"], result["stats"], lengths, original, len(core.layers))
         budget["encoded_views"] = sum(views)
+        for key in ("pre_base_tokens","pre_anyres_tokens","stage2_base_tokens","stage2_anyres_tokens","stage2_base_policy"):
+            if key in result["stats"]:
+                budget[key] = result["stats"][key]
         return dict(question_id=sample.sample_id, gt=sample.gt, answer=result["answer"],
                     **{key:result[key] for key in common.TIMING}, budget=budget)
 
