@@ -22,7 +22,8 @@ from llava_pruning.prompts import GENERIC_PROMPT_V0
 class Grid3Tests(unittest.TestCase):
     def fixture(self, root):
         model = root / "model"; model.mkdir()
-        common.save_json(model / "config.json", dict(num_hidden_layers=28))
+        common.save_json(model / "config.json", dict(num_hidden_layers=28,
+            image_grid_pinpoints=[[384*w,384*h] for w in range(1,7) for h in range(1,7)]))
         student = root / "student"; student.mkdir()
         checkpoint = student / "last.pt"; checkpoint.write_bytes(b"weights")
         common.save_json(student / "train_run.json", dict(original_visa_test_is_training_source=False))
@@ -85,6 +86,23 @@ class Grid3Tests(unittest.TestCase):
         self.assertEqual(geometry["paste_xy"],[0,0])
         self.assertEqual(source.size,(150,100))
         with self.assertRaises(ValueError): entry.resize_image(source,"other")
+
+    def test_original_candidates_match_old_forced_grid_pixel_for_pixel(self):
+        from llava.mm_utils import process_images
+        from llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor
+        processor=SigLipImageProcessor(size=(384,384),crop_size={"height":384,"width":384})
+        source=Image.fromarray(np.random.RandomState(17).randint(0,256,(96,156,3),dtype=np.uint8))
+        for mode in ("letterbox","stretch"):
+            image,_=entry.resize_image(source,mode)
+            original=SimpleNamespace(image_aspect_ratio="anyres_max_9",mm_patch_merge_type="spatial_unpad",
+                image_grid_pinpoints=[[384*w,384*h] for w in range(1,7) for h in range(1,7)])
+            forced=SimpleNamespace(image_aspect_ratio="anyres_max_9",mm_patch_merge_type="spatial_unpad",
+                image_grid_pinpoints=[[1152,1152]])
+            actual=process_images([image],processor,original)
+            previous=process_images([image],processor,forced)
+            self.assertEqual(tuple(actual.shape),(1,10,3,384,384))
+            self.assertEqual(actual.stride(),previous.stride())
+            self.assertTrue(torch.equal(actual,previous))
 
     def test_native_llava_packing_lengths_and_base_identity(self):
         from test_reference import ToyPacking
@@ -289,6 +307,157 @@ class Grid3Tests(unittest.TestCase):
             starts=[e for e in events if e[0]=="spawn"]
             self.assertEqual(len(starts),5)
             self.assertTrue(all(e[2]=="4" for e in starts if e[1].startswith("hybrid")))
+
+    def test_original_grid_signature_survives_real_student_loading(self):
+        from test_copied_attention_predictor import core_model
+        from llava.model.language_model.attention_predictor import CopiedAttentionPredictor,backbone_signature
+        from llava_pruning.predictor_training import save_student
+        core=core_model()
+        candidates=[[384*w,384*h] for w in range(1,7) for h in range(1,7)]
+        core.config.image_grid_pinpoints=candidates
+        core.config.image_aspect_ratio="anyres_max_9"
+        core.config.mm_patch_merge_type="spatial_unpad"
+        signature=backbone_signature(core.config)
+        student=CopiedAttentionPredictor.from_backbone(core)
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"student.pt"
+            save_student(path,student,student_precision="float32",backbone_depth=6,teacher_layer=6,
+                         signature=signature)
+            core.config.image_grid_pinpoints=[[1152,1152]]
+            with self.assertRaisesRegex(ValueError,"does not match training"):
+                core.configure_attention_predictor(enabled=True,keep_ratio=.5,checkpoint=path)
+            core.config.image_grid_pinpoints=candidates
+            self.assertEqual(tuple(entry.validate_grid(core.config)),(3,3))
+            self.assertEqual(backbone_signature(core.config),signature)
+            self.assertIs(core.config.image_grid_pinpoints,candidates)
+            core.configure_attention_predictor(enabled=True,keep_ratio=.5,checkpoint=path)
+            self.assertTrue(core.attention_predictor_enabled)
+
+    def legacy_pair(self, root):
+        args=self.fixture(root);output=args.output_dir;output.mkdir()
+        identity=entry.grid_bug_source_identity()
+        specs={}
+        for mode,gpu in (("letterbox",3),("stretch",4)):
+            args.resize_modes=[mode];args.gpus=[gpu];args.output_dir=output/mode
+            folder,spec=entry.setup(args)
+            spec.update(version=entry.GRID_BUG_VERSION,source_identity=identity)
+            common.save_json(folder/"run.json",spec);specs[mode]=spec
+            sources=[json.loads(line) for line in Path(spec["input_json"]).read_text(encoding="utf-8").splitlines()]
+            for job in spec["jobs"]:
+                trial=folder/job["job_id"];trial.mkdir()
+                common.save_json(trial/"inference.json",dict(inference={"image_grid_pinpoints":[[1152,1152]]}))
+                if job["method"]=="llava_unpruned":
+                    records=[dict(question_id=r["question_id"],gt=r["gt"],answer="B" if i==0 or r["gt"]==0 else "A",
+                        lat_seconds=.1,generation_seconds=.2,generated_tokens=2,peak_allocated_bytes=100,
+                        peak_reserved_bytes=200,budget={}) for i,r in enumerate(sources)]
+                    (trial/"predictions.jsonl").write_text("".join(json.dumps(r)+"\n" for r in records),encoding="utf-8")
+                    report=common.summarize_records(records,len(sources),job,1000)
+                    report.update(status="success",job_id=job["job_id"],input_sha256=spec["input_sha256"])
+                else:
+                    report=dict(status="failed",complete=False,job_id=job["job_id"],input_sha256=spec["input_sha256"],
+                                error=entry.GRID_BUG_ERROR)
+                common.save_json(trial/"metrics.json",report)
+            entry.write_reports(folder,spec)
+        configuration={key:str(value) if isinstance(value,Path) else value for key,value in vars(args).items()
+                       if key not in {"worker","manifest","resume","repair_grid_config"}}
+        configuration.update(gpus=[3,4],resize_modes=["letterbox","stretch"],output_dir=str(output),previous_output=None)
+        root_spec=dict(version=entry.GRID_BUG_VERSION,kind="paired_resize",source_identity=identity,
+                       resize_modes=["letterbox","stretch"],checkpoint=specs["letterbox"]["checkpoint"],
+                       configuration=configuration,gpu_by_mode={"letterbox":3,"stretch":4})
+        common.save_json(output/"run.json",root_spec)
+        return output,args,specs
+
+    def test_repair_preserves_six_baselines_and_scheduler_only_runs_four_failed_jobs(self):
+        with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
+            output,args,specs=self.legacy_pair(Path(temporary))
+            preserved={path:path.read_bytes() for mode,spec in specs.items() for job in spec["jobs"][:3]
+                for path in (output/mode/job["job_id"]).iterdir() if path.is_file()}
+            entry.repair_grid_output(output)
+            for path,content in preserved.items(): self.assertEqual(path.read_bytes(),content)
+            for mode in specs:
+                folder=output/mode
+                updated=json.loads((folder/"run.json").read_text(encoding="utf-8"))
+                entry.verify(updated,checkpoint_hash=True)
+                self.assertEqual(updated["version"],entry.VERSION)
+                for job in specs[mode]["jobs"][3:]:
+                    trial=folder/job["job_id"]
+                    self.assertFalse((trial/"metrics.json").exists())
+                    self.assertFalse((trial/"inference.json").exists())
+                    archived=json.loads((trial/"before_grid_config_fix/metrics.json").read_text(encoding="utf-8"))
+                    self.assertEqual(archived["error"],entry.GRID_BUG_ERROR)
+            # Repeating the migration itself changes no successful files.
+            entry.repair_grid_output(output)
+            launched=[]
+            for mode in specs:
+                spec=json.loads((output/mode/"run.json").read_text(encoding="utf-8"))
+                class Process:
+                    def __init__(self,command,**options):
+                        self.job=command[command.index("--worker")+1];launched.append((mode,self.job))
+                    def poll(self):
+                        common.save_json(output/mode/self.job/"metrics.json",dict(job_id=self.job,status="success",
+                            complete=True,input_sha256=spec["input_sha256"],accuracy=.75,tp=1,tn=2,fp=0,fn=1,
+                            lat_mean_ms=100,mem_peak_allocated_gib=1,budget={}))
+                        return 0
+                args.output_dir=output/mode;args.resume=True
+                with patch.object(entry.time,"sleep"):
+                    self.assertEqual(entry.run(args,process_factory=Process),0)
+            self.assertEqual(len(launched),4)
+            self.assertTrue(all(job.startswith("hybrid_") for _,job in launched))
+            for path,content in preserved.items(): self.assertEqual(path.read_bytes(),content)
+
+    def test_repaired_parent_resumes_both_children_with_saved_gpu_and_only_failed_trials(self):
+        with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
+            output,_,_=self.legacy_pair(Path(temporary))
+            entry.repair_grid_output(output)
+            launched=[]
+            class Controller:
+                def __init__(self,command,**options):
+                    self.command=command
+                    self.mode=command[command.index("--resize-modes")+1]
+                    self.polled=False
+                def poll(self):
+                    if not self.polled:
+                        self.polled=True;return None
+                    child=entry.parser().parse_args(self.command[3:])
+                    spec=json.loads((child.output_dir/"run.json").read_text(encoding="utf-8"))
+                    class Worker:
+                        def __init__(inner,command,**options):
+                            inner.job=command[command.index("--worker")+1]
+                            launched.append((child.resize_modes[0],inner.job,options["env"]["CUDA_VISIBLE_DEVICES"]))
+                        def poll(inner):
+                            common.save_json(child.output_dir/inner.job/"metrics.json",dict(job_id=inner.job,
+                                status="success",complete=True,input_sha256=spec["input_sha256"],accuracy=.75,
+                                tp=1,tn=2,fp=0,fn=1,lat_mean_ms=100,mem_peak_allocated_gib=1,budget={}))
+                            return 0
+                    return entry.run(child,process_factory=Worker)
+            args=entry.parser().parse_args(["--resume","--output-dir",str(output)])
+            with patch.object(entry.time,"sleep"):
+                self.assertEqual(entry.run(args,process_factory=Controller),0)
+            self.assertEqual(len(launched),4)
+            self.assertEqual({(mode,gpu) for mode,_,gpu in launched},{("letterbox","3"),("stretch","4")})
+            self.assertTrue(all(job.startswith("hybrid_") for _,job,_ in launched))
+            with (output/"summary.csv").open(encoding="utf-8-sig",newline="") as stream:
+                rows=list(csv.DictReader(stream))
+            self.assertEqual(len(rows),10)
+            self.assertTrue(all(row["acc"] for row in rows))
+
+    def test_repair_refuses_unrelated_code_or_measured_hybrid_data(self):
+        for problem in ("source","hybrid_rows","cache"):
+            with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
+                output,_,specs=self.legacy_pair(Path(temporary))
+                if problem=="source":
+                    root=json.loads((output/"run.json").read_text(encoding="utf-8"))
+                    root["source_identity"]["sha256"]="unrelated"
+                    common.save_json(output/"run.json",root)
+                elif problem=="hybrid_rows":
+                    (output/"letterbox/hybrid_70_tail0/predictions.jsonl").write_text('{"measured":true}\n')
+                else:
+                    spec=specs["letterbox"]
+                    row=json.loads(Path(spec["input_json"]).read_text(encoding="utf-8").splitlines()[0])
+                    Image.new("RGB",(1152,1152),"blue").save(Path(spec["prepared_root"])/row["image"])
+                with self.assertRaises(ValueError): entry.repair_grid_output(output)
+                self.assertFalse((output/"run_before_grid_config_fix.json").exists())
+                self.assertTrue((output/"letterbox/hybrid_70_tail0/metrics.json").exists())
 
 
 if __name__ == "__main__": unittest.main()

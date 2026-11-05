@@ -23,7 +23,10 @@ import benchmark_visa_methods as common
 
 
 PROJECT = Path(__file__).resolve().parent
-VERSION = "2.0-visa-letterbox-stretch-grid3"
+VERSION = "2.1-visa-grid-config-preserved"
+GRID_BUG_VERSION = "2.0-visa-letterbox-stretch-grid3"
+GRID_BUG_SCRIPT_SHA256 = "25392eaa8db64ea9ce408dc02984d994e6525a3806f5f5aba7222141adbe23e3"
+GRID_BUG_ERROR = "ValueError: Predictor backbone architecture/AnyRes packing/order does not match training"
 CANVAS = 1152
 
 
@@ -47,6 +50,8 @@ def parser():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output-dir", type=Path, default=Path("output/visa_grid3_letterbox_stretch_70_tail0_9_01"))
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--repair-grid-config", action="store_true",
+                   help="Validate/migrate the known v2.0 grid-override failure, retain completed baselines, then resume")
     p.add_argument("--worker", help=argparse.SUPPRESS)
     p.add_argument("--manifest", type=Path, help=argparse.SUPPRESS)
     return p
@@ -112,6 +117,132 @@ def input_fingerprint(samples):
 def cache_fingerprint(records, root):
     values = [(r["image"], common.digest(root / r["image"])) for r in records]
     return hashlib.sha256(json.dumps(values, separators=(",", ":")).encode()).hexdigest()
+
+
+def validate_grid(config, tile_size=384):
+    """The square input selects 3x3 naturally; NEVER mutate the model config."""
+    from llava.mm_utils import get_anyres_image_grid_shape
+    grid = get_anyres_image_grid_shape((CANVAS, CANVAS), config.image_grid_pinpoints, tile_size)
+    if tile_size != 384 or tuple(grid) != (3, 3):
+        raise ValueError(f"Original checkpoint candidates select {grid}, not 3x3, for the 1152 square input")
+    return grid
+
+
+def grid_bug_source_identity():
+    """Reconstruct ONLY the known old script; all other source hashes stay strict."""
+    files = list(PROJECT.glob("*.py"))
+    for name in ("llava_pruning", "vendor/llava/llava", "third_party"):
+        files.extend((PROJECT / name).rglob("*.py"))
+    entries = []
+    for path in sorted(set(files)):
+        relative = path.relative_to(PROJECT).as_posix()
+        digest = (GRID_BUG_SCRIPT_SHA256 if relative == "benchmark_visa_grid3.py" else
+                  hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest())
+        entries.append(relative + ":" + digest)
+    return dict(files=len(entries), sha256=hashlib.sha256("\n".join(entries).encode()).hexdigest())
+
+
+def repair_grid_output(output):
+    """Narrow migration: validate inputs and the exact known source change first.
+
+    Completed baseline predictions/timings stay byte-for-byte unchanged. Failed
+    hybrid metadata is archived, never deleted. No checkpoint guard is relaxed.
+    """
+    from types import SimpleNamespace
+    from llava_pruning.visa_data import load_visa_test
+    output = Path(output).expanduser().resolve()
+    current, legacy = common.source_identity(), grid_bug_source_identity()
+    root_path = output / "run.json"
+    root = json.loads(root_path.read_text(encoding="utf-8"))
+
+    def known(spec):
+        return ((spec["version"] == GRID_BUG_VERSION and spec["source_identity"] == legacy) or
+                (spec["version"] == VERSION and spec["source_identity"] == current))
+
+    if not known(root):
+        raise ValueError("Repair refused: changes extend beyond the known grid-override script")
+    if root.get("kind") == "paired_resize":
+        folders = [output / mode for mode in root["resize_modes"]]
+        if common.checkpoint_identity(root["checkpoint"]["path"]) != root["checkpoint"]:
+            raise ValueError("Repair refused: checkpoint/provenance changed")
+    else:
+        folders = [output]
+    plans = []
+    for folder in folders:
+        path = folder / "run.json"
+        spec = json.loads(path.read_text(encoding="utf-8"))
+        if not known(spec):
+            raise ValueError(f"Repair refused: unrelated source/version changes in {folder}")
+        normalized = dict(spec, version=VERSION, source_identity=current)
+        verify(normalized, checkpoint_hash=True)
+        samples, info = load_visa_test(spec["raw_data_root"], spec["visa_split_csv"])
+        if input_fingerprint(samples) != spec["raw_inputs_sha256"] or info != spec["dataset_info"]:
+            raise ValueError("Repair refused: original images or official split changed")
+        model_config = json.loads((Path(spec["model_path"]) / "config.json").read_text(encoding="utf-8"))
+        validate_grid(SimpleNamespace(**model_config))
+        if spec["version"] == VERSION:
+            continue  # Idempotent after an earlier completed migration.
+        records = [json.loads(line) for line in Path(spec["input_json"]).read_text(encoding="utf-8").splitlines()]
+        if len(records) != spec["sample_count"] or any(r["image_size"] != [CANVAS, CANVAS] for r in records):
+            raise ValueError("Repair refused: inputs are not the original fixed square experiment")
+        retries, retained = [], []
+        for job in spec["jobs"]:
+            trial = folder / job["job_id"]
+            report_path = trial / "metrics.json"
+            report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
+            if report and report.get("input_sha256") != spec["input_sha256"]:
+                raise ValueError("Repair refused: report input identity changed")
+            predictions = trial / "predictions.jsonl"
+            if job["method"] == "llava_unpruned":
+                saved, valid = common.read_prefix(predictions)
+                if (report.get("status") != "success" or not report.get("complete")
+                        or len(saved) != spec["sample_count"] or predictions.stat().st_size != valid):
+                    raise ValueError("Repair requires the three complete, valid unpruned baselines")
+                for index, (row, source) in enumerate(zip(saved, records)):
+                    common.validate_prediction(row, source["question_id"], source["gt"], index)
+                retained.append(job["job_id"])
+            else:
+                if report and (report.get("status") != "failed" or report.get("error") != GRID_BUG_ERROR):
+                    raise ValueError("Repair refused: hybrid has a different failure or already-computed results")
+                if predictions.is_file() and predictions.stat().st_size:
+                    raise ValueError("Repair refused: hybrid has measured samples; cannot splice different runtime identities")
+                if (trial / "before_grid_config_fix").exists():
+                    raise ValueError("Repair archive already exists; inspect the interrupted migration")
+                retries.append(job["job_id"])
+        if not any((folder / job / "metrics.json").is_file() for job in retries):
+            raise ValueError("Repair refused: no recorded grid-signature failure")
+        plans.append((folder, spec, retained, retries))
+
+    # All validation above is read-only. Only metadata of the known failure moves.
+    for folder, spec, retained, retries in plans:
+        before = folder / "run_before_grid_config_fix.json"
+        if not before.exists():
+            before.write_bytes((folder / "run.json").read_bytes())
+        for job in retries:
+            trial = folder / job
+            if trial.exists():
+                archive = trial / "before_grid_config_fix"
+                archive.mkdir()
+                for name in ("metrics.json", "inference.json"):
+                    source = trial / name
+                    if source.exists():
+                        source.replace(archive / name)
+        spec.update(version=VERSION, source_identity=current,
+            grid_config_repair=dict(old_version=GRID_BUG_VERSION, old_source_identity=legacy,
+                effective_grid=[3, 3], preserved_jobs=retained, retry_jobs=retries,
+                policy="Original candidate list and student compatibility checks preserved; completed baselines unchanged"))
+        common.save_json(folder / "run.json", spec)
+        write_reports(folder, spec)
+        print(f"Repaired {folder.name}: preserve {retained}; retry {retries}", flush=True)
+    if root.get("kind") == "paired_resize":
+        before = output / "run_before_grid_config_fix.json"
+        if not before.exists():
+            before.write_bytes(root_path.read_bytes())
+        root.update(version=VERSION, source_identity=current, complete=False, failed_modes=[],
+                    grid_config_repair=dict(old_version=GRID_BUG_VERSION, old_source_identity=legacy,
+                        modes=root["resize_modes"], policy="Preserve all completed baseline measurements"))
+        common.save_json(root_path, root)
+        merge_resize_reports(output, root["resize_modes"])
 
 
 def verify(spec, *, checkpoint_hash=False):
@@ -201,7 +332,8 @@ def setup(args):
         jobs=jobs,
         transform=dict(mode=mode, size=[CANVAS, CANVAS], resample="BICUBIC",
             padding_rgb=[0, 0, 0] if mode == "letterbox" else None,
-            alignment="center" if mode == "letterbox" else None, grid_pinpoints=[[CANVAS, CANVAS]],
+            alignment="center" if mode == "letterbox" else None, effective_grid=[3, 3],
+            candidate_policy="Preserve checkpoint candidates; verify natural 3x3 selection",
             padding_policy=("Padding is part of the shared square input" if mode == "letterbox" else
                             "Direct resize; no aspect preservation or added padding"),
             image_sizes_policy="1152x1152 in ALL trials"),
@@ -322,9 +454,9 @@ def worker(manifest, job_id):
         core = backend.model.get_model()
         if len(core.layers) != 28 or backend.vision_tower.image_size != 384:
             raise ValueError("Expected 28 LLM layers and a 384-pixel vision input")
-        for config in (backend.model.config, core.config):
-            config.image_grid_pinpoints = [[CANVAS, CANVAS]]
-        inference = dict(backend.inference_config, image_grid_pinpoints=[[CANVAS, CANVAS]])
+        validate_grid(core.config, backend.vision_tower.image_size)
+        inference = dict(backend.inference_config, image_grid_pinpoints=core.config.image_grid_pinpoints,
+                         effective_grid=[3, 3])
         device = torch.cuda.get_device_properties(0)
         common.verify_runtime(output, inference, device.name, device.total_memory)
         report["inference"] = inference
@@ -568,6 +700,11 @@ def run(args, *, process_factory=None):
 
 def main():
     args = parser().parse_args()
+    if args.repair_grid_config:
+        if args.worker:
+            raise ValueError("Repair must run in the parent before starting workers")
+        repair_grid_output(args.output_dir)
+        args.resume = True
     if args.worker:
         if not args.manifest:
             raise ValueError("Worker requires --manifest")
