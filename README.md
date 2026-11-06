@@ -1504,6 +1504,23 @@ mix weight0 (disabled); set `--spatial-mix-weight 0.02` explicitly to enable it.
 Usage, policy differences, outputs, and timing limitations:
 [PoolSpatial integration](docs/pool_spatial.md).
 
+## MMAD binary comparison (0-shot)
+
+`benchmark_mmad_binary.py` runs the local MMAD Anomaly Detection subset with VisA excluded,
+with the seven existing methods plus a joint-self hybrid at layer-average 50/70/90%,
+including Lat/Mem and source-wise metrics. Use `--gpus 5 6 7` for independent
+parallel trials, one per GPU, or `--gpu 5` for sequential trials. It defaults to the confirmed
+VisA-trained student for the hybrid baseline and records its training provenance.
+VisA-source MMAD questions are excluded from EVERY trial and the unpruned
+reference because the student was trained on VisA. The added hybrid uses full
+Base+AnyRes+Text predictor input, each
+token's own predicted attention, joint Top-k without group quotas, lambda=.7
+and tail0; the original Base-guided/base_text/tail9 group is retained.
+Query images only; native question/option text; no PNG.
+PyramidDrop90% is explicitly unreachable. See
+[MMAD usage and scoring](docs/mmad_binary_comparison.md) for the full command,
+CPU-only `--check-data`, annotation paths, and `--resume`.
+
 ## Research cautions
 
 - This FastV implementation masks visual keys in decoder attention. It does **not** shorten the token sequence or prove wall-clock acceleration from token removal. `generation_seconds` is diagnostic, not a claimed speedup metric.
