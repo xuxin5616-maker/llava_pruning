@@ -131,6 +131,79 @@ class MMADDataTests(unittest.TestCase):
                 with self.assertRaises(ValueError): relative_image(value)
             with self.assertRaisesRegex(ValueError,'0 candidate'): resolve_image(root,'VisA/object/image/good/missing.png')
 
+    def test_native_test_paths_prefix_aliases_and_annotation_precedence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve()
+            cases=[('DS-MVTec','MVTec-AD','bottle'),('MVTec-AD','DS-MVTec','pill'),
+                   ('MVTec-LOCO','MVTec-LOCO','breakfast_box'),('GoodsAD','GoodsAD','food_box')]
+            for annotation_source,installed_source,category in cases:
+                with self.subTest(source=annotation_source):
+                    relative=f'{annotation_source}/{category}/image/broken/000.png'
+                    native=root/installed_source/category/'test/broken/000.png'
+                    native.parent.mkdir(parents=True,exist_ok=True);native.write_bytes(b'native')
+                    self.assertEqual(resolve_image(root,relative),native.resolve())
+                    converted=root/relative;converted.parent.mkdir(parents=True,exist_ok=True)
+                    converted.write_bytes(b'converted MMAD')
+                    self.assertEqual(resolve_image(root,relative),converted.resolve())
+
+    def test_explicit_mvtec_root_is_authoritative_and_never_uses_train(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)/'MMAD';root.mkdir()
+            external=Path(temporary)/'original_MVTec';external.mkdir()
+            installed=root/'DS-MVTec/bottle/image/good/000.png'
+            installed.parent.mkdir(parents=True);installed.write_bytes(b'converted')
+            train=external/'bottle/train/good/000.png'
+            train.parent.mkdir(parents=True);train.write_bytes(b'NOT A TEST IMAGE')
+            relative='DS-MVTec/bottle/image/good/000.png'
+            with self.assertRaisesRegex(ValueError,'0 candidate files') as error:
+                resolve_image(root,relative,mvtec_root=external)
+            self.assertIn(str((external/'bottle/test/good/000.png').resolve()),str(error.exception))
+            native=external/'bottle/test/good/000.png'
+            native.parent.mkdir(parents=True);native.write_bytes(b'external native')
+            for prefix in ('DS-MVTec','MVTec-AD'):
+                self.assertEqual(resolve_image(root,f'{prefix}/bottle/image/good/000.png',
+                    mvtec_root=external),native.resolve())
+            with self.assertRaisesRegex(NotADirectoryError,'mvtec-root not found'):
+                resolve_image(root,relative,mvtec_root=external/'missing')
+            duplicate=root/'images/MVTec-LOCO/c/test/good/000.png'
+            original=root/'MVTec-LOCO/c/test/good/000.png'
+            for path in (original,duplicate): path.parent.mkdir(parents=True);path.write_bytes(b'c')
+            with self.assertRaisesRegex(ValueError,'2 candidate files'):
+                resolve_image(root,'MVTec-LOCO/c/image/good/000.png',mvtec_root=external)
+
+    def test_native_install_and_external_mvtec_freeze_resume(self):
+        with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()) as text:
+            root=Path(temporary);args=fixture(root);data=Path(args.data_root)
+            external=root/'original_MVTec';external.mkdir();args.mvtec_root=str(external)
+            for source in ('DS-MVTec','MVTec-AD','MVTec-LOCO','GoodsAD'):
+                for label in ('good','broken'):
+                    original=data/source/'object/image'/label/'000.png'
+                    target=(external if source in {'DS-MVTec','MVTec-AD'} else data/source)/'object/test'/label/'000.png'
+                    target.parent.mkdir(parents=True,exist_ok=True)
+                    target.write_bytes(original.read_bytes());original.unlink()
+            args.check_data=True
+            self.assertEqual(entry.run(args),0);self.assertFalse(args.output_dir.exists())
+            self.assertIn('MVTec image source:',text.getvalue())
+            args.check_data=False
+            _,spec=entry.setup(args);samples=load_frozen(spec['input_json'],exclude_sources=entry.EXCLUDED_SOURCES)
+            self.assertEqual(len(samples),8)
+            self.assertEqual(spec['dataset_info']['mvtec_root'],str(external.resolve()))
+            for sample in samples:
+                self.assertIn('/image/',sample.source['image'])
+                self.assertIn('test',sample.image.parts)
+                if sample.source['dataset']=='MVTec-AD': self.assertTrue(sample.image.is_relative_to(external.resolve()))
+                self.assertEqual(sample.text,prompt(sample.source))
+            args.resume=True
+            self.assertEqual(entry.setup(args)[1],spec)
+
+    def test_missing_image_fails_before_checkpoint_fingerprinting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args=fixture(Path(temporary));args.image_root=str(Path(temporary)/'missing_images')
+            with patch.object(entry,'student_identity') as fingerprint:
+                with self.assertRaisesRegex(ValueError,'0 candidate files'): entry.setup(args)
+                fingerprint.assert_not_called()
+            self.assertFalse(args.output_dir.exists())
+
     def test_check_data_needs_no_model_or_checkpoint_and_writes_nothing(self):
         with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()) as text:
             root=Path(temporary);args=fixture(root);args.check_data=True

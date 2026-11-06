@@ -37,13 +37,44 @@ def find_annotations(root, explicit=None):
     return found.pop()
 
 
-def resolve_image(root, relative, image_root=None):
-    roots=[Path(image_root).expanduser().resolve()] if image_root else [root,root/'images',root/'dataset/MMAD',root/'MMAD']
-    found={(base/relative).resolve() for base in roots if (base/relative).is_file()}
-    if len(found)!=1:
-        raise ValueError(f'MMAD image has {len(found)} candidate files: {relative}; use --image-root to select the image root')
-    # Official instructions explicitly permit source-directory symlinks.
-    return found.pop()
+def resolve_image(root, relative, image_root=None, *, mvtec_root=None):
+    """Exact annotation identity, allowing native category/test/label/name paths.
+
+    No recursive filename matching, extension changes, training-image fallback,
+    or skipped questions. An explicit MVTec source root overrides container
+    roots for BOTH DS-MVTec and MVTec-AD; other sources keep their own roots.
+    """
+    parts=PurePosixPath(relative_image(relative)).parts
+    root=Path(root)
+    native=list(parts[1:])
+    variants=[Path(*native)]
+    if native[1]=='image':
+        native[1]='test';variants.append(Path(*native))
+    if mvtec_root is not None and SOURCES[parts[0]]=='MVTec-AD':
+        external=Path(mvtec_root).expanduser().resolve()
+        if not external.is_dir(): raise NotADirectoryError(f'--mvtec-root not found: {external}')
+        tiers=[[external/tail] for tail in variants]
+    else:
+        roots=[Path(image_root).expanduser().resolve()] if image_root else [root,root/'images',root/'dataset/MMAD',root/'MMAD']
+        aliases=[parts[0]]
+        if parts[0] in {'DS-MVTec','MVTec-AD'}:
+            aliases.append('MVTec-AD' if parts[0]=='DS-MVTec' else 'DS-MVTec')
+        # Prefer the annotation's actual source/name, then its native test
+        # layout, then the alternate MVTec prefix. This preserves existing
+        # converted MMAD files when native originals are installed as well.
+        tiers=[[base/alias/tail for base in roots] for alias in aliases for tail in variants]
+    tried=[]
+    for candidates in tiers:
+        tried.extend(candidates)
+        # Official instructions explicitly permit source-directory symlinks.
+        found={candidate.resolve() for candidate in candidates if candidate.is_file()}
+        if len(found)>1:
+            raise ValueError(f'MMAD image has {len(found)} candidate files: {relative}; '
+                f'use --image-root or --mvtec-root to select one. Matches: '+', '.join(str(p) for p in sorted(found)))
+        if found: return found.pop()
+    hint=' For MVTec, supply --mvtec-root /path/to/MVTec-AD.' if SOURCES[parts[0]]=='MVTec-AD' else ''
+    raise ValueError(f'MMAD image has 0 candidate files: {relative}.{hint} Tried:\n  '
+                     +'\n  '.join(str(p) for p in tried))
 
 
 def yes_no(value):
@@ -57,7 +88,7 @@ def prompt(record):
         +"Answer with the option's letter from the given choices directly.")
 
 
-def load_binary(data_root, annotations=None, image_root=None, seed=42, *, exclude_sources=()):
+def load_binary(data_root, annotations=None, image_root=None, seed=42, *, exclude_sources=(), mvtec_root=None):
     root=Path(data_root).expanduser().resolve()
     if not root.is_dir(): raise NotADirectoryError(root)
     excluded=set(exclude_sources)
@@ -95,7 +126,7 @@ def load_binary(data_root, annotations=None, image_root=None, seed=42, *, exclud
             # Used for confusion groups only, as in official normal-vs-abnormal
             # scoring. Option-to-class mapping is evaluated AFTER generation.
             gt=0 if PurePosixPath(relative).parts[-2].lower() in {'good','normal'} else 1
-            image=resolve_image(root,relative,image_root)
+            image=resolve_image(root,relative,image_root,mvtec_root=mvtec_root)
             shuffled=list(options.items());rng.shuffle(shuffled)
             mapping={chr(65+i):old_key for i,(old_key,_) in enumerate(shuffled)}
             choices={chr(65+i):text for i,(_,text) in enumerate(shuffled)}
@@ -112,6 +143,9 @@ def load_binary(data_root, annotations=None, image_root=None, seed=42, *, exclud
         query_images=len(data),selected_query_images=len({r['image'] for r in records}),
         binary_questions=len(records),source_counts=dict(counts),excluded_sources=sorted(excluded),
         excluded_binary_questions=dict(excluded_counts),
+        mvtec_root=str(Path(mvtec_root).expanduser().resolve()) if mvtec_root is not None else None,
+        image_root=str(Path(image_root).expanduser().resolve()) if image_root is not None else None,
+        image_resolution_policy='Exact category/label/filename; annotation image layout preferred, native test layout fallback; DS-MVTec/MVTec-AD prefix alias; explicit mvtec_root overrides only MVTec',
         binary_questions_with_distractors=extra,skipped_question_types=dict(skipped),shots=0,
         option_policy='Question and option text retained; labels shuffled ONCE with seed, shared by all methods',
         conversation_policy='First conversation* field, matching the official example parser',

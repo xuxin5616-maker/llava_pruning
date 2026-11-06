@@ -15,6 +15,7 @@ python benchmark_mmad_binary.py \
   --gpus 5 6 7 \
   --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
   --data-root /home/yz/xxy/data/datasets/MMAD \
+  --mvtec-root /home/yz/xxy/data/datasets/MVTec-AD \
   --checkpoint output/attention_predictor_twig_train_01/best.pt \
   --prune-rates 50 70 90 \
   --output-dir output/mmad_no_visa_two_hybrids_gpu567_01
@@ -25,13 +26,30 @@ python benchmark_mmad_binary.py \
 ```bash
 python benchmark_mmad_binary.py \
   --data-root /home/yz/xxy/data/datasets/MMAD \
+  --mvtec-root /home/yz/xxy/data/datasets/MVTec-AD \
   --check-data
 ```
 
 自动查找根目录及 `dataset/MMAD/`、`MMAD/`、`annotations/` 中的 `mmad.json`。
 该文件必须为官方问题标注：以图片相对路径为键，值包含 `conversation` 列表、Question、Options、Answer、type。
 不是普通分类 JSON，也不是 MMAD-BBox 或只有图片路径的 metadata CSV。
-图片从根目录、`images/`、`dataset/MMAD/`、`MMAD/` 下查找；允许官方说明中的来源目录软链接。
+图片从根目录、`images/`、`dataset/MMAD/`、`MMAD/` 下查找；允许来源目录软链接。
+已兼容用户下载的原始 `test` 布局，按固定规则精确映射，例如：
+
+```text
+标注：MVTec-LOCO/breakfast_box/image/logical_anomalies/000.png
+文件：MMAD/MVTec-LOCO/breakfast_box/test/logical_anomalies/000.png
+
+标注：DS-MVTec/bottle/image/broken_large/000.png
+文件：--mvtec-root/bottle/test/broken_large/000.png
+```
+
+`--mvtec-root` 应指向包含 `bottle/`、`cable/` 等类别目录的原始 MVTec-AD 根目录。
+它对标注中的 `DS-MVTec` 和 `MVTec-AD` 两种前缀都生效；LOCO、GoodsAD仍从 MMAD 中读取。
+该参数显式覆盖 MVTec 来源，即使 MMAD 中也有 MVTec 图片，也按用户指定的目录读取。
+不指定时先使用标注同名来源的 `image` 布局，再尝试原生 `test` 布局，最后尝试两个MVTec来源前缀互换。
+始终保留类别、缺陷类型、文件名和扩展名，不做递归同名搜索，不使用 `train/validation/ground_truth` 替代查询图。
+原始图片尺寸从实际文件读取，冻结清单记录解析后的绝对路径；评测ID、问题、选项、GT仍来自原标注。
 若安装位置不同或找到多个候选，明确添加：
 
 ```bash
@@ -51,7 +69,8 @@ python benchmark_mmad_binary.py --resume --output-dir output/mmad_no_visa_two_hy
 恢复沿用保存的 GPU 分配/参数和问题顺序，已完成实验跳过，未完成实验读取逐题记录后继续。
 源码、模型配置、问题标注、冻结清单、学生权重或训练来源清单变化时拒绝混用。
 每个工作进程还检查图片大小及修改时间；没有对图片内容和主模型全部权重逐个校验哈希。
-当前排除VisA版本为1.3；旧版本已产生结果时请用新目录，不将含VisA的旧结果混入新统计。
+当前原生目录适配版本为1.4；旧版本已产生结果时请用新目录，不将不同源码/输入配置混入同一次恢复。
+准备数据阶段因缺图退出时还未创建实验目录，可以修正路径后重新执行原命令。
 
 `--gpus 5 6 7` 将实验固定轮转分配到三张卡，三张卡可以同时工作；每张卡最多一个任务，
 每个任务都独立加载模型。不是把单个模型拆到三张卡上。

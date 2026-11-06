@@ -1520,6 +1520,10 @@ Query images only; native question/option text; no PNG.
 PyramidDrop90% is explicitly unreachable. See
 [MMAD usage and scoring](docs/mmad_binary_comparison.md) for the full command,
 CPU-only `--check-data`, annotation paths, and `--resume`.
+The loader supports both annotation `image/` and native `test/` layouts.
+Use `--mvtec-root /home/yz/xxy/data/datasets/MVTec-AD` when MVTec images are
+stored separately; both `DS-MVTec` and `MVTec-AD` annotation prefixes map to
+that source root by exact category/defect/filename.
 
 ## Research cautions
 

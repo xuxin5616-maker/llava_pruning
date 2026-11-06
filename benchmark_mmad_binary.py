@@ -26,7 +26,7 @@ from llava_pruning.mmad_data import load_binary, load_frozen, canonical_answer
 
 
 PROJECT = Path(__file__).resolve().parent
-VERSION = "1.3-mmad-exclude-visa-0shot"
+VERSION = "1.4-mmad-native-test-paths"
 EXCLUDED_SOURCES = ("VisA",)
 FIELDS = (*common.FIELDS, "pre", "recall", "tnr", "unparsed", "nonbinary", "mmad_score")
 SOURCE_FIELDS = ("source", "questions", "normal", "abnormal", *FIELDS)
@@ -40,6 +40,7 @@ def parser():
     p.add_argument("--data-root", default="/home/yz/xxy/data/datasets/MMAD")
     p.add_argument("--annotations", help="Official question JSON; default auto-detects local annotation paths")
     p.add_argument("--image-root", help="Directory containing DS-MVTec/MVTec-AD/VisA/GoodsAD source folders")
+    p.add_argument("--mvtec-root", help="Optional MVTec-AD source root containing bottle/test, etc.; used for both DS-MVTec and MVTec-AD annotations")
     p.add_argument("--model-path", default="/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/")
     p.add_argument("--checkpoint", default="output/attention_predictor_twig_train_01/best.pt",
                    help="VisA-trained student used by hybrid_baseline only")
@@ -62,12 +63,14 @@ def describe(info):
           f"{info['selected_query_images']} selected images; local annotation={info['annotations']}", flush=True)
     print("Source question counts: "+json.dumps(info['source_counts'],ensure_ascii=False),flush=True)
     print("Excluded source question counts: "+json.dumps(info['excluded_binary_questions'],ensure_ascii=False),flush=True)
+    if info.get("mvtec_root"): print(f"MVTec image source: {info['mvtec_root']}",flush=True)
     print(f"Questions with extra distractors: {info['binary_questions_with_distractors']}; "
           "no normal-reference images or masks are used.",flush=True)
 
 
 def check_data(args):
-    _,info = load_binary(args.data_root,args.annotations,args.image_root,args.seed,exclude_sources=EXCLUDED_SOURCES)
+    _,info = load_binary(args.data_root,args.annotations,args.image_root,args.seed,
+        exclude_sources=EXCLUDED_SOURCES,mvtec_root=args.mvtec_root)
     describe(info)
     return 0
 
@@ -136,11 +139,14 @@ def setup(args):
             len(set(args.prune_rates))!=len(args.prune_rates)):
         raise ValueError("Invalid GPU, seed, warmup or pruning rates")
     if output.exists() and any(output.iterdir()): raise FileExistsError(f"Use a new/empty directory or --resume: {output}")
+    # Validate the complete query image set before model/config/weight loading
+    # or fingerprinting; path failures should be quick to diagnose and retry.
+    records,info = load_binary(args.data_root,args.annotations,args.image_root,args.seed,
+        exclude_sources=EXCLUDED_SOURCES,mvtec_root=args.mvtec_root)
     model = Path(args.model_path).expanduser().resolve()
     if json.loads((model/"config.json").read_text(encoding="utf-8")).get("num_hidden_layers")!=28:
         raise ValueError("The matched pruning schedules require the existing 28-layer Qwen2 model")
     checkpoint = student_identity(args.checkpoint,"visa")
-    records,info = load_binary(args.data_root,args.annotations,args.image_root,args.seed,exclude_sources=EXCLUDED_SOURCES)
     from PIL import Image
     images = {}
     for row in records:
