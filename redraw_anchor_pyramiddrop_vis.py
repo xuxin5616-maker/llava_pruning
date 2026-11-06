@@ -1,4 +1,4 @@
-"""Combine cached pruning PNGs: pruned Base on left, stitched AnyRes on right.
+"""Combine cached PNGs: original AnyRes, pruned Base, and pruned AnyRes.
 
 CPU only, Pillow + standard library. No model, Torch, GPU or inference.
 Reads existing visualizations; one PNG per sample/method/rate.
@@ -33,7 +33,7 @@ def parser():
                    help="Experiment directory, or its visualizations directory")
     p.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     p.add_argument("--panel-height", type=int, default=PANEL_HEIGHT,
-                   help="Both panels' display height; nearest-neighbor resizing. 0 keeps native AnyRes height")
+                   help="All panels' display height; nearest-neighbor resizing. 0 keeps native AnyRes height")
     return p
 
 
@@ -83,17 +83,21 @@ def render_sample(folder, method, rate, *, panel_height=PANEL_HEIGHT):
         raise ValueError(f"Final pruning stage is missing: {prefix}; partial stages are not substituted")
     base = read_body(folder / f"{prefix}_base.png")
     mosaic = Image.new("RGB", (width * VIEW_SIZE, height * VIEW_SIZE), "white")
+    original = Image.new("RGB", mosaic.size, "white")
     for tile in range(width * height):
         view = read_body(folder / f"{prefix}_anyres_{tile+1:02d}.png")
+        raw_view = read_body(folder / f"input_anyres_{tile+1:02d}.png")
         row, col = divmod(tile, width)
         mosaic.paste(view, (col * VIEW_SIZE, row * VIEW_SIZE))
-        view.close()
+        original.paste(raw_view, (col * VIEW_SIZE, row * VIEW_SIZE))
+        view.close(); raw_view.close()
     target_height = panel_height or mosaic.height
     base = base.resize((target_height, target_height), Image.Resampling.NEAREST)
     mosaic = mosaic.resize((max(1, round(mosaic.width * target_height / mosaic.height)), target_height),
                            Image.Resampling.NEAREST)
+    original = original.resize(mosaic.size, Image.Resampling.NEAREST)
     margin, gap, header, footer = 20, 24, 100, 36
-    canvas = Image.new("RGB", (2 * margin + base.width + gap + mosaic.width,
+    canvas = Image.new("RGB", (2 * margin + original.width + base.width + 2 * gap + mosaic.width,
                                header + target_height + footer), "white")
     draw = ImageDraw.Draw(canvas)
     text = f"{title} | Average pruning {rate:g}%"
@@ -105,16 +109,19 @@ def render_sample(folder, method, rate, *, panel_height=PANEL_HEIGHT):
     sample_id = saved.get("question_id", folder.name)
     caption = f"ID: {sample_id} | GT: {label(saved.get('gt'))} | Pred: {pred}"
     draw.text((margin, 43), caption, fill="black", font=font(16))
-    right = margin + base.width + gap
-    draw.text((margin, 73), "Base", fill="black", font=font(19))
-    draw.text((right, 73), f"AnyRes ({width} x {height})", fill="black", font=font(19))
-    canvas.paste(base, (margin, header))
+    middle = margin + original.width + gap
+    right = middle + base.width + gap
+    draw.text((margin, 73), f"Original AnyRes ({width} x {height})", fill="black", font=font(19))
+    draw.text((middle, 73), "Base (pruned)", fill="black", font=font(19))
+    draw.text((right, 73), "AnyRes (pruned)", fill="black", font=font(19))
+    canvas.paste(original, (margin, header))
+    canvas.paste(base, (middle, header))
     canvas.paste(mosaic, (right, header))
     note = "White = pruned | Gray = native unpadding"
     if stage.get("max9_resized"):
         note += " | AnyRes mask projected from packed tokens"
     draw.text((margin, header + target_height + 9), note, fill="black", font=font(14))
-    base.close(); mosaic.close()
+    base.close(); mosaic.close(); original.close()
     return canvas, dict(question_id=sample_id, gt=saved.get("gt"), prediction=pred,
                         measured_answer=saved.get("measured_answer", ""), visualization_answer=answer,
                         grid_width=width, grid_height=height)

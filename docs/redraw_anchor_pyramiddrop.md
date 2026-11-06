@@ -16,11 +16,12 @@ python /tmp/redraw_anchor_pyramiddrop_vis.py \
 也可以修改脚本顶部的`RESULTS_DIR`、`OUTPUT_DIR`，直接运行脚本。
 
 - 每个方法、每个剪枝率、每个样本只保存一张PNG。
-- 左侧是最终剪枝后的Base，右侧是按实际行列拼接的全部AnyRes块。
-- AnchorPrune读取`pre_llm_*`，PyramidDrop只读取`after_layer_21_*`；不保存输入或第7/14层的图。
+- 从左到右：原始AnyRes拼接图、最终剪枝后的Base、最终剪枝后的AnyRes拼接图。
+- 原始拼接图读取`input_anyres_*.png`；两组AnyRes使用相同网格和显示大小，便于直接对照。
+- AnchorPrune的剪枝状态读取`pre_llm_*`，PyramidDrop只取`after_layer_21_*`；不额外输出第7/14层的图。
 - 顶部保留方法、平均剪枝率、ID、GT和对应旧图片的模型预测。
 - 实际AnyRes网格沿用旧图，不固定成3×3，也不改变已经运行的剪枝决策。
-- 两个面板默认等高768像素，最近邻缩放，避免对白色格子边界混色。
+- 三个面板默认等高768像素，最近邻缩放，避免对白色格子边界混色。
   `--panel-height 0`保留AnyRes拼接后的原生高度；`--panel-height 1152`可加大显示尺寸。
 - 新图在`<output>/anchorprune/prune_50/sample_000000000.png`等位置。
 - `redraw_index.csv`记录图片位置及失败原因；进度打印已完成数量、耗时和ETA。

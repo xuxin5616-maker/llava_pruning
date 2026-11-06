@@ -27,12 +27,15 @@ class RedrawTests(unittest.TestCase):
         for view in range(1+grid[0]*grid[1]):
             color=(20+view*15,80,150);colors.append(color)
             image=Image.new("RGB",(384,384),color)
-            if view==0:image.paste((255,255,255),(0,0,14,14))
-            if view==1:image.paste((160,160,160),(0,0,14,14))
             header=40+view*7
             cached=Image.new("RGB",(384,header+384),(255,0,255))
             cached.paste(image,(0,header))
             name="base" if view==0 else f"anyres_{view:02d}"
+            cached.save(folder/f"input_{name}.png")
+            if view==0:image.paste((255,255,255),(0,0,14,14))
+            if view==1:image.paste((160,160,160),(0,0,14,14))
+            if view==2:image.paste((255,255,255),(0,0,14,14))
+            cached.paste(image,(0,header))
             cached.save(folder/f"{prefix}_{name}.png")
         return folder,meta,colors
 
@@ -40,14 +43,19 @@ class RedrawTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             folder,_,colors=self.sample(Path(temporary))
             image,metadata=entry.render_sample(folder,"anchorprune",50,panel_height=0)
-            self.assertEqual(image.size,(1984,904))
-            self.assertEqual(image.getpixel((20+7,100+7)),(255,255,255))
-            self.assertEqual(image.getpixel((20+80,100+80)),colors[0])
-            right=20+768+24
+            self.assertEqual(image.size,(3160,904))
+            middle=20+1152+24
+            self.assertEqual(image.getpixel((middle+7,100+7)),(255,255,255))
+            self.assertEqual(image.getpixel((middle+80,100+80)),colors[0])
+            right=middle+768+24
+            self.assertEqual(image.getpixel((20+7,100+7)),colors[1])
             self.assertEqual(image.getpixel((right+7,100+7)),(160,160,160))
+            self.assertEqual(image.getpixel((20+384+7,100+7)),colors[2])
+            self.assertEqual(image.getpixel((right+384+7,100+7)),(255,255,255))
             for view in range(1,7):
                 row,col=divmod(view-1,3)
                 self.assertEqual(image.getpixel((right+col*384+80,100+row*384+80)),colors[view])
+                self.assertEqual(image.getpixel((20+col*384+80,100+row*384+80)),colors[view])
             self.assertEqual(metadata["prediction"],"Normal")
             self.assertEqual(metadata["measured_answer"],"A")
             image.close()
@@ -58,12 +66,18 @@ class RedrawTests(unittest.TestCase):
             for layer in (7,14):
                 Image.new("RGB",(384,424),(255,0,0)).save(folder/f"after_layer_{layer:02d}_base.png")
             picture,_=entry.render_sample(folder,"pyramiddrop",70,panel_height=384)
-            self.assertEqual(picture.getpixel((20+80,100+80)),colors[0])
+            self.assertEqual(picture.getpixel((20+384+24+80,100+80)),colors[0])
             picture.close()
             metadata["stages"]=[dict(after_layer=7),dict(after_layer=14)]
             (folder/"run.json").write_text(json.dumps(metadata),encoding="utf-8")
             with self.assertRaisesRegex(ValueError,"Final pruning stage"):
                 entry.render_sample(folder,"pyramiddrop",70)
+
+    def test_missing_original_view_is_reported_instead_of_using_a_pruned_view(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder,_,_=self.sample(Path(temporary),grid=(1,1))
+            (folder/"input_anyres_01.png").unlink()
+            with self.assertRaises(FileNotFoundError):entry.render_sample(folder,"anchorprune",50)
 
     def test_batch_one_png_per_sample_preserves_old_files_and_reports_missing_views(self):
         with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
