@@ -132,7 +132,7 @@ def setup(args, *, source_policy="current_directory"):
 
 
 def run(args, *, process_factory=None, setup_function=None, worker_script=None,
-        manifest_name="run.json", report_writer=None):
+        manifest_name="run.json", report_writer=None, dataset_description=None):
     output, spec = (setup_function or setup)(args)
     save_reports = report_writer or common.write_reports
     save_reports(output, spec)
@@ -147,7 +147,8 @@ def run(args, *, process_factory=None, setup_function=None, worker_script=None,
     total = sum(len(queue) for queue in queues.values())
     completed = 0
     last_progress = time.perf_counter()
-    print(f"{spec['sample_count']} official VisA test images; stretch 1152; 3x3; "
+    description = dataset_description or "official VisA test images; stretch 1152; 3x3"
+    print(f"{spec['sample_count']} {description}; "
           f"{total} valid trials; GPUs={spec['gpus']}; no visualizations", flush=True)
     try:
         while active or any(queues.values()):
