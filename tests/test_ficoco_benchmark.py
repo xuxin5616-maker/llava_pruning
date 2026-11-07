@@ -72,6 +72,58 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual([j['prune_rate'] for j in group],[0,50,70,90])
         with self.assertRaises(ValueError): entry.schedule(entry.DATASETS,[50],[5,5],12)
 
+    def test_include_visa_reaches_preflight_frozen_inputs_and_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
+            args=fixture(Path(temporary));args.include_visa=True
+            args.check_data=True
+            self.assertEqual(entry.run(args),0);self.assertFalse(args.output_dir.exists())
+            args.check_data=False;_,spec=entry.setup(args);entry.verify(spec)
+            self.assertTrue(spec['include_visa'])
+            ds=spec['datasets']['mmad'];samples=entry.frozen_samples(ds,'mmad')
+            self.assertEqual(len(samples),10)
+            self.assertEqual(ds['info']['excluded_sources'],[])
+            self.assertEqual(ds['info']['source_counts']['VisA'],2)
+            for sample in samples:
+                if sample.source['dataset']=='VisA':
+                    self.assertEqual(len(sample.source['options']),4)
+                    self.assertIn(sample.source['question'],sample.text)
+            self.assertTrue(all('exclude=none' in j['config'] for j in spec['jobs'] if j['dataset']=='mmad'))
+            self.assertTrue(all('exclude=' not in j['config'] for j in spec['jobs'] if j['dataset']!='mmad'))
+            # Resume restores the saved inclusion policy; a missing CLI flag
+            # cannot silently drop VisA halfway through this experiment.
+            args.resume=True;args.include_visa=False
+            self.assertEqual(entry.setup(args)[1],spec)
+            spec['include_visa']=False
+            with self.assertRaisesRegex(ValueError,'MMAD annotation/exclusion'): entry.verify(spec)
+            ds['info']['excluded_sources']=['VisA']
+            with self.assertRaisesRegex(ValueError,'Frozen dataset/source'): entry.frozen_samples(ds,'mmad')
+
+    def test_include_visa_exports_four_sources_and_full_mmad_reference(self):
+        with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
+            args=fixture(Path(temporary));args.include_visa=True;args.datasets=['mmad'];calls=[]
+            def process(command,**kwargs):
+                manifest=Path(command[command.index('--manifest')+1]);spec=json.loads(manifest.read_text(encoding='utf-8'))
+                job=next(j for j in spec['jobs'] if j['job_id']==command[command.index('--worker')+1])
+                ds=spec['datasets']['mmad'];samples=entry.frozen_samples(ds,'mmad');rows=records_for(samples)
+                for sample,row in zip(samples,rows):
+                    if sample.source['dataset']=='VisA': row['answer']='I cannot decide.'
+                result=entry.summarize(rows,samples,job,2**30)
+                folder=manifest.parent/job['job_id'];folder.mkdir()
+                common.save_json(folder/'metrics.json',dict(result,job_id=job['job_id'],status='success',input_sha256=ds['input_sha256']))
+                calls.append(job);return SimpleNamespace(poll=lambda:0,wait=lambda **kw:0)
+            with patch.object(entry.subprocess,'Popen',side_effect=process):
+                self.assertEqual(entry.run(args),0);self.assertEqual(len(calls),4)
+                args.resume=True;self.assertEqual(entry.run(args),0);self.assertEqual(len(calls),4)
+            with (args.output_dir/'summary.csv').open(encoding='utf-8-sig') as stream:
+                rows=list(csv.DictReader(stream))
+            self.assertTrue(all(float(r['acc'])==80. and float(r['mmad_score'])==75. and
+                float(r['relative_accuracy_pct'])==100. for r in rows))
+            with (args.output_dir/'summary_by_source.csv').open(encoding='utf-8-sig') as stream:
+                rows=list(csv.DictReader(stream))
+            self.assertEqual(len(rows),16)
+            self.assertEqual({r['source'] for r in rows},{'MVTec-AD','MVTec-LOCO','GoodsAD','VisA'})
+            self.assertTrue(all(float(r['acc'])==0. for r in rows if r['source']=='VisA'))
+
     def test_parallel_reports_use_per_dataset_references_and_resume_same_inputs(self):
         with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
             args=fixture(Path(temporary));busy=set();maximum=[0];calls=[]

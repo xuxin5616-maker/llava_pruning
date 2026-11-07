@@ -1,7 +1,8 @@
-"""FiCoCo-V on MVTec, MMAD(no VisA) and MPDD: one server command, no PNG.
+"""FiCoCo-V on MVTec, MMAD and MPDD: one server command, no PNG.
 
 Default GPU5/MVTec, GPU6/MMAD, GPU7/MPDD; each dataset has a native unpruned
 reference and layer-average50/70/90%. No distilled student or training needed.
+Use --include-visa to include MMAD's VisA source (excluded by default).
 """
 
 import argparse
@@ -28,7 +29,7 @@ from llava_pruning.ficoco_v import PAPER, UPSTREAM, VERSION as METHOD_VERSION
 
 
 PROJECT=Path(__file__).resolve().parent
-VERSION="1.0-ficoco-three-datasets"
+VERSION="1.1-ficoco-optional-mmad-visa"
 DATASETS=("mvtec","mmad","mpdd")
 BUDGET_FIELDS=(*common.BUDGET_FIELDS,"vision_start_layer","vision_depth","raw_retained_tokens","protected_newlines","packing")
 
@@ -44,6 +45,7 @@ def parser():
     p.add_argument("--mmad-annotations")
     p.add_argument("--mmad-image-root")
     p.add_argument("--mmad-mvtec-root",default="/home/yz/xxy/data/datasets/MVTec-AD")
+    p.add_argument("--include-visa",action="store_true",help="Include the VisA-source Anomaly Detection questions inside MMAD, for both FiCoCo-V and the unpruned reference")
     p.add_argument("--mpdd-root",default="/home/yz/xxy/data/datasets/MPDD")
     p.add_argument("--prune-rates",nargs="+",type=int,choices=(50,70,90),default=[50,70,90])
     p.add_argument("--vision-start-layer",type=int,default=12,help="One-based SigLIP layer; compress after attention, before MLP")
@@ -66,7 +68,7 @@ def prepare_data(args):
     for name in args.datasets:
         if name=="mmad":
             rows,info=load_binary(args.mmad_root,args.mmad_annotations,args.mmad_image_root,args.seed,
-                                 exclude_sources=("VisA",),mvtec_root=args.mmad_mvtec_root)
+                                 exclude_sources=() if args.include_visa else ("VisA",),mvtec_root=args.mmad_mvtec_root)
         else:
             if name=="mvtec":
                 samples=load_samples(args.mvtec_input_json,args.mvtec_data_root)
@@ -95,7 +97,7 @@ def prepare_data(args):
     return datasets
 
 
-def schedule(names,rates,gpus,start,*,balance=.35,quantile=.998):
+def schedule(names,rates,gpus,start,*,balance=.35,quantile=.998,include_visa=False):
     if not gpus or len(set(gpus))!=len(gpus) or any(type(g) is not int or g<0 for g in gpus):
         raise ValueError("GPU IDs must be distinct nonnegative integers")
     jobs=[]
@@ -105,7 +107,7 @@ def schedule(names,rates,gpus,start,*,balance=.35,quantile=.998):
             method="ficoco_v" if rate else "llava_unpruned"
             config=f"dataset={name};method={method};prune={rate}%;rate=layer_average;shot=0;gpu={gpu}"
             if rate: config+=f";vision_start={start};balance={balance:g};quantile={quantile:g}"
-            if name=='mmad': config+=';exclude=VisA'
+            if name=='mmad': config+=';exclude=none' if include_visa else ';exclude=VisA'
             jobs.append(dict(job_id=f"{name}_{method}_{rate:02d}",dataset=name,method=method,prune_rate=rate,gpu=gpu,config=config))
     return jobs
 
@@ -120,7 +122,8 @@ def verify(spec):
         info=ds['info']
         if name=='mvtec' and common.digest(info['input_json'])!=info['input_sha256']:
             raise ValueError("Original MVTec question JSON changed")
-        if name=='mmad' and (info['excluded_sources']!=['VisA'] or 'VisA' in info['source_counts'] or
+        excluded=[] if spec.get('include_visa',False) else ['VisA']
+        if name=='mmad' and (info['excluded_sources']!=excluded or set(info['source_counts'])&set(excluded) or
                 common.digest(info['annotations'])!=info['annotations_sha256']):
             raise ValueError("MMAD annotation/exclusion changed")
 
@@ -130,7 +133,8 @@ def setup(args):
     if args.resume:
         spec=json.loads((output/'run.json').read_text(encoding='utf-8'));verify(spec)
         return output,spec
-    jobs=schedule(args.datasets,args.prune_rates,args.gpus,args.vision_start_layer,balance=args.balance,quantile=args.quantile)
+    jobs=schedule(args.datasets,args.prune_rates,args.gpus,args.vision_start_layer,
+                  balance=args.balance,quantile=args.quantile,include_visa=args.include_visa)
     if (len(set(args.datasets))!=len(args.datasets) or len(set(args.prune_rates))!=len(args.prune_rates) or
             args.warmup<0 or not 0<=args.seed<2**32 or not 1<=args.vision_start_layer<=26 or
             not 0<=args.balance<=1 or not 0<=args.quantile<=1):
@@ -149,6 +153,7 @@ def setup(args):
     spec=dict(version=VERSION,created_utc=datetime.now(timezone.utc).isoformat(),gpus=[str(g) for g in args.gpus],
         model_path=str(model),model_config_sha256=common.digest(model/'config.json'),datasets=datasets,jobs=jobs,
         seed=args.seed,warmup=args.warmup,vision_start_layer=args.vision_start_layer,balance=args.balance,quantile=args.quantile,
+        include_visa=args.include_visa,
         source_identity=common.source_identity(),method_version=METHOD_VERSION,paper=PAPER,upstream=UPSTREAM,
         definitions=dict(common.DEFINITIONS,
             rate="Physical mean removed packed image-token fraction over ALL LLM blocks. FiCoCo-V compresses in vision; every LLM block sees the same reduced sequence.",
@@ -159,7 +164,9 @@ def setup(args):
             relative_accuracy="Each dataset's own actually measured unpruned ACC; not a fixed91.18% reference.",
             timing="All online score/selection/merge/packing/vision/projector/prefill included in resident-input TTFT; no PNG, no timing exclusions.",
             units_csv="acc/pre/recall/tnr/bacc/f1/mmad_score/relative_accuracy_pct=percent; Lat=mean TTFT milliseconds; mem=peak allocated GiB.",
-            training="No student checkpoint or training. MMAD excludes VisA for consistency with earlier comparisons."))
+            training="No student checkpoint or training; FiCoCo-V and the unpruned reference do not use the VisA-trained student.",
+            source_selection="MMAD includes all four sources including VisA." if args.include_visa else
+                "MMAD excludes VisA; evaluate MVTec-AD, MVTec-LOCO and GoodsAD."))
     common.save_json(output/'run.json',spec)
     return output,spec
 
@@ -168,7 +175,7 @@ def frozen_samples(ds,name):
     rows=[json.loads(line) for line in Path(ds['input_json']).read_text(encoding='utf-8').splitlines() if line.strip()]
     samples=[]
     for row in rows:
-        if row['benchmark_dataset']!=name or (name=='mmad' and row['dataset']=='VisA'):
+        if row['benchmark_dataset']!=name or (name=='mmad' and row['dataset'] in ds['info']['excluded_sources']):
             raise ValueError("Frozen dataset/source mismatch")
         path=Path(row['resolved_image']);stat=path.stat()
         if (stat.st_size,stat.st_mtime_ns)!=(row['image_bytes'],row['image_mtime_ns']):

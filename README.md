@@ -1534,7 +1534,10 @@ records, and VisA training overlap is labelled for both hybrids. See the same gu
 
 `benchmark_ficoco_v.py --gpus 5 6 7` runs an unpruned reference and FiCoCo-V
 at physical LLM layer-average50/70/90% for each dataset, with full test data,
-ACC/PRE/Recall/TNR/BACC/F1/Lat/Mem and source-wise CSVs. MMAD excludes VisA.
+ACC/PRE/Recall/TNR/BACC/F1/Lat/Mem and source-wise CSVs. MMAD excludes VisA by
+default; add `--include-visa` to BOTH data checking and inference to include its
+VisA-source binary questions and source-wise metrics. The unpruned reference
+uses the same four sources. Use a separate new output directory for this setting.
 It uses the existing dataset paths and inference backend, no student weights
 or training. Start with `--check-data`. See [FiCoCo-V usage and adaptation](docs/ficoco_v.md)
 for the full server command, paper/CLIP-code discrepancies, SigLIP no-CLS

@@ -10,7 +10,7 @@ FiCoCo-V 是独立、免训练的对照方法，不加载蒸馏学生，不使�
 
 ```bash
 git pull origin ex
-python benchmark_ficoco_v.py --check-data
+python benchmark_ficoco_v.py --include-visa --check-data
 ```
 
 使用已配置的三个数据路径，一键运行：
@@ -18,6 +18,7 @@ python benchmark_ficoco_v.py --check-data
 ```bash
 python benchmark_ficoco_v.py \
   --gpus 5 6 7 \
+  --include-visa \
   --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
   --mvtec-input-json /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl \
   --mvtec-data-root /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/ \
@@ -25,27 +26,31 @@ python benchmark_ficoco_v.py \
   --mmad-mvtec-root /home/yz/xxy/data/datasets/MVTec-AD \
   --mpdd-root /home/yz/xxy/data/datasets/MPDD \
   --prune-rates 50 70 90 \
-  --output-dir output/ficoco_v_mvtec_mmad_mpdd_01
+  --output-dir output/ficoco_v_mvtec_mmad_mpdd_with_visa_01
 ```
 
 默认共12个有效实验：每套数据各自运行不剪枝参考，以及FiCoCo-V的50/70/90%。
 GPU5固定运行MVTec四组、GPU6固定运行MMAD四组、GPU7固定运行MPDD四组；卡间并行，每卡一次只运行一个新进程。
 不指定GPU时也默认5/6/7。单卡可用 `--gpus 5`；`--datasets mvtec` 等可只选部分数据集。
 没有额外缩小到100张，没有保存PNG或曲线，没有重新训练。
+`--include-visa` 将MMAD中的VisA来源二分类题目纳入FiCoCo-V及不剪枝参考，
+不是另外运行一套独立VisA数据集。省略该选项时仍沿用原来的排除VisA设置。
+两种来源筛选使用不同的新输出目录；不可将旧的no-VisA目录直接当作包含VisA的实验恢复。
 
 恢复相同实验：
 
 ```bash
-python benchmark_ficoco_v.py --resume --output-dir output/ficoco_v_mvtec_mmad_mpdd_01
+python benchmark_ficoco_v.py --resume --output-dir output/ficoco_v_mvtec_mmad_mpdd_with_visa_01
 ```
 
 恢复保存的配置、GPU分配、输入和逐题记录；跳过已完成任务。
+是否包含VisA同样从保存的配置恢复，不因恢复命令省略 `--include-visa` 而删除VisA。
 源码、输入、标注或模型配置变化时拒绝混入旧实验。每次工作进程另检查实际图片的大小与修改时间。
 
 ## 数据和指标
 
 - MVTec沿用之前的 `question_musc.jsonl`、图片目录和类别v0提示词。mask不进入冻结清单或模型推理。
-- MMAD只读Anomaly Detection，继续排除VisA。保留冻结的真实问题、选项和答案映射，兼容先前修复的原始test目录及独立MVTec根目录。
+- MMAD只读Anomaly Detection；上述命令包含VisA，省略 `--include-visa` 时排除VisA。保留冻结的真实问题、选项和答案映射，兼容先前修复的原始test目录及独立MVTec根目录。
 - MPDD复用本地已有的六类test读取器及通用v0 A/B提示词；不使用训练图或mask。
 - 所有任务：0-shot，单图，batch1，greedy，原生AnyRes max9；沿用backend的FP16/FlashAttention2和TF32设置。
 
@@ -56,6 +61,7 @@ python benchmark_ficoco_v.py --resume --output-dir output/ficoco_v_mvtec_mmad_mp
 相对ACC分母分别使用本次MVTec/MMAD/MPDD各自的不剪枝实测值，不使用固定91.18%。
 
 `summary_by_source.csv` 按来源汇总；MMAD分别列出MVTec-AD、MVTec-LOCO、GoodsAD，其它两个benchmark各列自己的来源。
+启用 `--include-visa` 后另有VisA行；MMAD的 `config` 标为 `exclude=none`，整体及不剪枝参考都使用这四个来源。
 用config中的dataset区分“完整MVTec评测”和“MMAD中的MVTec来源子集”。
 `budget_summary.csv` 记录实际物理层平均率、原始/保留token数、视觉起始层及打包规则。
 `inputs/*.jsonl` 是冻结清单；每组目录包含原始回答、canonical答案、逐题时间/显存/预算及inference环境。
