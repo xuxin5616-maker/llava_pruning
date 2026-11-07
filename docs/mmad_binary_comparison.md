@@ -21,6 +21,33 @@ python benchmark_mmad_binary.py \
   --output-dir output/mmad_no_visa_two_hybrids_gpu567_01
 ```
 
+只跑 Base 引导评分、取消末尾 image token 删除（`tail=0`），其余沿用 λ=.7、
+base_full＋base_text＋fast＋anyres_first：
+
+```bash
+python benchmark_mmad_binary.py \
+  --gpus 5 6 7 \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --data-root /home/yz/xxy/data/datasets/MMAD \
+  --mvtec-root /home/yz/xxy/data/datasets/MVTec-AD \
+  --checkpoint output/attention_predictor_twig_train_01/best.pt \
+  --prune-rates 50 70 90 \
+  --experiment-group base_guided \
+  --base-guided-tail 0 \
+  --output-dir output/mmad_base_guided_tail0_50_70_90_01
+```
+
+这条命令启动4组：不剪枝基准＋Base引导50/70/90%，不运行其它六种方法及joint_self。
+不保存图片，仍保存全部指标、按来源汇总及预算；相对ACC分母来自本次不剪枝基准。
+`tail=0` 表示第2层后保留下来的视觉token继续进入后续所有层，不再在最后9层前额外删除。
+两阶段剪枝及原生AnyRes处理不变，不强制3×3，不重新训练学生。
+
+`--experiment-group` 可选 `all`（默认完整对照）、`base_guided`、`joint_self`；
+每种选择均自动包含不剪枝基准。
+`--base-guided-tail` 为0～26，默认9，只作用于Base引导组；joint_self始终tail=0。
+所选组、tail及每组GPU记录在 `run.json`，CSV的 `config` 使用实际tail。
+不传这两个参数时，默认任务和方法设置沿用原完整对照。
+
 先检查下载的数据结构（无需显卡、模型或学生权重，不产生输出文件）：
 
 ```bash
@@ -69,7 +96,7 @@ python benchmark_mmad_binary.py --resume --output-dir output/mmad_no_visa_two_hy
 恢复沿用保存的 GPU 分配/参数和问题顺序，已完成实验跳过，未完成实验读取逐题记录后继续。
 源码、模型配置、问题标注、冻结清单、学生权重或训练来源清单变化时拒绝混用。
 每个工作进程还检查图片大小及修改时间；没有对图片内容和主模型全部权重逐个校验哈希。
-当前原生目录适配版本为1.4；旧版本已产生结果时请用新目录，不将不同源码/输入配置混入同一次恢复。
+当前实验组可选版本为1.5；旧版本已产生结果时请用新目录，不将不同源码/输入配置混入同一次恢复。
 准备数据阶段因缺图退出时还未创建实验目录，可以修正路径后重新执行原命令。
 
 `--gpus 5 6 7` 将实验固定轮转分配到三张卡，三张卡可以同时工作；每张卡最多一个任务，
@@ -107,7 +134,7 @@ VisA 来源在图片加载、预热及推理之前排除，因此不要求安装
 VisA 旧权重的训练来源保留在 `run.json`，其中明确记录 VisA 已从评测排除。
 这一步排除的是学生已知训练来源，不据此保证主模型预训练数据无重叠。
 
-共25行：不剪枝参考1行＋原七种方法各3行＋新增联合自身评分组3行；
+默认 `--experiment-group all` 共25行：不剪枝参考1行＋原七种方法各3行＋新增联合自身评分组3行；
 其中 PyramidDrop90%不可达，故实际启动24个 GPU 任务。
 每卡串行、卡间并行，每组新进程，预热10题，不计入统计。
 各方法边界与预算换算沿用 [七方法对照说明](visa_method_comparison.md#平均剪枝率及方法差异)：

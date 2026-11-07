@@ -397,8 +397,92 @@ class MMADDataTests(unittest.TestCase):
         for gpus in ([],[5,5],[-1],['5,6']):
             with self.assertRaisesRegex(ValueError,'GPU IDs'): entry.schedule([50],gpus)
 
+    def test_selected_groups_keep_reference_and_base_tail_is_scoped(self):
+        for group in ('base_guided','joint_self'):
+            jobs=entry.schedule([50,70,90],[5,6,7],experiment_group=group,base_guided_tail=0)
+            self.assertEqual(len(jobs),4)
+            self.assertEqual(jobs[0]['method'],'llava_unpruned')
+            self.assertEqual([j['prune_rate'] for j in jobs[1:]],[50,70,90])
+            self.assertTrue(all(j['variant']==group and j['tail_drop_layers']==0 for j in jobs[1:]))
+            self.assertTrue(all('tail=0;' in j['config'] and '(extra)' not in j['config'] for j in jobs[1:]))
+            self.assertEqual({j['gpu'] for j in jobs},{'5','6','7'})
+        jobs=entry.schedule([50],experiment_group='all',base_guided_tail=4)
+        base=next(j for j in jobs if j.get('variant')=='base_guided')
+        joint=next(j for j in jobs if j.get('variant')=='joint_self')
+        self.assertIn('tail=4(extra)',base['config'])
+        self.assertEqual((base['tail_drop_layers'],joint['tail_drop_layers']),(4,0))
+        for group,tail in (('typo',0),('all',-1),('all',27),('all',.5)):
+            with self.assertRaises(ValueError):
+                entry.schedule([50],experiment_group=group,base_guided_tail=tail)
+
+    def test_selected_base_tail0_launcher_exports_four_rows_and_resume_restores_options(self):
+        with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
+            args=fixture(Path(temporary))
+            args=entry.parser().parse_args(['--experiment-group','base_guided','--base-guided-tail','0',
+                '--gpus','5','6','7'],namespace=args)
+            calls=[]
+            def process(command,**kwargs):
+                manifest=Path(command[command.index('--manifest')+1])
+                spec=json.loads(manifest.read_text(encoding='utf-8'))
+                self.assertEqual((spec['experiment_group'],spec['base_guided_tail']),('base_guided',0))
+                self.assertIn('No extra tail deletion',spec['definitions']['hybrid'])
+                job_id=command[command.index('--worker')+1]
+                job=next(j for j in spec['jobs'] if j['job_id']==job_id)
+                self.assertEqual(kwargs['env']['CUDA_VISIBLE_DEVICES'],job['gpu'])
+                calls.append(job)
+                samples=load_frozen(spec['input_json'])
+                report=entry.summarize_records([prediction(s,s.source['correct_option']) for s in samples],samples,job,2**30)
+                folder=manifest.parent/job_id;folder.mkdir()
+                common.save_json(folder/'metrics.json',dict(report,job_id=job_id,status='success',input_sha256=spec['input_sha256']))
+                return SimpleNamespace(poll=lambda:0,wait=lambda **kw:0)
+            with patch.object(entry.subprocess,'Popen',side_effect=process):
+                self.assertEqual(entry.run(args),0);self.assertEqual(len(calls),4)
+                args.resume=True;args.experiment_group='all';args.base_guided_tail=9
+                self.assertEqual(entry.run(args),0);self.assertEqual(len(calls),4)
+            with (args.output_dir/'summary.csv').open(encoding='utf-8-sig',newline='') as stream:
+                rows=list(csv.DictReader(stream))
+            self.assertEqual(len(rows),4)
+            self.assertTrue(all(float(r['relative_accuracy_pct'])==100 for r in rows))
+            self.assertTrue(all('variant=base_guided' in r['config'] and 'tail=0;' in r['config'] for r in rows[1:]))
+            with (args.output_dir/'summary_by_source.csv').open(encoding='utf-8-sig',newline='') as stream:
+                self.assertEqual(len(list(csv.DictReader(stream))),12)
+
 
 class MMADGenerationTests(unittest.TestCase):
+    def test_base_guided_tail0_real_generation_retains_images_in_all_remaining_layers(self):
+        import torch
+        from test_pool_ablations import model_and_options
+        from test_attention_predictor import make_checkpoint
+        from llava_pruning.visa_comparison_methods import observe_prefill, observed_budget
+        threads=torch.get_num_threads();torch.set_num_threads(1)
+        try:
+            for rate in (50,70,90):
+                with self.subTest(rate=rate),tempfile.TemporaryDirectory() as temporary:
+                    torch.manual_seed(1802)
+                    model,options=model_and_options(28);core=model.get_model()
+                    checkpoint=Path(temporary)/'best.pt';make_checkpoint(checkpoint,core)
+                    job=entry.schedule([rate],experiment_group='base_guided',base_guided_tail=0)[1]
+                    method=entry.make_trial_method(job,core,checkpoint)
+                    self.assertEqual((method.mode,method.predictor_input,method.tail_drop_layers,method.share),
+                        ('base_full','base_text',0,.7))
+                    self.assertEqual((method.base_policy,method.adapter.base_mapping),('anyres_first','fast'))
+                    method.configure(core,rate);method.prepare_inputs((384,384),options['inputs'])
+                    with patch.object(core.attention_predictor,'forward',wraps=core.attention_predictor.forward) as predict,\
+                         method.generation_context(model),observe_prefill(core) as lengths,torch.inference_mode():
+                        generated=model.generate(**options)
+                    stats=method.stats(core,rate)
+                    budget=observed_budget(job['method'],rate,stats,lengths,1485)
+                    self.assertEqual(generated.sequences.shape[-1],3)
+                    self.assertEqual(predict.call_count,1)
+                    self.assertEqual(predict.call_args.args[0].shape[1],stats['pre_base_tokens']+4)
+                    self.assertEqual(budget['actual_tail_contribution'],0)
+                    self.assertGreater(budget['final_layer_visual_tokens'],0)
+                    self.assertAlmostEqual(budget['actual_average_prune_rate'],rate,delta=.15)
+                    self.assertEqual([lengths[i] for i in range(28)],
+                        [stats['pre_llm_tokens']+4]*2+[stats['final_llm_tokens']+4]*26)
+                    self.assertTrue(all(not layer._forward_pre_hooks for layer in core.layers))
+        finally: torch.set_num_threads(threads)
+
     def test_joint_self_factory_real_generation_at_all_three_rates(self):
         import torch
         from test_pool_ablations import model_and_options

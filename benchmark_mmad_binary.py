@@ -26,7 +26,7 @@ from llava_pruning.mmad_data import load_binary, load_frozen, canonical_answer
 
 
 PROJECT = Path(__file__).resolve().parent
-VERSION = "1.4-mmad-native-test-paths"
+VERSION = "1.5-mmad-selectable-hybrids"
 EXCLUDED_SOURCES = ("VisA",)
 FIELDS = (*common.FIELDS, "pre", "recall", "tnr", "unparsed", "nonbinary", "mmad_score")
 SOURCE_FIELDS = ("source", "questions", "normal", "abnormal", *FIELDS)
@@ -48,6 +48,10 @@ def parser():
     devices.add_argument("--gpu", default="5", help="One physical GPU (default5); trials run sequentially")
     devices.add_argument("--gpus", nargs="+", type=int, help="Physical GPU IDs, e.g. 5 6 7; at most one trial per GPU")
     p.add_argument("--prune-rates", nargs="+", type=int, choices=(50,70,90), default=[50,70,90])
+    p.add_argument("--experiment-group", choices=("all","base_guided","joint_self"), default="all",
+                   help="Select all methods or one hybrid group; always includes the unpruned reference")
+    p.add_argument("--base-guided-tail", type=int, choices=range(27), default=9, metavar="0..26",
+                   help="Extra final layers without image tokens for base_guided only (default9; 0 disables)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--output-dir", type=Path, default=Path("output/mmad_no_visa_two_hybrids_gpu567_01"))
@@ -87,16 +91,27 @@ def verify_inputs(spec):
     if common.source_identity()!=spec["source_identity"]: raise ValueError("Inference source changed; use a new output directory")
 
 
-def schedule(rates, gpus=None):
+def schedule(rates, gpus=None, *, experiment_group="all", base_guided_tail=9):
+    if experiment_group not in {"all","base_guided","joint_self"}:
+        raise ValueError("Unknown MMAD experiment group")
+    if type(base_guided_tail) is not int or not 0 <= base_guided_tail <= 26:
+        raise ValueError("Base-guided tail must be an integer in 0..26")
     jobs = common.schedule(rates)
+    if experiment_group != "all":
+        methods = {"llava_unpruned","hybrid_baseline"} if experiment_group=="base_guided" else {"llava_unpruned"}
+        jobs = [job for job in jobs if job["method"] in methods]
     for job in jobs:
         job["config"] = "dataset=MMAD;exclude=VisA;shot=0;"+job["config"]
         if job["method"]=="hybrid_baseline":
             job["variant"]="base_guided"
+            job["tail_drop_layers"]=base_guided_tail
+            tail_label=f"tail={base_guided_tail}"+("(extra)" if base_guided_tail else "")
+            job["config"]=";".join(tail_label if part.startswith("tail=") else part
+                                    for part in job["config"].split(";"))
             job["config"] += ";student=VisA;variant=base_guided"
-    for rate in rates:
+    for rate in rates if experiment_group in {"all","joint_self"} else ():
         jobs.append(dict(job_id=f"hybrid_joint_self_{rate:02d}",method="hybrid_baseline",variant="joint_self",
-            prune_rate=rate,status="pending",reason="",
+            prune_rate=rate,status="pending",reason="",tail_drop_layers=0,
             config=f"dataset=MMAD;exclude=VisA;shot=0;method=hybrid_baseline;variant=joint_self;prune={rate:g}%;"
                    "rate=layer_average;lambda=0.7;anyres_self;input=full;base_policy=joint;tail=0;student=VisA"))
     gpus=[str(gpu) for gpu in (gpus if gpus is not None else [5])]
@@ -121,6 +136,13 @@ def make_trial_method(job, core, checkpoint):
             settings=MethodSettings(prune_rate=0),pruning_audit="lean",tail_drop_layers=0,
             predictor_input="full",base_mapping="reference",base_policy="joint")
     if job.get("variant") not in {None,"base_guided"}: raise ValueError("Unknown MMAD hybrid variant")
+    if job["method"]=="hybrid_baseline":
+        from llava_pruning.pool_distill import PoolDistillMethod
+        from runMyPruningPoolSpatial import MethodSettings
+        return PoolDistillMethod(core,checkpoint,rate=job["prune_rate"],share=.7,mode="base_full",
+            settings=MethodSettings(prune_rate=0),pruning_audit="lean",
+            tail_drop_layers=job.get("tail_drop_layers",9),predictor_input="base_text",
+            base_mapping="fast",base_policy="anyres_first")
     return make_method(job["method"],core,job["prune_rate"],checkpoint)
 
 
@@ -134,7 +156,8 @@ def setup(args):
         # All options, including per-trial GPU assignments, are restored.
         return output,spec
     gpus=[str(gpu) for gpu in args.gpus] if args.gpus is not None else [str(args.gpu)]
-    jobs=schedule(args.prune_rates,gpus)
+    jobs=schedule(args.prune_rates,gpus,experiment_group=args.experiment_group,
+                  base_guided_tail=args.base_guided_tail)
     if (args.warmup<0 or not 0<=args.seed<2**32 or
             len(set(args.prune_rates))!=len(args.prune_rates)):
         raise ValueError("Invalid GPU, seed, warmup or pruning rates")
@@ -164,6 +187,7 @@ def setup(args):
         data_root=str(Path(args.data_root).expanduser().resolve()),dataset_info=info,checkpoint=checkpoint,
         input_json=str(input_path),input_sha256=common.digest(input_path),sample_count=len(records),
         source_identity=common.source_identity(),seed=args.seed,warmup=args.warmup,jobs=jobs,
+        experiment_group=args.experiment_group,base_guided_tail=args.base_guided_tail,
         training_overlap=dict(declared_student_training_source="VisA",
             excluded_eval_sources=list(EXCLUDED_SOURCES),evaluated_sources=sorted(info["source_counts"]),
             VisA="Excluded from every method and the unpruned reference because the student was trained on VisA",
@@ -175,7 +199,8 @@ def setup(args):
             "relative_accuracy":"100*pooled ACC / this run's measured unpruned MMAD ACC, with VisA excluded from both; not MVTec91.18%.",
             "source_selection":"Exclude all VisA-source questions before image loading, warmup or inference. Every method and the reference use the same remaining sources. MMAD source-macro score averages the remaining sources only.",
             "rate":"Mean removed visual-token fraction over 28 LLM input layers, relative to native Base+AnyRes+newlines. FastV is effective visibility; physical hidden/KV length unchanged.",
-            "hybrid":"MyPool preLLM + layer2 distillation; lambda=.7, base_full, base_text, fast mapping, lean, anyres_first; tail9 is EXTRA beyond the two-stage target.",
+            "hybrid":f"MyPool preLLM + layer2 distillation; lambda=.7, base_full, base_text, fast mapping, lean, anyres_first; tail={args.base_guided_tail}. "+
+                ("Tail deletion is EXTRA beyond the two-stage target." if args.base_guided_tail else "No extra tail deletion; image tokens retained by stage2 continue through every remaining LLM layer."),
             "hybrid_joint_self":"Additional group, same MyPool preLLM, checkpoint and lambda=.7. Full Base+AnyRes+Text predictor input; every Base/AnyRes spatial token uses its own predicted attention, joint Top-k without group quotas/protection or Base mapping. Structural newlines protected; tail0, no extra tail deletion.",
             "parallelism":"Fixed round-robin trial-to-GPU assignment, one fresh single-GPU process per trial, at most one active trial per GPU. All processes share the same frozen questions; only parent writes aggregate CSV. Per-GPU performance is recorded, not normalized across devices.",
             "units_csv":"acc/pre/recall/tnr/bacc/f1/mmad_score/relative_accuracy_pct are percentages; Lat is mean TTFT in ms; mem is full-generation peak allocated GiB."})
@@ -352,7 +377,8 @@ def write_reports(output, spec):
 def run(args):
     if args.check_data: return check_data(args)
     output,spec=setup(args);write_reports(output,spec)
-    print(f"GPUs {spec['gpus']}, one trial per GPU, seven methods + joint-self hybrid, no PNG; "
+    print(f"GPUs {spec['gpus']}, one trial per GPU, group={spec['experiment_group']}, "
+          f"base_guided_tail={spec['base_guided_tail']}, {len(spec['jobs'])} report rows, no PNG; "
           f"VisA-trained student={spec['checkpoint']['path']}",flush=True)
     print("VisA is excluded from EVERY trial and the unpruned reference; see run.json and summary_by_source.csv.",flush=True)
     queues={gpu:deque() for gpu in spec["gpus"]}
