@@ -3,8 +3,69 @@
 入口为 `benchmark_mmad_binary.py`，只读用户服务器上的 MMAD，不下载或修改数据。
 沿用现有七种剪枝实现、FP16 / FlashAttention2、原生 AnyRes max9，单张待测图、greedy、batch1。
 不输入正常参考图、mask、GT 或其它问题的回答，不保存 PNG。
-当前学生 checkpoint 由 VisA 训练，因此该入口固定排除 MMAD 的全部 VisA 来源题目。
+当前学生 checkpoint 由 VisA 训练，因此该入口默认排除 MMAD 的全部 VisA 来源题目。
 不剪枝参考及所有剪枝方法都使用相同的筛选结果，只评测 MVTec-AD、MVTec-LOCO、GoodsAD。
+需要补入VisA并复用旧结果时，使用下一节的显式选项。
+
+## 在旧结果上补入VisA，不重跑已完成题目
+
+更新服务器的ex分支后，使用新输出目录运行：
+
+```bash
+git pull origin ex
+
+python benchmark_mmad_binary.py \
+  --gpus 5 6 7 \
+  --include-visa \
+  --reuse-dir /home/yz/xxy/code/pruning/llava_pruning/output/mmad_no_visa_two_hybrids_gpu567_01 \
+  --output-dir output/mmad_with_visa_two_hybrids_gpu567_01
+```
+
+`--reuse-dir` 恢复旧 `run.json` 的模型、学生、方法列表、50/70/90%率、两组hybrid配置、
+seed及warmup，不需要再次填写这些路径或参数。只需选择新输出目录和GPU。
+旧目录只读，输出必须使用与旧目录分开的新目录，不能嵌套其中。
+要先检查数据与可复用数量，可在同一命令上加 `--check-data`，无需显卡或学生权重，也不写文件。
+
+复用要求旧目录保留 `run.json`、冻结的 `mmad_binary.jsonl`，以及每组的
+`predictions.jsonl` 和 `inference.json`。只有summary.csv不足以恢复逐题分数、时间分位数和显存峰值。
+支持此前的1.3、1.4、1.5以及当前1.6版no-VisA清单；方法配置或输入不匹配时明确报错。
+已完成题目全部复制其真实记录；旧任务尚未完成则继续补齐其剩余非VisA题目，然后补测VisA。
+PyramidDrop90%仍标为不可达，不伪造记录。
+
+旧问题顺序、提示词、选项及对应的逐题seed保持不变，不用包含VisA的新全量shuffle覆盖旧题。
+新VisA问题追加到清单末尾，选项按原seed单独冻结一次，所有方法共享同一份选项。
+每组若旧数据已完整，预热也只使用待补测的VisA，不对旧题重新推理。
+只补入MMAD标注中的VisA Anomaly Detection题，不混入独立VisA benchmark的额外图片。
+
+脚本重新根据全部逐题记录计算 `summary.csv`、`summary_by_source.csv` 和 `budget_summary.csv`：
+
+- ACC/混淆矩阵按题汇总；Lat对全部旧题＋新题的逐题测量取均值，分位数也重新计算。
+- Mem取全部测量的最大值；不将两个CSV的均值直接再平均，也不将显存求和。
+- 相对ACC使用补全后的完整MMAD不剪枝参考；各来源的相对ACC仍使用各自的不剪枝参考。
+- 来源CSV增加VisA行，同时保留另外三个来源；旧来源的已有原始回答及测量值保持不变。
+- `metrics.json` 的 `reused_from_previous` 记录从旧目录导入的数量；`run.json/reuse_history` 保存导入数量、
+  文件指纹、原GPU以及历史/当前源码指纹，`reused_run.json` 保留旧清单快照。
+
+这是明确的历史结果复用，并不声称旧测量来自当前源码指纹。新推理仍须匹配该组原来的
+精度、attention、依赖库、GPU型号和总显存身份，才允许合并Lat/Mem；环境不一致时拒绝混入。
+即使型号相同，不同运行时的GPU负载/时钟仍会影响延迟，脚本不会将旧时间改写为新时间。
+模型配置、标注、旧题元数据、学生及训练来源清单会核对；没有为原版全部主模型权重重新计算哈希。
+
+两组hybrid仍用VisA训练权重，它们的VisA结果存在学生训练来源重叠。
+CSV的hybrid配置标记 `training_overlap=VisA`，`run.json` 同时说明整体分数包含该来源；
+其它六个方法和不剪枝参考不使用这个学生权重。
+
+补测中断后直接恢复新目录，不重新导入旧目录：
+
+```bash
+python benchmark_mmad_binary.py \
+  --resume \
+  --output-dir output/mmad_with_visa_two_hybrids_gpu567_01
+```
+
+恢复使用新清单中保存的完整配置及GPU，旧目录随后移走也不影响恢复。
+源码或输入发生变化时，仍遵守原有严格恢复校验。
+若要从头评测完整MMAD，可只加 `--include-visa`，不传 `--reuse-dir`；默认不加时继续排除VisA。
 
 ## 一键运行
 
@@ -96,7 +157,7 @@ python benchmark_mmad_binary.py --resume --output-dir output/mmad_no_visa_two_hy
 恢复沿用保存的 GPU 分配/参数和问题顺序，已完成实验跳过，未完成实验读取逐题记录后继续。
 源码、模型配置、问题标注、冻结清单、学生权重或训练来源清单变化时拒绝混用。
 每个工作进程还检查图片大小及修改时间；没有对图片内容和主模型全部权重逐个校验哈希。
-当前实验组可选版本为1.5；旧版本已产生结果时请用新目录，不将不同源码/输入配置混入同一次恢复。
+当前版本为1.6；旧版本结果可通过上面的 `--reuse-dir` 显式导入新实验，不能直接改旧目录的source筛选再恢复。
 准备数据阶段因缺图退出时还未创建实验目录，可以修正路径后重新执行原命令。
 
 `--gpus 5 6 7` 将实验固定轮转分配到三张卡，三张卡可以同时工作；每张卡最多一个任务，
@@ -108,9 +169,9 @@ CSV由父进程统一更新；中断时会停止所有活动子进程，逐题�
 ## 任务及评测设置
 
 仅选 `type == "Anomaly Detection"`；每张图片采用第一个 `conversation*` 字段，与官方示例的字段选择一致。
-VisA 来源在图片加载、预热及推理之前排除，因此不要求安装被排除的 VisA 图片。
+默认VisA 来源在图片加载、预热及推理之前排除，因此不要求安装被排除的 VisA 图片。
 终端及 `run.json` 记录被排除的二分类题数和剩余来源题数；冻结清单中不含 VisA。
-工作进程再次检查来源，拒绝在冻结清单中混入 VisA。
+工作进程再次检查保存的来源筛选；只有显式启用 `--include-visa` 的新清单允许VisA。
 保留问题和选项文本，包括少量问题中的 Maybe / Unknown 选项，正确答案必须为 Yes / No。
 选项顺序用 seed42 **只打乱一次并冻结**，所有方法使用同一份顺序，不在方法之间重新抽取。
 输出提示为工业检查说明、原问题、选项及直接回答选项字母的要求。
@@ -149,7 +210,7 @@ VisA 旧权重的训练来源保留在 `run.json`，其中明确记录 VisA 已�
 
 - `summary.csv`：`config,tp,fp,tn,fn,acc,Lat,mem,bacc,f1,relative_accuracy_pct,pre,recall,tnr,unparsed,nonbinary,mmad_score`。
 - `summary_by_source.csv`：相同指标按 MVTec-AD / MVTec-LOCO / GoodsAD 分开汇总，附正常/异常数量。
-  所有配置含 `exclude=VisA`，没有 VisA 指标行。
+  默认配置含 `exclude=VisA`，没有 VisA 指标行；显式包含VisA时为 `exclude=none`，并增加VisA来源行。
 - `budget_summary.csv`：目标率、实际有效/物理平均率、两阶段值、tail贡献及实际序列计数；
   另列 `pre_base_tokens/pre_anyres_tokens/stage2_base_tokens/stage2_anyres_tokens/stage2_base_policy/protected_newlines`。
   联合组的Base/AnyRes保留数量来自实际选择，不按固定比例反推。

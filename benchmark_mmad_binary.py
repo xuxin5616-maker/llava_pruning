@@ -1,7 +1,7 @@
 """MMAD Anomaly Detection, 0-shot: seven methods plus a joint-self hybrid.
 
 Keep official question/option text; freeze option order once for all methods.
-VisA-source questions are excluded from every trial, including the reference.
+VisA is excluded by default; --include-visa can extend an existing experiment.
 No normal references, masks, PNG, or question history. Run --check-data first
 to inspect a local MMAD installation without loading Torch or a model.
 """
@@ -26,7 +26,7 @@ from llava_pruning.mmad_data import load_binary, load_frozen, canonical_answer
 
 
 PROJECT = Path(__file__).resolve().parent
-VERSION = "1.5-mmad-selectable-hybrids"
+VERSION = "1.6-mmad-visa-extension"
 EXCLUDED_SOURCES = ("VisA",)
 FIELDS = (*common.FIELDS, "pre", "recall", "tnr", "unparsed", "nonbinary", "mmad_score")
 SOURCE_FIELDS = ("source", "questions", "normal", "abnormal", *FIELDS)
@@ -57,6 +57,8 @@ def parser():
     p.add_argument("--output-dir", type=Path, default=Path("output/mmad_no_visa_two_hybrids_gpu567_01"))
     p.add_argument("--check-data", action="store_true", help="Validate/count local questions and images; no model/GPU/output files")
     p.add_argument("--resume", action="store_true", help="Resume saved configuration, GPU and question order")
+    p.add_argument("--include-visa", action="store_true", help="Evaluate all four MMAD sources; VisA-trained hybrids are labelled as training overlap")
+    p.add_argument("--reuse-dir", type=Path, help="With --include-visa, import a previous no-VisA run read-only. Restore its model/student/rates/settings; only infer missing questions into a NEW --output-dir")
     p.add_argument("--worker", help=argparse.SUPPRESS)
     p.add_argument("--manifest", type=Path, help=argparse.SUPPRESS)
     return p
@@ -73,8 +75,13 @@ def describe(info):
 
 
 def check_data(args):
+    if args.reuse_dir:
+        from llava_pruning.mmad_extension import prepare_reuse
+        _, info, _, _, _ = prepare_reuse(args, sys.modules[__name__], fingerprint_student=False)
+        describe(info)
+        return 0
     _,info = load_binary(args.data_root,args.annotations,args.image_root,args.seed,
-        exclude_sources=EXCLUDED_SOURCES,mvtec_root=args.mvtec_root)
+        exclude_sources=() if args.include_visa else EXCLUDED_SOURCES,mvtec_root=args.mvtec_root)
     describe(info)
     return 0
 
@@ -82,8 +89,9 @@ def check_data(args):
 def verify_inputs(spec):
     if spec.get("version")!=VERSION: raise ValueError("Wrong MMAD benchmark version")
     info=spec["dataset_info"]
-    if info.get("excluded_sources")!=list(EXCLUDED_SOURCES) or set(info["source_counts"])&set(EXCLUDED_SOURCES):
-        raise ValueError("This MMAD benchmark must exclude VisA from every trial")
+    excluded = [] if spec.get("include_visa",False) else list(EXCLUDED_SOURCES)
+    if info.get("excluded_sources")!=excluded or set(info["source_counts"])&set(excluded):
+        raise ValueError("MMAD source selection differs from the saved configuration")
     for path,expected in ((spec["input_json"],spec["input_sha256"]),
             (Path(spec["model_path"])/"config.json",spec["model_config_sha256"]),
             (spec["dataset_info"]["annotations"],spec["dataset_info"]["annotations_sha256"])):
@@ -91,7 +99,7 @@ def verify_inputs(spec):
     if common.source_identity()!=spec["source_identity"]: raise ValueError("Inference source changed; use a new output directory")
 
 
-def schedule(rates, gpus=None, *, experiment_group="all", base_guided_tail=9):
+def schedule(rates, gpus=None, *, experiment_group="all", base_guided_tail=9, include_visa=False):
     if experiment_group not in {"all","base_guided","joint_self"}:
         raise ValueError("Unknown MMAD experiment group")
     if type(base_guided_tail) is not int or not 0 <= base_guided_tail <= 26:
@@ -119,6 +127,9 @@ def schedule(rates, gpus=None, *, experiment_group="all", base_guided_tail=9):
         raise ValueError("GPU IDs must be distinct nonnegative integers")
     index=0
     for job in jobs:
+        if include_visa:
+            job["config"]=job["config"].replace("exclude=VisA", "exclude=none")
+            if job["method"]=="hybrid_baseline": job["config"]+=";training_overlap=VisA"
         if job["status"]=="pending":
             job["gpu"]=gpus[index%len(gpus)];index+=1
             job["config"]+=f";gpu={job['gpu']}"
@@ -155,9 +166,12 @@ def setup(args):
             raise ValueError("Saved VisA student or training provenance changed")
         # All options, including per-trial GPU assignments, are restored.
         return output,spec
+    if args.reuse_dir:
+        from llava_pruning.mmad_extension import setup_extension
+        return setup_extension(args,sys.modules[__name__])
     gpus=[str(gpu) for gpu in args.gpus] if args.gpus is not None else [str(args.gpu)]
     jobs=schedule(args.prune_rates,gpus,experiment_group=args.experiment_group,
-                  base_guided_tail=args.base_guided_tail)
+                  base_guided_tail=args.base_guided_tail,include_visa=args.include_visa)
     if (args.warmup<0 or not 0<=args.seed<2**32 or
             len(set(args.prune_rates))!=len(args.prune_rates)):
         raise ValueError("Invalid GPU, seed, warmup or pruning rates")
@@ -165,7 +179,7 @@ def setup(args):
     # Validate the complete query image set before model/config/weight loading
     # or fingerprinting; path failures should be quick to diagnose and retry.
     records,info = load_binary(args.data_root,args.annotations,args.image_root,args.seed,
-        exclude_sources=EXCLUDED_SOURCES,mvtec_root=args.mvtec_root)
+        exclude_sources=() if args.include_visa else EXCLUDED_SOURCES,mvtec_root=args.mvtec_root)
     model = Path(args.model_path).expanduser().resolve()
     if json.loads((model/"config.json").read_text(encoding="utf-8")).get("num_hidden_layers")!=28:
         raise ValueError("The matched pruning schedules require the existing 28-layer Qwen2 model")
@@ -187,7 +201,7 @@ def setup(args):
         data_root=str(Path(args.data_root).expanduser().resolve()),dataset_info=info,checkpoint=checkpoint,
         input_json=str(input_path),input_sha256=common.digest(input_path),sample_count=len(records),
         source_identity=common.source_identity(),seed=args.seed,warmup=args.warmup,jobs=jobs,
-        experiment_group=args.experiment_group,base_guided_tail=args.base_guided_tail,
+        experiment_group=args.experiment_group,base_guided_tail=args.base_guided_tail,include_visa=args.include_visa,
         training_overlap=dict(declared_student_training_source="VisA",
             excluded_eval_sources=list(EXCLUDED_SOURCES),evaluated_sources=sorted(info["source_counts"]),
             VisA="Excluded from every method and the unpruned reference because the student was trained on VisA",
@@ -204,9 +218,21 @@ def setup(args):
             "hybrid_joint_self":"Additional group, same MyPool preLLM, checkpoint and lambda=.7. Full Base+AnyRes+Text predictor input; every Base/AnyRes spatial token uses its own predicted attention, joint Top-k without group quotas/protection or Base mapping. Structural newlines protected; tail0, no extra tail deletion.",
             "parallelism":"Fixed round-robin trial-to-GPU assignment, one fresh single-GPU process per trial, at most one active trial per GPU. All processes share the same frozen questions; only parent writes aggregate CSV. Per-GPU performance is recorded, not normalized across devices.",
             "units_csv":"acc/pre/recall/tnr/bacc/f1/mmad_score/relative_accuracy_pct are percentages; Lat is mean TTFT in ms; mem is full-generation peak allocated GiB."})
+    apply_source_policy(spec)
     common.save_json(output/"run.json",spec)
     describe(info)
     return output,spec
+
+
+def apply_source_policy(spec):
+    if not spec.get("include_visa"): return
+    spec["training_overlap"].update(excluded_eval_sources=[],
+        evaluated_sources=sorted(spec["dataset_info"]["source_counts"]),
+        VisA="Included at user request. Both hybrids use a VisA-trained student; their VisA rows are NOT independent held-out evaluation.")
+    spec["definitions"].update(
+        relative_accuracy="100*pooled ACC / this experiment's measured full-MMAD unpruned ACC, including VisA in both numerator and denominator.",
+        source_selection="All four MMAD sources including VisA. Reused non-VisA prompts/options stay EXACTLY frozen; added VisA options freeze once with the saved seed, shared across methods.",
+        training_overlap="VisA-trained student is used ONLY by the two hybrids. Their VisA source is labelled training_overlap=VisA; pooled hybrid scores include this overlap. Other six methods and the unpruned reference do not use the student.")
 
 
 def summarize_records(records, samples, job, total_memory):
@@ -271,7 +297,10 @@ def evaluate_samples(backend, method, samples, spec, job, output, total_memory):
             canonical_answer=canonical,selected_option=key,**{k:result[k] for k in common.TIMING},budget=budget)
     context = method.generation_context(backend.model) if hasattr(method,"generation_context") else nullcontext()
     with context:
-        indices = common.warmup_indices(len(samples),spec["warmup"]) if resumed<len(samples) else []
+        if resumed<len(samples) and spec.get("reuse_history"):
+            indices=[resumed+i for i in common.warmup_indices(len(samples)-resumed,spec["warmup"])]
+        else:
+            indices=common.warmup_indices(len(samples),spec["warmup"]) if resumed<len(samples) else []
         for position,index in enumerate(indices,1):
             generate(index)
             print(f"{job['job_id']} warmup {position}/{len(indices)}",flush=True)
@@ -286,8 +315,9 @@ def evaluate_samples(backend, method, samples, spec, job, output, total_memory):
                     eta=elapsed*(len(samples)-index-1)/(index+1-resumed)
                     print(f"{job['job_id']} {index+1}/{len(samples)} elapsed={elapsed:.1f}s ETA={eta:.1f}s "
                           f"Lat={row['lat_seconds']*1000:.2f}ms",flush=True)
+    reused=spec.get("reuse_history",{}).get("trials",{}).get(job["job_id"],{}).get("records",0)
     return dict(summarize_records(records,samples,job,total_memory),resumed_samples=resumed,
-        fresh_samples=len(records)-resumed,warmup_samples=len(indices))
+        reused_from_previous=reused,fresh_samples=len(records)-resumed,warmup_samples=len(indices))
 
 
 def worker(manifest, job_id):
@@ -298,10 +328,13 @@ def worker(manifest, job_id):
     try:
         if os.environ.get("CUDA_VISIBLE_DEVICES")!=job["gpu"]:
             raise ValueError("Worker must expose only its assigned GPU via CUDA_VISIBLE_DEVICES")
+        if spec.get("reuse_history"):
+            from llava_pruning.mmad_extension import verify_imported_prefix
+            verify_imported_prefix(output,spec,job)
         import torch
         from llava_pruning.backend import LlavaBackend
         from llava_pruning.visa_comparison_methods import native_counts, single_drop_keep, visionzip_view_keeps
-        samples=load_frozen(spec["input_json"],exclude_sources=EXCLUDED_SOURCES)
+        samples=load_frozen(spec["input_json"],exclude_sources=() if spec.get("include_visa") else EXCLUDED_SOURCES)
         if len(samples)!=spec["sample_count"]: raise ValueError("Frozen MMAD question count changed")
         for sample in samples:
             stat=sample.image.stat()
@@ -380,7 +413,8 @@ def run(args):
     print(f"GPUs {spec['gpus']}, one trial per GPU, group={spec['experiment_group']}, "
           f"base_guided_tail={spec['base_guided_tail']}, {len(spec['jobs'])} report rows, no PNG; "
           f"VisA-trained student={spec['checkpoint']['path']}",flush=True)
-    print("VisA is excluded from EVERY trial and the unpruned reference; see run.json and summary_by_source.csv.",flush=True)
+    print("All four MMAD sources included; hybrid VisA scores have student-training overlap."
+          if spec.get("include_visa") else "VisA is excluded from EVERY trial and the unpruned reference; see run.json and summary_by_source.csv.",flush=True)
     queues={gpu:deque() for gpu in spec["gpus"]}
     for job in spec["jobs"]:
         if job["status"]=="unreachable":

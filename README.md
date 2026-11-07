@@ -1506,12 +1506,12 @@ Usage, policy differences, outputs, and timing limitations:
 
 ## MMAD binary comparison (0-shot)
 
-`benchmark_mmad_binary.py` runs the local MMAD Anomaly Detection subset with VisA excluded,
+`benchmark_mmad_binary.py` runs the local MMAD Anomaly Detection subset with VisA excluded by default,
 with the seven existing methods plus a joint-self hybrid at layer-average 50/70/90%,
 including Lat/Mem and source-wise metrics. Use `--gpus 5 6 7` for independent
 parallel trials, one per GPU, or `--gpu 5` for sequential trials. It defaults to the confirmed
 VisA-trained student for the hybrid baseline and records its training provenance.
-VisA-source MMAD questions are excluded from EVERY trial and the unpruned
+By default, VisA-source MMAD questions are excluded from every trial and the unpruned
 reference because the student was trained on VisA. The added hybrid uses full
 Base+AnyRes+Text predictor input, each
 token's own predicted attention, joint Top-k without group quotas, lambda=.7
@@ -1524,6 +1524,11 @@ The loader supports both annotation `image/` and native `test/` layouts.
 Use `--mvtec-root /home/yz/xxy/data/datasets/MVTec-AD` when MVTec images are
 stored separately; both `DS-MVTec` and `MVTec-AD` annotation prefixes map to
 that source root by exact category/defect/filename.
+To add VisA to completed results without regenerating their saved answers/timings,
+use `--include-visa --reuse-dir output/mmad_no_visa_two_hybrids_gpu567_01`
+and a separate new `--output-dir`. All original methods/settings are restored;
+only missing questions run. Full/source CSVs are recomputed from per-question
+records, and VisA training overlap is labelled for both hybrids. See the same guide.
 
 ## FiCoCo-V on MVTec, MMAD and MPDD
 
