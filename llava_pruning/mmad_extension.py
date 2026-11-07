@@ -66,7 +66,8 @@ def prepare_reuse(args, api, *, fingerprint_student=True):
     if not rates or set(rates)-{50,70,90}: raise ValueError("Unsupported historical pruning rates")
     gpus=[str(v) for v in args.gpus] if args.gpus is not None else [str(args.gpu)]
     jobs=api.schedule(rates,gpus,experiment_group=old.get("experiment_group","all"),
-        base_guided_tail=old.get("base_guided_tail",9),include_visa=True)
+        base_guided_tail=old.get("base_guided_tail",9),include_visa=True,
+        joint_self_tails=old.get("joint_self_tails",[0]))
     old_jobs={j["job_id"]:j for j in old["jobs"]}
     if len(old_jobs)!=len(old["jobs"]) or set(old_jobs)!={j["job_id"] for j in jobs}:
         raise ValueError("Historical method list differs from the supported matched schedule")
@@ -157,7 +158,8 @@ def setup_extension(args,api):
         gpu=jobs[0]["gpu"],gpus=list(dict.fromkeys(j["gpu"] for j in jobs if j["status"]=="pending")),
         dataset_info=info,input_json=str(input_path),input_sha256=common.digest(input_path),sample_count=len(records),
         jobs=jobs,source_identity=common.source_identity(),reuse_history=history,
-        experiment_group=old.get("experiment_group","all"),base_guided_tail=old.get("base_guided_tail",9))
+        experiment_group=old.get("experiment_group","all"),base_guided_tail=old.get("base_guided_tail",9),
+        joint_self_tails=old.get("joint_self_tails",[0]))
     for name in ("complete","completed_trials","failed_trials"): spec.pop(name,None)
     api.apply_source_policy(spec)
     for job_id,value in history["trials"].items():

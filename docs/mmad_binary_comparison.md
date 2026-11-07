@@ -105,9 +105,41 @@ python benchmark_mmad_binary.py \
 
 `--experiment-group` 可选 `all`（默认完整对照）、`base_guided`、`joint_self`；
 每种选择均自动包含不剪枝基准。
-`--base-guided-tail` 为0～26，默认9，只作用于Base引导组；joint_self始终tail=0。
+`--base-guided-tail` 为0～26，默认9，只作用于Base引导组；joint_self默认tail=0，
+可用 `--joint-self-tails` 单独选择一个或多个tail。
 所选组、tail及每组GPU记录在 `run.json`，CSV的 `config` 使用实际tail。
 不传这两个参数时，默认任务和方法设置沿用原完整对照。
+
+## 联合自身评分：包含VisA，扫描tail0～10
+
+这组使用各自蒸馏预测的attention：旁路输入Base＋AnyRes＋Text，Base与AnyRes合并统一Top-k，
+λ=.7、LLM前MyPool不变；不保存图片。使用GPU3/4，完整评测MMAD四个来源：
+
+```bash
+python benchmark_mmad_binary.py \
+  --gpus 3 4 \
+  --model-path /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/ \
+  --data-root /home/yz/xxy/data/datasets/MMAD \
+  --mvtec-root /home/yz/xxy/data/datasets/MVTec-AD \
+  --checkpoint output/attention_predictor_twig_train_01/best.pt \
+  --include-visa \
+  --experiment-group joint_self \
+  --prune-rates 50 70 90 \
+  --joint-self-tails 0 1 2 3 4 5 6 7 8 9 10 \
+  --output-dir output/mmad_all_joint_self_50_70_90_lambda07_tail0_10_01
+```
+
+共33组hybrid＋1组共用的不剪枝参考，汇总34行。只跑指定joint_self组，
+不重复运行其它方法，也不为每个tail重复测不剪枝。
+`summary.csv` 汇总全部配置，`summary_by_source.csv` 分别报告GoodsAD、MVTec-AD、MVTec-LOCO、VisA。
+各行config包含真实tail；tail>0标为 `tail=N(extra)`，实际总剪枝率及额外tail贡献保留在预算表。
+tail只控制何时删除第二阶段保留的所有image token，不删除LLM层、不改变原两阶段预算或评分模式。
+
+`--joint-self-tails` 默认仅0，支持0～26的不同整数，原有默认任务及tail0任务ID保持兼容。
+不剪枝参考也使用包含VisA的完整题集，Ratio相对于该实测参考，不使用91.18%。
+沿用VisA训练学生，因此VisA来源的训练重叠标注与其它完整MMAD实验相同。
+此命令从头运行新扫描，不传 `--reuse-dir`。若导入旧结果，脚本会恢复旧实验的tail列表，
+不把不同tail配置的历史回答互相复用。中断后使用原目录和 `--resume`，无需重新列出tails。
 
 先检查下载的数据结构（无需显卡、模型或学生权重，不产生输出文件）：
 
