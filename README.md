@@ -1525,6 +1525,16 @@ Use `--mvtec-root /home/yz/xxy/data/datasets/MVTec-AD` when MVTec images are
 stored separately; both `DS-MVTec` and `MVTec-AD` annotation prefixes map to
 that source root by exact category/defect/filename.
 
+## FiCoCo-V on MVTec, MMAD and MPDD
+
+`benchmark_ficoco_v.py --gpus 5 6 7` runs an unpruned reference and FiCoCo-V
+at physical LLM layer-average50/70/90% for each dataset, with full test data,
+ACC/PRE/Recall/TNR/BACC/F1/Lat/Mem and source-wise CSVs. MMAD excludes VisA.
+It uses the existing dataset paths and inference backend, no student weights
+or training. Start with `--check-data`. See [FiCoCo-V usage and adaptation](docs/ficoco_v.md)
+for the full server command, paper/CLIP-code discrepancies, SigLIP no-CLS
+scoring, progressive layer12..26 compression and sparse AnyRes packing.
+
 ## Research cautions
 
 - This FastV implementation masks visual keys in decoder attention. It does **not** shorten the token sequence or prove wall-clock acceleration from token removal. `generation_seconds` is diagnostic, not a claimed speedup metric.
