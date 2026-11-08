@@ -254,7 +254,7 @@ def record_source_identity(spec,check=None):
     spec["source_policy"]="mmad_inference_dependencies"
     if check and check.get("legacy_recovery"):
         spec["source_recovery"]=dict(check["legacy_recovery"],verified_utc=datetime.now(timezone.utc).isoformat())
-    spec["definitions"]["source_check"]="Check MMAD generation, method/schedule/metrics functions and their local imports, plus native/vendor/third-party code. Ignore unrelated root experiments. Legacy aggregate hashes must match an exact Git revision before scoped migration. Original broad source_identity retained as historical metadata."
+    spec["definitions"]["source_check"]="Check MMAD generation, method/schedule/metrics functions and their local imports, plus native/vendor/third-party code. Ignore unrelated root experiments. Legacy aggregate hashes must match an exact reconstruction from Git and optionally current local Python additions/edits before scoped migration. Original broad source_identity retained as historical metadata."
 
 
 def apply_source_policy(spec):

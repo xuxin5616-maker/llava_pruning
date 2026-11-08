@@ -1,8 +1,9 @@
 """Scoped MMAD inference identity and verified recovery of legacy whole-tree hashes.
 
 An unrelated root experiment is not an inference dependency. Legacy manifests
-store only an aggregate hash: resolve it to an EXACT Git snapshot before
-comparing scoped dependencies. Never relabel an unknown historical hash.
+store only an aggregate hash: reconstruct it EXACTLY from Git, optionally
+including unchanged local additions/edits, before comparing dependencies.
+Never relabel an unknown historical hash or modify local source files.
 """
 
 import ast
@@ -120,6 +121,31 @@ def changed_paths(before,after):
     return [p for p in sorted(set(left)|set(right)) if left.get(p)!=right.get(p)]
 
 
+def local_changes(files,head):
+    """Use file contents, including ignored Python files seen by the old guard.
+
+    JSON/shell/backup files were never in the old Python-only identity. Files
+    introduced by later commits are NOT local additions just because an older
+    revision lacks them: compare working files with the CURRENT Git HEAD.
+    """
+    additions={p:data for p,data in files.items() if p not in head}
+    modified={p:data for p,data in files.items() if p in head and data!=head[p]}
+    deleted=set(head)-set(files)
+    return additions,modified,deleted
+
+
+def legacy_candidates(original,additions,modified,deleted):
+    yield original,dict(mode='git_only',added=[],modified=[],deleted=[])
+    if additions:
+        yield dict(original,**additions),dict(mode='git_plus_local_additions',
+            added=sorted(additions),modified=[],deleted=[])
+    if modified or deleted:
+        combined=dict(original,**additions,**modified)
+        for path in deleted: combined.pop(path,None)
+        yield combined,dict(mode='git_plus_local_changes',added=sorted(additions),
+            modified=sorted(modified),deleted=sorted(deleted))
+
+
 def verify_source(spec,root):
     root=Path(root);files=working_files(root);current=scope_identity(files)
     saved=spec.get('mmad_source_identity')
@@ -132,17 +158,25 @@ def verify_source(spec,root):
     if legacy in (whole_identity(files),whole_identity(files,windows=True)):
         return dict(identity=current,legacy_recovery=dict(reference='unchanged working source',legacy_identity=legacy))
     cache={};visited=set()
+    head=revision_files(root,'HEAD',cache)
+    additions,modified,deleted=local_changes(files,head)
     for revision in git(root,'rev-list','--max-count=100','HEAD').decode().splitlines():
         original=revision_files(root,revision,cache)
-        signature=whole_identity(original)
-        if signature['sha256'] in visited: continue
-        visited.add(signature['sha256'])
-        if legacy not in (signature,whole_identity(original,windows=True)): continue
-        previous=scope_identity(original)
-        if previous!=current:
-            changed=', '.join(changed_paths(previous,current)[:8])
-            raise ValueError(f'Historical source matches Git {revision[:12]}, but MMAD inference dependencies changed: {changed}')
-        return dict(identity=current,legacy_recovery=dict(reference=revision,legacy_identity=legacy,
-            verification='Exact legacy whole-source hash matched Git; scoped inference code is unchanged'))
-    raise ValueError('Cannot identify the saved legacy source hash in the latest 100 Git revisions; '
-                     'existing results are preserved. Restore the original source before resuming; no hash check was bypassed')
+        for candidate,overlay in legacy_candidates(original,additions,modified,deleted):
+            if len(candidate)!=legacy.get('files'): continue
+            signature=whole_identity(candidate)
+            if signature['sha256'] in visited: continue
+            visited.add(signature['sha256'])
+            if legacy not in (signature,whole_identity(candidate,windows=True)): continue
+            previous=scope_identity(candidate)
+            if previous!=current:
+                changed=', '.join(changed_paths(previous,current)[:8])
+                raise ValueError(f'Historical source matches Git {revision[:12]} ({overlay["mode"]}), '
+                                 f'but MMAD inference dependencies changed: {changed}')
+            return dict(identity=current,legacy_recovery=dict(reference=revision,legacy_identity=legacy,
+                local_overlay=overlay,
+                verification='Exact legacy whole-source hash matched reconstructed Git/local files; scoped inference code is unchanged'))
+    raise ValueError('Cannot identify the saved legacy source hash in the latest 100 Git revisions plus current local Python files; '
+        f'saved_files={legacy.get("files")}, current_files={len(files)}, local_additions={len(additions)}, '
+        f'local_modified={len(modified)}, local_deleted={len(deleted)}. '
+        'Existing results are preserved; no hash check was bypassed')

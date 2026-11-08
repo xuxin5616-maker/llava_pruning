@@ -1531,7 +1531,7 @@ only missing questions run. Full/source CSVs are recomputed from per-question
 records, and VisA training overlap is labelled for both hybrids. See the same guide.
 MMAD resume now checks inference dependencies rather than every unrelated root
 experiment script. Legacy whole-project source hashes are migrated only after
-an exact Git-history match and unchanged inference dependencies; completed
+exact reconstruction from Git and preserved local Python files, plus unchanged inference dependencies; completed
 results stay intact. See the guide's `Inference source changed` recovery command.
 
 ## FiCoCo-V on MVTec, MMAD and MPDD

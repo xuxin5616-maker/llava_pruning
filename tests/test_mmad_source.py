@@ -29,7 +29,8 @@ def source_repo(root):
         'llava_pruning/__init__.py':'',
         'llava_pruning/backend.py':'def generate():\n    from .scores import rank\n    return rank()\n',
         'llava_pruning/scores.py':'def rank(): return 1\n',
-        'vendor/llava/llava/model.py':'NATIVE=1\n','third_party/pinned.py':'PINNED=1\n'}
+        'vendor/llava/llava/model.py':'NATIVE=1\n','third_party/pinned.py':'PINNED=1\n',
+        'run_fastv_layer_sweep.py':'GPU=5\n'}
     for name,text in files.items():
         path=root/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(text,encoding='utf-8')
     source.git(root,'init','-q')
@@ -37,8 +38,8 @@ def source_repo(root):
     return root
 
 
-def commit(root,message):
-    source.git(root,'add','.')
+def commit(root,message,paths=None):
+    source.git(root,'add',*(paths or ['.']))
     source.git(root,'-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm',message)
     return source.git(root,'rev-parse','HEAD').decode().strip()
 
@@ -84,9 +85,58 @@ class SourceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'Cannot identify the saved legacy source hash'):
                 source.verify_source({'source_identity':{'files':999,'sha256':'unknown-old-code'}},root)
 
+    def test_server_seven_extra_scripts_and_local_sweep_edit_recover_exact_old_hash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=source_repo(Path(temporary)/'src')
+            scripts=['1.py','runMyPruningPoolRedundancy.py','runPoolRedundancyLayerSweep.py',
+                'runPoolSpatialAblationSweep.py','runPoolSpatialStrengthSweep.py',
+                'runPoolTemperatureSweep.py','runVisionZipAnchorOrder.py']
+            for index,name in enumerate(scripts): (root/name).write_text(f'LOCAL={index}\n',encoding='utf-8')
+            (root/'run_fastv_layer_sweep.py').write_text('GPU=3\n',encoding='utf-8')
+            (root/'runMyPruningPoolSpatial.py.local-backup').write_text('not Python identity',encoding='utf-8')
+            (root/'runPoolBaseFullSix.sh').write_text('# shell\n',encoding='utf-8')
+            legacy=source.whole_identity(source.working_files(root),windows=True)
+            old=source.git(root,'rev-parse','HEAD').decode().strip()
+            (root/'benchmark_ficoco_v.py').write_text('VERSION=2\n',encoding='utf-8')
+            helper=root/'llava_pruning/mmad_source.py';helper.write_text('POLICY="new guard"\n',encoding='utf-8')
+            commit(root,'new tracked guard and unrelated update',paths=['benchmark_ficoco_v.py','llava_pruning/mmad_source.py'])
+            before=source.working_files(root)
+            result=source.verify_source({'source_identity':legacy},root)
+            recovery=result['legacy_recovery']
+            self.assertEqual(recovery['reference'],old)
+            self.assertEqual(recovery['local_overlay']['mode'],'git_plus_local_changes')
+            self.assertEqual(recovery['local_overlay']['added'],sorted(scripts))
+            self.assertEqual(recovery['local_overlay']['modified'],['run_fastv_layer_sweep.py'])
+            self.assertEqual(len(before),legacy['files']+1)
+            self.assertEqual(source.working_files(root),before)
+
+    def test_local_inference_edit_that_already_existed_is_proved_not_discarded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=source_repo(Path(temporary)/'src');path=root/'llava_pruning/scores.py'
+            path.write_text('def rank(): return 3\n',encoding='utf-8')
+            legacy=source.whole_identity(source.working_files(root))
+            (root/'benchmark_ficoco_v.py').write_text('VERSION=2\n',encoding='utf-8')
+            commit(root,'unrelated',paths=['benchmark_ficoco_v.py'])
+            result=source.verify_source({'source_identity':legacy},root)
+            self.assertEqual(result['legacy_recovery']['local_overlay']['modified'],['llava_pruning/scores.py'])
+            self.assertEqual(path.read_text(encoding='utf-8'),'def rank(): return 3\n')
+
+    def test_changed_local_script_or_inference_after_old_run_is_not_assumed_unchanged(self):
+        for path in ('1.py','llava_pruning/scores.py'):
+            with self.subTest(file=path),tempfile.TemporaryDirectory() as temporary:
+                root=source_repo(Path(temporary)/'src');(root/'1.py').write_text('LOCAL=1\n',encoding='utf-8')
+                legacy=source.whole_identity(source.working_files(root))
+                target=root/path;target.write_text(target.read_text(encoding='utf-8')+'\nCHANGED=2\n',encoding='utf-8')
+                (root/'benchmark_ficoco_v.py').write_text('VERSION=2\n',encoding='utf-8')
+                commit(root,'unrelated',paths=['benchmark_ficoco_v.py'])
+                with self.assertRaisesRegex(ValueError,'Cannot identify|inference dependencies changed'):
+                    source.verify_source({'source_identity':legacy},root)
+
     def test_recovery_preserves_two_completed_trials_and_runs_only_the_remaining_32(self):
         with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
             root=Path(temporary);code=source_repo(root/'src');args=fixture(root)
+            (code/'1.py').write_text('LOCAL=1\n',encoding='utf-8')
+            (code/'run_fastv_layer_sweep.py').write_text('GPU=3\n',encoding='utf-8')
             args.gpus=[3,4];args.include_visa=True;args.experiment_group='joint_self';args.joint_self_tails=list(range(11))
             with patch.object(entry,'PROJECT',code):
                 output,spec=entry.setup(args);spec.pop('mmad_source_identity');spec.pop('source_policy')
@@ -98,7 +148,8 @@ class SourceTests(unittest.TestCase):
                     result=entry.summarize_records([prediction(s,s.source['correct_option']) for s in samples],samples,job,2**30)
                     common.save_json(folder/'metrics.json',dict(result,job_id=job['job_id'],status='success',input_sha256=spec['input_sha256']))
                     saved[folder/'metrics.json']=(folder/'metrics.json').read_bytes()
-                (code/'benchmark_ficoco_v.py').write_text('VERSION=2\n',encoding='utf-8');commit(code,'unrelated new benchmark')
+                (code/'benchmark_ficoco_v.py').write_text('VERSION=2\n',encoding='utf-8')
+                commit(code,'unrelated new benchmark',paths=['benchmark_ficoco_v.py'])
                 calls=[]
                 real_popen=entry.subprocess.Popen
                 def process(command,**kwargs):
