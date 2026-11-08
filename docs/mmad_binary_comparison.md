@@ -64,7 +64,7 @@ python benchmark_mmad_binary.py \
 ```
 
 恢复使用新清单中保存的完整配置及GPU，旧目录随后移走也不影响恢复。
-源码或输入发生变化时，仍遵守原有严格恢复校验。
+MMAD推理依赖或输入发生变化时，仍遵守恢复校验；无关的根目录实验脚本不阻止续跑。
 若要从头评测完整MMAD，可只加 `--include-visa`，不传 `--reuse-dir`；默认不加时继续排除VisA。
 
 ## 一键运行
@@ -187,10 +187,35 @@ python benchmark_mmad_binary.py --resume --output-dir output/mmad_no_visa_two_hy
 ```
 
 恢复沿用保存的 GPU 分配/参数和问题顺序，已完成实验跳过，未完成实验读取逐题记录后继续。
-源码、模型配置、问题标注、冻结清单、学生权重或训练来源清单变化时拒绝混用。
+MMAD推理依赖、模型配置、问题标注、冻结清单、学生权重或训练来源清单变化时拒绝混用。
 每个工作进程还检查图片大小及修改时间；没有对图片内容和主模型全部权重逐个校验哈希。
 当前版本为1.6；旧版本结果可通过上面的 `--reuse-dir` 显式导入新实验，不能直接改旧目录的source筛选再恢复。
 准备数据阶段因缺图退出时还未创建实验目录，可以修正路径后重新执行原命令。
+
+### 修复 `Inference source changed` 后继续原来的tail扫描
+
+旧检查将根目录所有Python实验脚本一起算入源码指纹。运行中更新不参与MMAD推理的
+`benchmark_ficoco_v.py` 等文件，也会使后续工作进程在模型加载之前失败。
+新检查追踪实际MMAD生成、剪枝、调度、指标函数及其本地导入，并保守检查vendor/third-party源码。
+无关的根目录脚本变化不再阻止续跑；实际推理代码变化仍然拒绝混入。
+
+对于只存整项目哈希的旧 `run.json`，恢复时在本地Git最近100个提交中寻找**整项目哈希精确匹配**的版本，
+再比较当时与现在的MMAD推理依赖。全部一致才自动迁移；找不到旧版本或依赖有变化时明确报错，不跳过核对。
+首次迁移保存 `run.before_scoped_source.json`，原 `source_identity` 保留，另记旧Git版本及核对时间。
+新实验在 `mmad_source_identity` 保存各依赖文件指纹；正常恢复无需再扫描Git历史。
+
+用户已生成的完整MMAD、joint-self、50/70/90%、lambda=.7、tail0～10实验可这样继续：
+
+```bash
+git pull origin ex
+python benchmark_mmad_binary.py \
+  --resume \
+  --output-dir /home/yz/xxy/code/pruning/llava_pruning/output/mmad_all_joint_self_50_70_90_lambda07_tail0_10_01
+```
+
+沿用原GPU3/4、完整问题清单及所有方法参数，不需要重填。成功的未剪枝与50%/tail0两组直接跳过；
+失败或未完成组继续各自保存的逐题进度。原有CSV会随剩余32组完成重新汇总，不把空白改成伪造的0。
+运行环境、图片元数据、模型配置和学生检查均保留；修改这些内容不能靠源码恢复绕过。
 
 `--gpus 5 6 7` 将实验固定轮转分配到三张卡，三张卡可以同时工作；每张卡最多一个任务，
 每个任务都独立加载模型。不是把单个模型拆到三张卡上。

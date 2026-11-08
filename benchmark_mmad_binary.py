@@ -98,7 +98,8 @@ def verify_inputs(spec):
             (Path(spec["model_path"])/"config.json",spec["model_config_sha256"]),
             (spec["dataset_info"]["annotations"],spec["dataset_info"]["annotations_sha256"])):
         if common.digest(path)!=expected: raise ValueError(f"Saved MMAD input/model/annotation changed: {path}")
-    if common.source_identity()!=spec["source_identity"]: raise ValueError("Inference source changed; use a new output directory")
+    from llava_pruning.mmad_source import verify_source
+    return verify_source(spec,PROJECT)
 
 
 def schedule(rates, gpus=None, *, experiment_group="all", base_guided_tail=9, include_visa=False,
@@ -171,14 +172,23 @@ def setup(args):
     output = args.output_dir.expanduser().resolve()
     if args.resume:
         spec = json.loads((output/"run.json").read_text(encoding="utf-8"))
-        verify_inputs(spec)
+        source_check=verify_inputs(spec)
         if student_identity(spec["checkpoint"]["path"],"visa")!=spec["checkpoint"]:
             raise ValueError("Saved VisA student or training provenance changed")
+        if "mmad_source_identity" not in spec:
+            backup=output/"run.before_scoped_source.json"
+            if not backup.exists(): backup.write_bytes((output/"run.json").read_bytes())
+            record_source_identity(spec,source_check)
+            common.save_json(output/"run.json",spec)
+            print("Verified legacy source; resume with unchanged MMAD inference dependencies. Old manifest: "+str(backup),flush=True)
         # All options, including per-trial GPU assignments, are restored.
         return output,spec
     if args.reuse_dir:
         from llava_pruning.mmad_extension import setup_extension
-        return setup_extension(args,sys.modules[__name__])
+        output,spec=setup_extension(args,sys.modules[__name__])
+        record_source_identity(spec)
+        common.save_json(output/"run.json",spec)
+        return output,spec
     gpus=[str(gpu) for gpu in args.gpus] if args.gpus is not None else [str(args.gpu)]
     jobs=schedule(args.prune_rates,gpus,experiment_group=args.experiment_group,
                   base_guided_tail=args.base_guided_tail,include_visa=args.include_visa,
@@ -232,9 +242,19 @@ def setup(args):
             "parallelism":"Fixed round-robin trial-to-GPU assignment, one fresh single-GPU process per trial, at most one active trial per GPU. All processes share the same frozen questions; only parent writes aggregate CSV. Per-GPU performance is recorded, not normalized across devices.",
             "units_csv":"acc/pre/recall/tnr/bacc/f1/mmad_score/relative_accuracy_pct are percentages; Lat is mean TTFT in ms; mem is full-generation peak allocated GiB."})
     apply_source_policy(spec)
+    record_source_identity(spec)
     common.save_json(output/"run.json",spec)
     describe(info)
     return output,spec
+
+
+def record_source_identity(spec,check=None):
+    from llava_pruning.mmad_source import scope_identity, working_files
+    spec["mmad_source_identity"]=check["identity"] if check else scope_identity(working_files(PROJECT))
+    spec["source_policy"]="mmad_inference_dependencies"
+    if check and check.get("legacy_recovery"):
+        spec["source_recovery"]=dict(check["legacy_recovery"],verified_utc=datetime.now(timezone.utc).isoformat())
+    spec["definitions"]["source_check"]="Check MMAD generation, method/schedule/metrics functions and their local imports, plus native/vendor/third-party code. Ignore unrelated root experiments. Legacy aggregate hashes must match an exact Git revision before scoped migration. Original broad source_identity retained as historical metadata."
 
 
 def apply_source_policy(spec):
