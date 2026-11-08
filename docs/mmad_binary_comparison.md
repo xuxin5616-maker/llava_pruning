@@ -211,6 +211,22 @@ Git、本地脚本及其未提交修改均保持原样，不执行checkout/reset
 若使用本地文件重建，`source_recovery.local_overlay` 同时记录参与重建的新增、修改、删除文件名。
 新实验在 `mmad_source_identity` 保存各依赖文件指纹；正常恢复无需再扫描Git历史。
 
+对 `67136cf` 的旧25组完整MMAD实验，还核对了后续 `6aea384` 新增tail扫描的兼容性：
+旧版联合自身评分固定tail0，新版读取保存任务的tail参数；当旧任务仍全部为tail0时，构造器含义一致。
+调度函数的新列表参数和extension的tail配置传递不改变保存的任务清单，恢复也不重新调用schedule。
+兼容路径只接受这次已核实的两个函数AST、extension文件哈希对，并要求其它推理依赖逐项一致；
+不按文件名一概忽略改动，不将旧tail0结果合并到新tail1～10配置。
+`source_recovery.compatibility` 记录这一限定的迁移；50/70/90%旧/新tail0已做CPU小模型生成对照。
+因此原 `mmad_with_visa_two_hybrids_gpu567_01` 可用原目录恢复：
+
+```bash
+python benchmark_mmad_binary.py \
+  --resume \
+  --output-dir /home/yz/xxy/code/pruning/llava_pruning/output/mmad_with_visa_two_hybrids_gpu567_01
+```
+
+保存的21组成功结果跳过，恢复失败的3组；PyramidDrop90%仍不可达、保留空白。
+
 用户已生成的完整MMAD、joint-self、50/70/90%、lambda=.7、tail0～10实验可这样继续：
 
 ```bash

@@ -17,6 +17,17 @@ ENTRY="benchmark_mmad_binary.py"
 FUNCTIONS={"schedule","make_trial_method","summarize_records","restore_records",
            "evaluate_samples","worker","metric_row"}
 CONSTANTS={"FIELDS","SOURCE_FIELDS","HYBRID_COUNT_FIELDS","BUDGET_FIELDS","EXCLUDED_SOURCES"}
+# Reviewed transition 67136cf -> 6aea384: the existing joint-self tail0
+# becomes configurable, and the extension manifest carries that new option.
+# These exact AST/file pairs, NOT filenames alone, define the compatibility.
+TAIL0_FUNCTION_PAIRS={
+    'schedule':('c42993536ae352d3cd70526b12454529c99401d2d29faafb19127bd0fe525f5a',
+                '85f01d65ef12434b18a0540a618668f187c3ac78f4e052a91470a9fc510ca675'),
+    'make_trial_method':('c0d19194e331f48144f483780b3c450474aba1f3e38159f61ca63eac111a5a50',
+                         '0453547d9ad5ab0b6477b18679483cd639cc2122e50d5ecd72357b7033065756')}
+EXTENSION='llava_pruning/mmad_extension.py'
+TAIL0_EXTENSION_PAIR=('fe6f8f3b0c6cdd9af7d91227f62328bfb75b2b1c39e306eff9321b77e4f2628f',
+                      '69d0fce97b11e5356b212f052acb8e5f1262f57b3c345347612fa56b584b4b2f')
 
 
 def digest(data):
@@ -146,6 +157,44 @@ def legacy_candidates(original,additions,modified,deleted):
             modified=sorted(modified),deleted=sorted(deleted))
 
 
+def tail0_compatibility(previous,files,spec,current):
+    """Prove the reviewed default-tail0 extension is inert for THIS saved run.
+
+    Resume restores the frozen job list; it does not call schedule again.
+    The method's old literal tail0 and new job.get(...,0) are equivalent only
+    when every saved joint-self job is tail0. All other dependency hashes,
+    generation/metrics functions and method code must remain unchanged.
+    No old source is executed or written to disk.
+    """
+    jobs=spec.get('jobs');tails=spec.get('joint_self_tails',[0])
+    if not isinstance(jobs,list) or not jobs or not isinstance(tails,(list,tuple)) or list(tails)!=[0]: return None
+    for job in jobs:
+        if job.get('variant')=='joint_self':
+            tail=job.get('tail_drop_layers',0)
+            if type(tail) is not int or tail!=0: return None
+    earlier=scope_identity(previous)
+    if set(changed_paths(earlier,current))-{ENTRY,EXTENSION}: return None
+    old_tree,new_tree=entry_tree(previous[ENTRY]),entry_tree(files[ENTRY])
+    before={n.name:n for n in old_tree.body if isinstance(n,ast.FunctionDef)}
+    after={n.name:n for n in new_tree.body if isinstance(n,ast.FunctionDef)}
+    for name,pair in TAIL0_FUNCTION_PAIRS.items():
+        actual=tuple(digest(ast.dump(nodes[name],include_attributes=False).encode()) for nodes in (before,after))
+        if actual!=pair: return None
+    if (digest(previous.get(EXTENSION,b'')),digest(files.get(EXTENSION,b'')))!=TAIL0_EXTENSION_PAIR: return None
+    # Substitute ONLY the four exactly reviewed changes, then demand equality
+    # of the complete inference identity. Any unrelated scoring/forward/
+    # timing/statistics change still fails the normal dependency check.
+    old_tree.body=[after[n.name] if isinstance(n,ast.FunctionDef) and n.name in TAIL0_FUNCTION_PAIRS else n
+                   for n in old_tree.body]
+    adjusted=dict(previous)
+    adjusted[ENTRY]=ast.unparse(old_tree).encode('utf-8')
+    adjusted[EXTENSION]=files[EXTENSION]
+    if scope_identity(adjusted)!=current: return None
+    return dict(transition='67136cf_to_6aea384_default_tail0',
+        reviewed_files=[ENTRY,EXTENSION],joint_self_tails=[0],
+        verification='Exact reviewed AST/file pairs; saved jobs unchanged; tail0 constructor equivalent; all other inference dependencies identical')
+
+
 def verify_source(spec,root):
     root=Path(root);files=working_files(root);current=scope_identity(files)
     saved=spec.get('mmad_source_identity')
@@ -169,13 +218,16 @@ def verify_source(spec,root):
             visited.add(signature['sha256'])
             if legacy not in (signature,whole_identity(candidate,windows=True)): continue
             previous=scope_identity(candidate)
+            compatibility=None
             if previous!=current:
-                changed=', '.join(changed_paths(previous,current)[:8])
-                raise ValueError(f'Historical source matches Git {revision[:12]} ({overlay["mode"]}), '
-                                 f'but MMAD inference dependencies changed: {changed}')
+                compatibility=tail0_compatibility(candidate,files,spec,current)
+                if compatibility is None:
+                    changed=', '.join(changed_paths(previous,current)[:8])
+                    raise ValueError(f'Historical source matches Git {revision[:12]} ({overlay["mode"]}), '
+                                     f'but MMAD inference dependencies changed: {changed}')
             return dict(identity=current,legacy_recovery=dict(reference=revision,legacy_identity=legacy,
-                local_overlay=overlay,
-                verification='Exact legacy whole-source hash matched reconstructed Git/local files; scoped inference code is unchanged'))
+                local_overlay=overlay,compatibility=compatibility,
+                verification='Exact legacy whole-source hash matched reconstructed Git/local files; inference is unchanged or exactly verified default-tail0 compatible'))
     raise ValueError('Cannot identify the saved legacy source hash in the latest 100 Git revisions plus current local Python files; '
         f'saved_files={legacy.get("files")}, current_files={len(files)}, local_additions={len(additions)}, '
         f'local_modified={len(modified)}, local_deleted={len(deleted)}. '
