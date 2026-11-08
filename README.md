@@ -26,6 +26,15 @@ Removed/merged-away positions are RGB255 white. Native crop
 count is preserved; no full-dataset evaluation or Lat/Mem benchmark is run.
 See [exact command and white-mask semantics](docs/baseline_single_visualization.md).
 
+For **FULL MVTec**, use `python visualize_mvtec_baseline.py --gpus 5 6`:
+GPU5 runs50%, GPU6 runs70%, with the same lambda.7/base_full/base_text/fast/
+anyres_first/tail9 baseline. Each sample/rate saves ONE PNG: original disk
+image, cumulatively pruned Base and native AnyRes mosaic, removed anchors
+painted RGB255. The snapshot is after distillation and before tail9. No
+intermediate PNGs or Lat/Mem benchmark. `--find-existing` read-only searches
+server output metadata/PNGs; `--resume` continues this new visualization run.
+See [full command and output layout](docs/mvtec_baseline_compact.md).
+
 For the **63-trial tail-image-drop / Base+Text side-input ablation suite**, use
 `python run_pool_distill_ablations.py --gpus 5 6 7`. It runs rates30/50/70 and
 lambda0.7/0.8/0.9, writes a compact eleven-column summary, and saves no images.
