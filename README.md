@@ -34,6 +34,12 @@ painted RGB255. The snapshot is after distillation and before tail9. No
 intermediate PNGs or Lat/Mem benchmark. `--find-existing` read-only searches
 server output metadata/PNGs; `--resume` continues this new visualization run.
 See [full command and output layout](docs/mvtec_baseline_compact.md).
+Add `--selection-modes baseline joint_self` to draw both configurations at
+50/70%: joint_self uses full Base+AnyRes+Text side input and joint Top-k from
+each token's own predicted attention, with the same MyPool/lambda.7/tail9.
+GPU5 queues the two50% jobs, GPU6 queues the two70% jobs. After an existing
+baseline run exits, `--resume --add-joint-self --output-dir <that-run>` appends
+only the new mode while retaining completed baseline PNGs.
 
 For the **63-trial tail-image-drop / Base+Text side-input ablation suite**, use
 `python run_pool_distill_ablations.py --gpus 5 6 7`. It runs rates30/50/70 and

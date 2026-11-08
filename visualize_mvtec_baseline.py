@@ -1,4 +1,4 @@
-"""Full MVTec baseline: one original/pruned-Base/pruned-AnyRes PNG per sample.
+"""Full MVTec baseline or joint self-score Top-k: one compact PNG per sample.
 
 Default GPU5=50%, GPU6=70%. Snapshot after MyPool+distillation, BEFORE tail9.
 Diagnostic generation only: no clean Lat/Mem benchmark, no additional PNGs.
@@ -23,13 +23,50 @@ from visualize_pool_distill import BASELINE
 
 
 PROJECT=Path(__file__).resolve().parent
-VERSION='1.0-mvtec-baseline-compact'
+VERSION='1.1-mvtec-compact-selection-modes'
+LEGACY_VERSION='1.0-mvtec-baseline-compact'
+MODES=('baseline','joint_self')
+
+
+def mode_configuration(mode):
+    if mode not in MODES: raise ValueError('Unknown visualization selection mode')
+    config=dict(BASELINE)
+    if mode=='joint_self':
+        config.update(selection_mode='anyres_self',predictor_input='full',base_mapping='reference',base_policy='joint')
+    return config
+
+
+def job_folder(output,job):
+    return output/job.get('folder',job['job_id'])
+
+
+def schedule(rates,gpus,modes):
+    jobs=[]
+    for mode in modes:
+        for i,rate in enumerate(rates):
+            name=f'prune_{rate:02d}'
+            jobs.append(dict(job_id=name if mode=='baseline' else f'joint_self_{name}',
+                folder=name if mode=='baseline' else f'joint_self/{name}',
+                prune_rate=rate,gpu=str(gpus[i%len(gpus)]),selection_mode=mode))
+    return jobs
+
+
+def make_method(core,checkpoint,rate,mode):
+    from llava_pruning.pool_distill import PoolDistillMethod
+    from runMyPruningPoolSpatial import MethodSettings
+    config=mode_configuration(mode)
+    return PoolDistillMethod(core,checkpoint,rate=rate,share=.7,mode=config['selection_mode'],
+        settings=MethodSettings(prune_rate=0,redundancy_layers=(26,),visionzip_layers=(26,),allocation_temperature=.05,spatial_strength=0.),
+        pruning_audit='lean',tail_drop_layers=9,predictor_input=config['predictor_input'],base_mapping=config['base_mapping'],base_policy=config['base_policy'])
 
 
 def parser():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--gpus',type=int,nargs='+',default=[5,6])
     p.add_argument('--prune-rates',type=int,nargs='+',choices=(50,70),default=[50,70])
+    p.add_argument('--selection-modes',nargs='+',choices=MODES,default=['baseline'],
+                   help='New run: baseline and/or joint_self (full side input, joint self-attention Top-k)')
+    p.add_argument('--add-joint-self',action='store_true',help='With --resume, append joint_self jobs to an existing baseline run without rerunning completed baseline images')
     p.add_argument('--model-path',default='/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/')
     p.add_argument('--checkpoint',default='output/attention_predictor_twig_train_01/best.pt')
     p.add_argument('--input-json',default='/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc.jsonl')
@@ -104,8 +141,19 @@ def freeze(args):
 
 
 def verify(spec):
-    if spec.get('version')!=VERSION or spec['configuration']!=BASELINE:
+    modes=spec.get('selection_modes',['baseline'])
+    if (spec.get('version') not in {VERSION,LEGACY_VERSION} or not modes or len(set(modes))!=len(modes) or
+            any(mode not in MODES for mode in modes) or spec['configuration']!=mode_configuration(modes[0])):
         raise ValueError('Saved visualization version or baseline settings changed')
+    configurations=spec.get('mode_configurations',{'baseline':dict(BASELINE)})
+    if configurations!={mode:mode_configuration(mode) for mode in modes}:
+        raise ValueError('Saved per-mode visualization settings changed')
+    for job in spec['jobs']:
+        mode=job.get('selection_mode','baseline')
+        if mode not in modes: raise ValueError('Saved job has an unselected mode')
+        expected=schedule([job['prune_rate']],[int(job['gpu'])],[mode])[0]
+        if job['job_id']!=expected['job_id'] or job.get('folder',job['job_id'])!=expected['folder']:
+            raise ValueError('Saved visualization job/folder changed')
     for path,expected in ((spec['input_json'],spec['input_sha256']),
             (spec['original_input_json'],spec['original_input_sha256']),
             (Path(spec['model_path'])/'config.json',spec['model_config_sha256'])):
@@ -118,9 +166,22 @@ def setup(args):
         spec=json.loads((output/'run.json').read_text(encoding='utf-8'));verify(spec)
         if student_identity(spec['checkpoint']['path'],'visa')!=spec['checkpoint']:
             raise ValueError('Saved student or training manifest changed')
+        if args.add_joint_self and 'joint_self' not in spec.get('selection_modes',['baseline']):
+            existing=spec['jobs'];rates=list(dict.fromkeys(j['prune_rate'] for j in existing))
+            added=[]
+            for rate in rates:
+                previous=next(j for j in existing if j['prune_rate']==rate)
+                added+=schedule([rate],[int(previous['gpu'])],['joint_self'])
+            spec.update(version=VERSION,selection_modes=[*spec.get('selection_modes',['baseline']),'joint_self'],
+                mode_configurations={**spec.get('mode_configurations',{'baseline':dict(BASELINE)}),'joint_self':mode_configuration('joint_self')},
+                jobs=existing+added)
+            common.save_json(output/'run.json',spec)
+            print('Appended joint_self jobs; saved baseline pictures and progress are retained.',flush=True)
         return output,spec
+    if args.add_joint_self: raise ValueError('--add-joint-self requires --resume')
     if (not args.gpus or len(set(args.gpus))!=len(args.gpus) or any(g<0 for g in args.gpus) or
-            not args.prune_rates or len(set(args.prune_rates))!=len(args.prune_rates) or args.panel_height<1):
+            not args.prune_rates or len(set(args.prune_rates))!=len(args.prune_rates) or args.panel_height<1 or
+            not args.selection_modes or len(set(args.selection_modes))!=len(args.selection_modes)):
         raise ValueError('Use distinct nonnegative GPUs, distinct rates and positive panel-height')
     if output.exists() and any(output.iterdir()): raise FileExistsError(f'Use a new/empty directory or --resume: {output}')
     rows=freeze(args);model=Path(args.model_path).expanduser().resolve()
@@ -129,8 +190,9 @@ def setup(args):
     checkpoint=student_identity(args.checkpoint,'visa')
     output.mkdir(parents=True,exist_ok=True);path=output/'input_frozen.jsonl'
     path.write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in rows),encoding='utf-8')
-    jobs=[dict(job_id=f'prune_{rate:02d}',prune_rate=rate,gpu=str(args.gpus[i%len(args.gpus)])) for i,rate in enumerate(args.prune_rates)]
-    spec=dict(version=VERSION,created_utc=datetime.now(timezone.utc).isoformat(),configuration=dict(BASELINE),
+    jobs=schedule(args.prune_rates,args.gpus,args.selection_modes)
+    spec=dict(version=VERSION,created_utc=datetime.now(timezone.utc).isoformat(),configuration=mode_configuration(args.selection_modes[0]),
+        selection_modes=args.selection_modes,mode_configurations={mode:mode_configuration(mode) for mode in args.selection_modes},
         model_path=str(model),model_config_sha256=common.digest(model/'config.json'),checkpoint=checkpoint,
         original_input_json=str(Path(args.input_json).expanduser().resolve()),original_input_sha256=common.digest(args.input_json),
         input_json=str(path),input_sha256=common.digest(path),data_root=str(Path(args.data_root).expanduser().resolve()),
@@ -140,6 +202,7 @@ def setup(args):
             mask='RGB255 at removed independent token anchors, including merged-away source positions. Native unencoded edges retained.',
             images='Exactly one PNG per sample/rate: original disk image, pruned Base, native AnyRes mosaic. No intermediate PNGs.',
             measurement='Diagnostic generation/rendering only; no clean Lat/Mem measurements.',
+            selection='baseline: Base-mapped AnyRes ranking, Base+Text side input, anyres_first. joint_self: Base+AnyRes+Text side input, each spatial token owns its predicted attention, joint Top-k without separate view quotas. Same MyPool, lambda=.7 and tail9.',
             source='Use current project code; record source fingerprints per job. Resume checks inputs/model/student/runtime. No whole-project source-change blocking.'))
     common.save_json(output/'run.json',spec)
     return output,spec
@@ -155,12 +218,13 @@ def samples_for(spec):
     return samples
 
 
-def restored(folder,samples):
+def restored(folder,samples,selection_mode='baseline'):
     path=folder/'predictions.jsonl';rows,valid=common.read_prefix(path)
     if len(rows)>len(samples): raise ValueError('Too many saved visualization rows')
     for i,(row,sample) in enumerate(zip(rows,samples)):
         if row.get('index')!=i or row.get('question_id')!=sample.sample_id or row.get('gt')!=sample.gt:
             raise ValueError('Saved image ID/order/GT changed')
+        if row.get('selection_mode','baseline')!=selection_mode: raise ValueError('Saved image selection mode changed')
         if row.get('output')!=f'visualizations/sample_{i:09d}.png' or not isinstance(row.get('answer'),str):
             raise ValueError('Invalid saved image/output record')
         if not (folder/row['output']).is_file(): raise FileNotFoundError(folder/row['output'])
@@ -176,7 +240,8 @@ def render_samples(backend,method,samples,spec,job,folder):
     from llava_pruning.pool_distill_visualization import capture_baseline_views
     from llava_pruning.pool_compact_visualization import render_compact
     folder.mkdir(parents=True,exist_ok=True);pictures=folder/'visualizations';pictures.mkdir(exist_ok=True)
-    rows=restored(folder,samples);resumed=len(rows);started=time.perf_counter();last=started
+    mode=job.get('selection_mode','baseline')
+    rows=restored(folder,samples,mode);resumed=len(rows);started=time.perf_counter();last=started
     with torch.inference_mode(),method.generation_context(backend.model),(folder/'predictions.jsonl').open('a',encoding='utf-8') as stream:
         for index in range(resumed,len(samples)):
             sample=samples[index]
@@ -188,23 +253,23 @@ def render_samples(backend,method,samples,spec,job,folder):
             name=f'visualizations/sample_{index:09d}.png';target=folder/name;temporary=target.with_suffix('.png.tmp')
             try: picture.save(temporary,format='PNG',compress_level=2);temporary.replace(target)
             finally: picture.close()
-            row=dict(index=index,question_id=sample.sample_id,gt=sample.gt,answer=result['answer'],output=name,
+            row=dict(index=index,question_id=sample.sample_id,gt=sample.gt,answer=result['answer'],output=name,selection_mode=mode,
                 sample_seed=spec['seed']+index,**details)
             stream.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+'\n');stream.flush();rows.append(row)
             del trace,result,picture
             elapsed=time.perf_counter()-started
             if index==resumed or (index+1)%25==0 or index+1==len(samples) or time.perf_counter()-last>=15:
                 eta=elapsed*(len(samples)-index-1)/(index+1-resumed)
-                print(f"VIS GPU{job['gpu']} prune={job['prune_rate']} {index+1}/{len(samples)} elapsed={elapsed:.1f}s ETA={eta:.1f}s",flush=True)
+                print(f"VIS GPU{job['gpu']} {mode} prune={job['prune_rate']} {index+1}/{len(samples)} elapsed={elapsed:.1f}s ETA={eta:.1f}s",flush=True)
                 last=time.perf_counter()
-    common.save_csv(folder/'image_index.csv',rows,('index','question_id','gt','answer','output','base_kept','anyres_kept',
+    common.save_csv(folder/'image_index.csv',rows,('index','question_id','gt','answer','selection_mode','output','base_kept','anyres_kept',
         'baseline_packed_tokens','pre_llm_tokens','post_distill_tokens','protected_newlines'))
     return dict(complete=True,samples=len(rows),resumed_samples=resumed,fresh_samples=len(rows)-resumed,pngs=len(rows),lat_mem_benchmark=False)
 
 
 def worker(manifest,job_id):
     spec=json.loads(manifest.read_text(encoding='utf-8'));verify(spec)
-    job=next(j for j in spec['jobs'] if j['job_id']==job_id);folder=manifest.parent/job_id;folder.mkdir(exist_ok=True)
+    job=next(j for j in spec['jobs'] if j['job_id']==job_id);folder=job_folder(manifest.parent,job);folder.mkdir(parents=True,exist_ok=True)
     report=dict(job_id=job_id,status='failed',complete=False,input_sha256=spec['input_sha256'],gpu=job['gpu'])
     try:
         if os.environ.get('CUDA_VISIBLE_DEVICES')!=job['gpu']: raise ValueError('Wrong visible GPU')
@@ -212,17 +277,13 @@ def worker(manifest,job_id):
         if student_identity(spec['checkpoint']['path'],'visa')!=spec['checkpoint']: raise ValueError('Student changed')
         import torch
         from llava_pruning.backend import LlavaBackend
-        from llava_pruning.pool_distill import PoolDistillMethod
-        from runMyPruningPoolSpatial import MethodSettings
         torch.manual_seed(spec['seed'])
         backend=LlavaBackend(spec['model_path'],'anyres_max_9',image_token_order='base_first')
         common.validate_single_gpu(backend.model,torch);core=backend.model.get_model()
         if len(core.layers)!=28: raise ValueError('Expected 28 LLM layers')
         device=torch.cuda.get_device_properties(0)
         common.verify_runtime(folder,backend.inference_config,device.name,device.total_memory)
-        method=PoolDistillMethod(core,spec['checkpoint']['path'],rate=job['prune_rate'],share=.7,mode='base_full',
-            settings=MethodSettings(prune_rate=0,redundancy_layers=(26,),visionzip_layers=(26,),allocation_temperature=.05,spatial_strength=0.),
-            pruning_audit='lean',tail_drop_layers=9,predictor_input='base_text',base_mapping='fast',base_policy='anyres_first')
+        method=make_method(core,spec['checkpoint']['path'],job['prune_rate'],job.get('selection_mode','baseline'))
         report.update(inference=backend.inference_config,source_identity=common.source_identity(),
             **render_samples(backend,method,samples,spec,job,folder));report['status']='success'
     except Exception as error: report['error']=f'{type(error).__name__}: {error}';traceback.print_exc()
@@ -241,12 +302,12 @@ def run(args):
         while active or any(queues.values()):
             for gpu,queue in queues.items():
                 while gpu not in active and queue:
-                    job=queue.popleft();folder=output/job['job_id'];marker=folder/'status.json'
+                    job=queue.popleft();folder=job_folder(output,job);marker=folder/'status.json'
                     old=json.loads(marker.read_text(encoding='utf-8')) if marker.is_file() else {}
                     if old.get('complete') and old.get('status')=='success':
                         if old.get('input_sha256')!=spec['input_sha256'] or old.get('job_id')!=job['job_id']:
                             raise ValueError('Saved completed images belong to another input/job')
-                        if len(restored(folder,samples_for(spec)))!=spec['sample_count']: raise ValueError('Incomplete completed PNG set')
+                        if len(restored(folder,samples_for(spec),job.get('selection_mode','baseline')))!=spec['sample_count']: raise ValueError('Incomplete completed PNG set')
                         print(f"Reuse complete {job['job_id']}",flush=True);continue
                     logpath=output/(job['job_id']+'.log');log=logpath.open('a',encoding='utf-8')
                     command=[sys.executable,'-u',str(PROJECT/'visualize_mvtec_baseline.py'),'--worker',job['job_id'],'--manifest',str(output/'run.json')]
@@ -259,12 +320,12 @@ def run(args):
                 code=process.poll()
                 if code is None: continue
                 process.wait();log.close();del active[gpu]
-                marker=output/job['job_id']/'status.json';report=json.loads(marker.read_text(encoding='utf-8')) if marker.is_file() else {}
+                marker=job_folder(output,job)/'status.json';report=json.loads(marker.read_text(encoding='utf-8')) if marker.is_file() else {}
                 if code or report.get('status')!='success' or not report.get('complete'): failures.append(job['job_id'])
                 print(f"Finish GPU{gpu}: {job['job_id']}; exit={code}; elapsed={time.perf_counter()-started:.1f}s",flush=True)
             if time.perf_counter()-last>=30:
                 for gpu,(_,_,job,started) in active.items():
-                    count=len(common.read_prefix(output/job['job_id']/'predictions.jsonl')[0])
+                    count=len(common.read_prefix(job_folder(output,job)/'predictions.jsonl')[0])
                     print(f"GPU{gpu} {job['job_id']}: {count}/{spec['sample_count']} saved; elapsed={time.perf_counter()-started:.0f}s; ETA in log",flush=True)
                 last=time.perf_counter()
             if active: time.sleep(.25)

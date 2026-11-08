@@ -1,9 +1,48 @@
 # 全量MVTec：基准模式50/70%，每样本一张三栏图
 
 入口 `visualize_mvtec_baseline.py`。使用输入JSON的全部记录，不限制100张、不筛ID或正常/异常。
-固定沿用已确认的基准：MyPool LLM前剪枝＋第2层后蒸馏，lambda=.7，base_full、base_text、
+默认沿用已确认的基准：MyPool LLM前剪枝＋第2层后蒸馏，lambda=.7，base_full、base_text、
 fast映射、lean、anyres_first、tail9、AnyRes max9、v0、greedy。
-沿用当前LLaVA主干的FP16/FlashAttention2及已有剪枝实现，不重新训练或切换评分分支。
+沿用当前LLaVA主干的FP16/FlashAttention2及已有剪枝实现，不重新训练。
+
+## 同时对比Base映射与联合自身评分
+
+```bash
+python visualize_mvtec_baseline.py \
+  --gpus 5 6 \
+  --prune-rates 50 70 \
+  --selection-modes baseline joint_self \
+  --output-dir output/mvtec_base_vs_joint_compact_50_70_gpu56_01
+```
+
+共4组：两种模式各跑50/70%，都是完整MVTec。GPU5先baseline50再joint_self50，
+GPU6先baseline70再joint_self70，每张卡最多一个活动任务。
+
+| 模式 | 旁路输入 | 蒸馏阶段评分与选择 |
+|---|---|---|
+| baseline | Base＋Text | Base分数映射到AnyRes，anyres_first |
+| joint_self | Base＋AnyRes＋Text | 每个Base/AnyRes空间token使用其自身预测attention，合在一起统一Top-k，无固定两组配额 |
+
+joint_self同样保留MyPool前置、lambda=.7、tail9和原两阶段层平均预算；
+图像仍在tail删除前捕获。这里用的是现有蒸馏旁路的预测attention，不读取原生第22层attention。
+两种模式图片标题分别标Baseline或Joint self-attention Top-k，逐题记录及图像索引也标selection_mode。
+
+基准图片仍在 `<output>/prune_50/visualizations/`、`prune_70/visualizations/`，
+新增组放在 `<output>/joint_self/prune_50/visualizations/`、`joint_self/prune_70/visualizations/`。
+只跑新增组时使用 `--selection-modes joint_self`，其它路径及配置默认不变。
+
+如果上一条仅基准的命令已经运行，请在它结束后，直接追加新增组：
+
+```bash
+python visualize_mvtec_baseline.py \
+  --resume --add-joint-self \
+  --output-dir output/mvtec_baseline_compact_50_70_gpu56_01
+```
+
+恢复原目录保存的GPU5/6、输入、权重、50/70%和基准进度，再追加joint_self两组。
+已完成的基准PNG不会重跑；有未完成的基准组时，先在相应卡补完它，再运行新增组。
+`--add-joint-self`重复执行不会重复添加任务，兼容上一版1.0的基准清单。
+每个目录只运行一个入口；让此前的入口退出后再恢复/追加，避免两套入口在同卡同时加载模型。
 
 ## 查询之前是否生成过
 

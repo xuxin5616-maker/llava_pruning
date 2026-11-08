@@ -18,13 +18,12 @@ import torch
 import visualize_mvtec_baseline as entry
 import benchmark_visa_methods as common
 from llava_pruning.pool_compact_visualization import render_compact
-from llava_pruning.pool_distill import PoolDistillMethod,source_records
+from llava_pruning.pool_distill import source_records
 from llava_pruning.backend import LlavaBackend
 from llava import mm_utils
 from llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor
 from test_pool_ablations import model_and_options
 from test_attention_predictor import make_checkpoint
-from runMyPruningPoolSpatial import MethodSettings
 
 
 def fixture(root):
@@ -62,9 +61,8 @@ class CompactTests(unittest.TestCase):
                     core=SimpleNamespace(config=SimpleNamespace(mm_patch_merge_type='spatial_unpad')),
                     plan=dict(pre_llm_tokens=len(records),final_llm_tokens=len(selected),baseline_packed_tokens=729*len(decisions)+newlines))
                 trace=dict(pixels=pixels,selected=torch.tensor(selected));height=grid[1]*384
-                with patch('llava_pruning.pool_lean.export_source_decisions',side_effect=lambda x:x):
-                    image,details=render_compact(SimpleNamespace(adapter=adapter),trace,SigLipImageProcessor(),
-                        {'answer':'B'},SimpleNamespace(image=original,sample_id='000000048',gt=0),50,height)
+                image,details=render_compact(SimpleNamespace(adapter=adapter),trace,SigLipImageProcessor(),
+                    {'answer':'B'},SimpleNamespace(image=original,sample_id='000000048',gt=0),50,height)
                 self.assertEqual(details['native_grid'],list(grid))
                 self.assertEqual(details['base_kept'],1);self.assertEqual(details['anyres_kept'],len(decisions)-1)
                 panels=[image.crop(box) for box in details['panels']]
@@ -86,6 +84,7 @@ class CompactTests(unittest.TestCase):
     def test_real_full_input_generation_saves_one_png_each_and_resume_does_not_regenerate(self):
         with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
             root=Path(temporary);args=fixture(root)
+            args.selection_modes=['baseline','joint_self']
             torch.manual_seed(733);model,options=model_and_options(28);core=model.get_model()
             core.config.max_position_embeddings=4096
             make_checkpoint(args.checkpoint,core)
@@ -98,19 +97,29 @@ class CompactTests(unittest.TestCase):
             with patch.object(model,'generate',side_effect=short_generate),patch.object(torch.cuda,'synchronize'),\
                     patch.object(mm_utils,'tokenizer_image_token',return_value=options['inputs'][0]):
                 for job in spec['jobs']:
-                    method=PoolDistillMethod(core,args.checkpoint,rate=job['prune_rate'],share=.7,mode='base_full',
-                        settings=MethodSettings(prune_rate=0,redundancy_layers=(26,),visionzip_layers=(26,),allocation_temperature=.05,spatial_strength=0.),
-                        pruning_audit='lean',tail_drop_layers=9,predictor_input='base_text',base_mapping='fast',base_policy='anyres_first')
+                    mode=job['selection_mode'];config=entry.mode_configuration(mode)
+                    method=entry.make_method(core,args.checkpoint,job['prune_rate'],mode)
+                    self.assertEqual((method.mode,method.predictor_input,method.base_policy,method.tail_drop_layers),
+                        (config['selection_mode'],config['predictor_input'],config['base_policy'],9))
+                    method.configure(core,job['prune_rate'],capture_visualization=False,capture_attention=False)
                     first_call=len(sequences)
-                    report=entry.render_samples(backend,method,samples,spec,job,output/job['job_id'])
+                    folder=entry.job_folder(output,job)
+                    with patch.object(core.attention_predictor,'forward',wraps=core.attention_predictor.forward) as predict:
+                        report=entry.render_samples(backend,method,samples,spec,job,folder)
+                    self.assertEqual(predict.call_count,2)
+                    if mode=='joint_self':
+                        self.assertTrue(all(d['cluster_assignments'] is None for d in method.adapter.device_decisions))
+                    expected_input=method.adapter.plan['pre_llm_tokens'] if mode=='joint_self' else len(method.adapter.base)
+                    self.assertEqual(predict.call_args.args[0].shape[1],expected_input+4)
                     self.assertEqual(len(sequences)-first_call,2)
                     self.assertEqual((report['samples'],report['fresh_samples'],report['pngs']),(2,2,2))
-                    rows=entry.restored(output/job['job_id'],samples)
+                    rows=entry.restored(folder,samples,mode)
+                    self.assertTrue(all(r['selection_mode']==mode for r in rows))
                     self.assertEqual({r['gt'] for r in rows},{0,1})
-                    self.assertEqual(len(list((output/job['job_id']).rglob('*.png'))),2)
+                    self.assertEqual(len(list(folder.rglob('*.png'))),2)
                     self.assertTrue(all(r['post_distill_tokens']>0 and 'before tail9' in r['post_snapshot'] for r in rows))
                     self.assertTrue(all(r['post_distill_tokens']==r['base_kept']+r['anyres_kept']+r['protected_newlines'] for r in rows))
-                    again=entry.render_samples(backend,method,samples,spec,job,output/job['job_id'])
+                    again=entry.render_samples(backend,method,samples,spec,job,folder)
                     self.assertEqual(again['fresh_samples'],0);self.assertEqual(len(sequences)-first_call,2)
                     with torch.inference_mode(),method.generation_context(model):
                         reference=backend.generate(samples[0],samples[0].source['prompt'],method,job['prune_rate'],'anyres_max_9',
@@ -119,7 +128,7 @@ class CompactTests(unittest.TestCase):
                     self.assertTrue(torch.equal(sequences[first_call],sequences[-1]))
                     self.assertEqual(rows[0]['answer'],reference['answer'])
                     self.assertEqual(reference['stats']['final_llm_visual_tokens'],0)  # actual model still tail9
-            self.assertEqual(len(list(output.rglob('*.png'))),4)
+            self.assertEqual(len(list(output.rglob('*.png'))),8)
             self.assertNotIn('select',method.adapter.__dict__)
 
     def test_two_gpu_launcher_full_input_and_completed_resume(self):
@@ -129,18 +138,18 @@ class CompactTests(unittest.TestCase):
                 def __init__(self,command,kwargs):
                     manifest=Path(command[command.index('--manifest')+1]);self.spec=json.loads(manifest.read_text(encoding='utf-8'))
                     self.job=next(j for j in self.spec['jobs'] if j['job_id']==command[command.index('--worker')+1])
-                    self.gpu=kwargs['env']['CUDA_VISIBLE_DEVICES'];self.folder=manifest.parent/self.job['job_id'];self.polls=0
+                    self.gpu=kwargs['env']['CUDA_VISIBLE_DEVICES'];self.folder=entry.job_folder(manifest.parent,self.job);self.polls=0
                     self.done=False;self.assertion=self.gpu==self.job['gpu'];assert self.assertion and self.gpu not in busy
                     busy.add(self.gpu);peak[0]=max(peak[0],len(busy));calls.append(self.job)
                 def poll(self):
                     if self.done: return 0
                     self.polls+=1
                     if self.polls==1: return None
-                    self.done=True;busy.remove(self.gpu);self.folder.mkdir();(self.folder/'visualizations').mkdir()
+                    self.done=True;busy.remove(self.gpu);self.folder.mkdir(parents=True);(self.folder/'visualizations').mkdir()
                     samples=entry.samples_for(self.spec);rows=[]
                     for i,sample in enumerate(samples):
                         name=f'visualizations/sample_{i:09d}.png';Image.new('RGB',(10,10),'white').save(self.folder/name)
-                        rows.append(dict(index=i,question_id=sample.sample_id,gt=sample.gt,answer='B',output=name))
+                        rows.append(dict(index=i,question_id=sample.sample_id,gt=sample.gt,answer='B',output=name,selection_mode=self.job['selection_mode']))
                     (self.folder/'predictions.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows),encoding='utf-8')
                     common.save_json(self.folder/'status.json',dict(job_id=self.job['job_id'],complete=True,status='success',input_sha256=self.spec['input_sha256']))
                     return 0
@@ -150,6 +159,33 @@ class CompactTests(unittest.TestCase):
                 self.assertEqual([(j['prune_rate'],j['gpu']) for j in calls],[(50,'5'),(70,'6')])
                 args.resume=True;args.gpus=[0]
                 self.assertEqual(entry.run(args),0);self.assertEqual(len(calls),2)
+                preserved={p:p.read_bytes() for p in args.output_dir.rglob('*.png')}
+                args.add_joint_self=True
+                self.assertEqual(entry.run(args),0);self.assertEqual(len(calls),4)
+                self.assertEqual([(j['selection_mode'],j['prune_rate'],j['gpu']) for j in calls[2:]],
+                    [('joint_self',50,'5'),('joint_self',70,'6')])
+                self.assertEqual({p:p.read_bytes() for p in preserved},preserved)
+                self.assertEqual(entry.run(args),0);self.assertEqual(len(calls),4)
+
+    def test_four_jobs_two_mode_configs_and_legacy_baseline_manifest_compatibility(self):
+        with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
+            args=fixture(Path(temporary));args.selection_modes=['baseline','joint_self']
+            output,spec=entry.setup(args);entry.verify(spec)
+            self.assertEqual(len(spec['jobs']),4)
+            self.assertEqual([(j['selection_mode'],j['prune_rate'],j['gpu']) for j in spec['jobs']],
+                [('baseline',50,'5'),('baseline',70,'6'),('joint_self',50,'5'),('joint_self',70,'6')])
+            config=spec['mode_configurations']['joint_self']
+            self.assertEqual((config['selection_mode'],config['predictor_input'],config['base_policy']),('anyres_self','full','joint'))
+            self.assertEqual((config['distill_share'],config['tail_drop_layers']),(.7,9))
+            spec['jobs']=spec['jobs'][:2]
+            for job in spec['jobs']:
+                for key in ('folder','selection_mode'): job.pop(key)
+            for key in ('selection_modes','mode_configurations'): spec.pop(key)
+            spec['version']=entry.LEGACY_VERSION;common.save_json(output/'run.json',spec)
+            entry.verify(spec);args.resume=True;args.add_joint_self=True
+            _,updated=entry.setup(args)
+            self.assertEqual(len(updated['jobs']),4)
+            self.assertEqual(updated['jobs'][:2],spec['jobs'])
 
     def test_preflight_and_existing_query_are_read_only_and_distinguish_training_dataset_names(self):
         with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
@@ -178,6 +214,8 @@ class CompactTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding='utf-8'),json.dumps(row)+'\n')
             path.write_text(json.dumps(row),encoding='utf-8');entry.restored(folder,samples)
             self.assertTrue(path.read_bytes().endswith(b'\n'))
+            with self.assertRaisesRegex(ValueError,'selection mode changed'):
+                entry.restored(folder,samples,'joint_self')
 
     def test_interrupt_stops_both_workers_and_closes_logs(self):
         with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):

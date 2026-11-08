@@ -12,15 +12,28 @@ def font(size):
         except TypeError: return ImageFont.load_default()
 
 
+def anchor_decisions(decisions):
+    """Export ONLY actual retained anchors; lean self mode omits merge maps.
+
+    Merge members never change packed anchor order and are intentionally
+    white in this visualization. An empty membership list is used solely by
+    the shared anchor-mask packer; it does not replace model provenance.
+    """
+    def indices(value):
+        return value.detach().cpu().tolist() if hasattr(value,'detach') else list(value)
+    return [dict(dominant_indices=indices(d['dominant_indices']),
+                 contextual_indices=indices(d['contextual_indices']),cluster_assignments=[])
+            for d in decisions]
+
+
 def render_compact(method,trace,processor,result,sample,rate,panel_height=768):
-    from .pool_lean import export_source_decisions
     from .visualization import prediction_caption
     if type(panel_height) is not int or panel_height<1: raise ValueError('panel-height must be positive')
     if 'pixels' not in trace or 'selected' not in trace:
         raise RuntimeError('Missing actual encoder input or pre-tail distillation selection')
     adapter=method.adapter;grid=tuple(adapter.geometry.grid);width,height=grid
     views=input_rgb(trace['pixels'],processor)
-    decisions=export_source_decisions(adapter.device_decisions)
+    decisions=anchor_decisions(adapter.device_decisions)
     selected=trace['selected'].cpu().tolist()
     before,after,newlines=anchor_masks(decisions,grid,selected,
         final_newline=adapter.core.config.mm_patch_merge_type.endswith('_add_newl'))
@@ -44,7 +57,8 @@ def render_compact(method,trace,processor,result,sample,rate,panel_height=768):
         margin,gap,header,footer=20,24,100,36
         canvas=Image.new('RGB',(2*margin+sum(p.width for p in scaled)+2*gap,header+panel_height+footer),'white')
         draw=ImageDraw.Draw(canvas)
-        draw.text((margin,10),f'Baseline | Avg pruning {rate:g}% | lambda=0.7 | ID: {sample.sample_id}',fill='black',font=font(20))
+        title='Joint self-attention Top-k' if getattr(method,'base_policy','anyres_first')=='joint' else 'Baseline'
+        draw.text((margin,10),f'{title} | Avg pruning {rate:g}% | lambda=0.7 | ID: {sample.sample_id}',fill='black',font=font(20))
         draw.text((margin,40),prediction_caption(sample.gt,result['answer'])+' | After MyPool + distillation, BEFORE tail9',fill='black',font=font(16))
         labels=('Original',f'Base (pruned; {int(after[0].sum())}/729)',
                 f'AnyRes (pruned; {width} x {height}; {int(after[1:].sum())}/{729*(len(views)-1)})')
