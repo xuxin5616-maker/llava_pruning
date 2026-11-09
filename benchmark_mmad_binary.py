@@ -48,8 +48,8 @@ def parser():
     devices.add_argument("--gpu", default="5", help="One physical GPU (default5); trials run sequentially")
     devices.add_argument("--gpus", nargs="+", type=int, help="Physical GPU IDs, e.g. 5 6 7; at most one trial per GPU")
     p.add_argument("--prune-rates", nargs="+", type=int, choices=(50,70,90), default=[50,70,90])
-    p.add_argument("--experiment-group", choices=("all","base_guided","joint_self"), default="all",
-                   help="Select all methods or one hybrid group; always includes the unpruned reference")
+    p.add_argument("--experiment-group", choices=("all", "baselines", "base_guided", "joint_self"), default="all",
+                   help="Select all methods, six pruning baselines, or one hybrid group; includes the unpruned reference")
     p.add_argument("--base-guided-tail", type=int, choices=range(27), default=9, metavar="0..26",
                    help="Extra final layers without image tokens for base_guided only (default9; 0 disables)")
     p.add_argument("--joint-self-tails", type=int, nargs="+", choices=range(27), default=[0], metavar="0..26",
@@ -173,7 +173,8 @@ def setup(args):
     if args.resume:
         spec = json.loads((output/"run.json").read_text(encoding="utf-8"))
         source_check=verify_inputs(spec)
-        if student_identity(spec["checkpoint"]["path"],"visa")!=spec["checkpoint"]:
+        saved_student = spec["checkpoint"]
+        if saved_student["path"] is not None and student_identity(saved_student["path"], "visa") != saved_student:
             raise ValueError("Saved VisA student or training provenance changed")
         if "mmad_source_identity" not in spec:
             backup=output/"run.before_scoped_source.json"
@@ -184,15 +185,21 @@ def setup(args):
         # All options, including per-trial GPU assignments, are restored.
         return output,spec
     if args.reuse_dir:
+        if args.experiment_group == "baselines":
+            raise ValueError("Use a fresh directory for --experiment-group baselines, or --resume that run")
         from llava_pruning.mmad_extension import setup_extension
         output,spec=setup_extension(args,sys.modules[__name__])
         record_source_identity(spec)
         common.save_json(output/"run.json",spec)
         return output,spec
     gpus=[str(gpu) for gpu in args.gpus] if args.gpus is not None else [str(args.gpu)]
-    jobs=schedule(args.prune_rates,gpus,experiment_group=args.experiment_group,
+    baselines_only = args.experiment_group == "baselines"
+    group = "all" if baselines_only else args.experiment_group
+    jobs=schedule(args.prune_rates,gpus,experiment_group=group,
                   base_guided_tail=args.base_guided_tail,include_visa=args.include_visa,
                   joint_self_tails=args.joint_self_tails)
+    if baselines_only:
+        jobs = [job for job in jobs if job["method"] != "hybrid_baseline"]
     if (args.warmup<0 or not 0<=args.seed<2**32 or
             len(set(args.prune_rates))!=len(args.prune_rates)):
         raise ValueError("Invalid GPU, seed, warmup or pruning rates")
@@ -204,7 +211,7 @@ def setup(args):
     model = Path(args.model_path).expanduser().resolve()
     if json.loads((model/"config.json").read_text(encoding="utf-8")).get("num_hidden_layers")!=28:
         raise ValueError("The matched pruning schedules require the existing 28-layer Qwen2 model")
-    checkpoint = student_identity(args.checkpoint,"visa")
+    checkpoint = {"path": None} if baselines_only else student_identity(args.checkpoint, "visa")
     from PIL import Image
     images = {}
     for row in records:
@@ -242,6 +249,14 @@ def setup(args):
             "parallelism":"Fixed round-robin trial-to-GPU assignment, one fresh single-GPU process per trial, at most one active trial per GPU. All processes share the same frozen questions; only parent writes aggregate CSV. Per-GPU performance is recorded, not normalized across devices.",
             "units_csv":"acc/pre/recall/tnr/bacc/f1/mmad_score/relative_accuracy_pct are percentages; Lat is mean TTFT in ms; mem is full-generation peak allocated GiB."})
     apply_source_policy(spec)
+    if baselines_only:
+        spec["training_overlap"] = dict(
+            declared_student_training_source=None,
+            excluded_eval_sources=info["excluded_sources"],
+            evaluated_sources=sorted(info["source_counts"]),
+        )
+        for key in ("hybrid", "hybrid_joint_self", "training_overlap"):
+            spec["definitions"].pop(key, None)
     record_source_identity(spec)
     common.save_json(output/"run.json",spec)
     describe(info)
@@ -443,12 +458,20 @@ def write_reports(output, spec):
 def run(args):
     if args.check_data: return check_data(args)
     output,spec=setup(args);write_reports(output,spec)
+    student = spec["checkpoint"]["path"]
+    hybrid_settings = (
+        f"base_guided_tail={spec['base_guided_tail']}, joint_self_tails={spec.get('joint_self_tails', [0])}, "
+        if student is not None else ""
+    )
     print(f"GPUs {spec['gpus']}, one trial per GPU, group={spec['experiment_group']}, "
-          f"base_guided_tail={spec['base_guided_tail']}, joint_self_tails={spec.get('joint_self_tails',[0])}, "
-          f"{len(spec['jobs'])} report rows, no PNG; "
-          f"VisA-trained student={spec['checkpoint']['path']}",flush=True)
-    print("All four MMAD sources included; hybrid VisA scores have student-training overlap."
-          if spec.get("include_visa") else "VisA is excluded from EVERY trial and the unpruned reference; see run.json and summary_by_source.csv.",flush=True)
+          f"{hybrid_settings}{len(spec['jobs'])} report rows, no PNG; "
+          f"student={student if student is not None else 'none'}",flush=True)
+    if spec.get("include_visa"):
+        overlap = " Hybrid VisA scores have student-training overlap." if student is not None else ""
+        print("All four MMAD sources included." + overlap, flush=True)
+    else:
+        print("VisA is excluded from every trial and the unpruned reference; see run.json and summary_by_source.csv.",
+              flush=True)
     queues={gpu:deque() for gpu in spec["gpus"]}
     for job in spec["jobs"]:
         if job["status"]=="unreachable":

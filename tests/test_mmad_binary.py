@@ -415,6 +415,27 @@ class MMADDataTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 entry.schedule([50],experiment_group=group,base_guided_tail=tail)
 
+    def test_baselines_group_runs_without_student_and_restores_four_gpu_schedule(self):
+        with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
+            root = Path(temporary)
+            args = entry.parser().parse_args([
+                "--experiment-group", "baselines", "--gpus", "0", "1", "2", "3",
+                "--checkpoint", str(root / "missing.pt"),
+            ], namespace=fixture(root))
+            output, spec = entry.setup(args)
+            self.assertIsNone(spec["checkpoint"]["path"])
+            self.assertEqual(spec["dataset_info"]["excluded_sources"], ["VisA"])
+            self.assertEqual({job["method"] for job in spec["jobs"]},
+                             {"llava_unpruned", "fastv", "visionzip", "pyramiddrop", "anchorprune", "clse", "priortr"})
+            self.assertEqual([job["job_id"] for job in spec["jobs"] if job["status"] == "unreachable"],
+                             ["pyramiddrop_90"])
+            pending = [job for job in spec["jobs"] if job["status"] == "pending"]
+            self.assertEqual(len(pending), 18)
+            self.assertEqual([job["gpu"] for job in pending], [str(index % 4) for index in range(18)])
+            args.resume = True
+            args.experiment_group = "all"
+            self.assertEqual(entry.setup(args), (output, spec))
+
     def test_selected_base_tail0_launcher_exports_four_rows_and_resume_restores_options(self):
         with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
             args=fixture(Path(temporary))
