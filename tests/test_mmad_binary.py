@@ -436,6 +436,45 @@ class MMADDataTests(unittest.TestCase):
             args.experiment_group = "all"
             self.assertEqual(entry.setup(args), (output, spec))
 
+    def test_stretched_mmad_inputs_keep_six_baselines_and_only_two_requested_hybrids(self):
+        from types import SimpleNamespace
+        from llava.mm_utils import process_images
+        from llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor
+
+        with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
+            root = Path(temporary)
+            args = entry.parser().parse_args([
+                "--experiment-group", "baselines_joint90", "--joint-self-tails", "8", "9",
+                "--resize-mode", "stretch", "--gpus", "0", "1", "2",
+            ], namespace=fixture(root))
+            config = dict(num_hidden_layers=28, image_grid_pinpoints=[[384, 384], [1152, 1152]],
+                          image_aspect_ratio="anyres_max_9", mm_patch_merge_type="spatial_unpad")
+            common.save_json(Path(args.model_path) / "config.json", config)
+            original = Path(args.data_root) / "DS-MVTec/object/image/good/000.png"
+            Image.new("RGB", (128, 64), "red").save(original)
+            output, spec = entry.setup(args)
+            self.assertEqual(spec["dataset_info"]["excluded_sources"], ["VisA"])
+            self.assertEqual(spec["resize_mode"], "stretch")
+            hybrids = [job for job in spec["jobs"] if job["method"] == "hybrid_baseline"]
+            self.assertEqual([(job["variant"], job["prune_rate"], job["tail_drop_layers"]) for job in hybrids],
+                             [("joint_self", 90, 8), ("joint_self", 90, 9)])
+            pending = [job for job in spec["jobs"] if job["status"] == "pending"]
+            self.assertEqual(len(pending), 20)
+            self.assertEqual([job["gpu"] for job in pending], [str(i % 3) for i in range(20)])
+            self.assertTrue(all("resize=stretch;canvas=1152;grid=3x3" in job["config"] for job in spec["jobs"]))
+            samples = load_frozen(spec["input_json"], exclude_sources=("VisA",))
+            sample = next(s for s in samples if s.source["original_resolved_image"] == str(original.resolve()))
+            self.assertEqual(sample.source["transform"]["original_size"], [128, 64])
+            with Image.open(original) as image:
+                self.assertEqual(image.size, (128, 64))
+            with Image.open(sample.image) as image:
+                self.assertEqual(image.size, (1152, 1152))
+                self.assertEqual(image.getpixel((0, 0)), (255, 0, 0))
+                views = process_images([image], SigLipImageProcessor(), SimpleNamespace(**config))
+                self.assertEqual(tuple(views.shape), (1, 10, 3, 384, 384))
+            args.resume = True
+            self.assertEqual(entry.setup(args), (output, spec))
+
     def test_selected_base_tail0_launcher_exports_four_rows_and_resume_restores_options(self):
         with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
             args=fixture(Path(temporary))

@@ -48,8 +48,11 @@ def parser():
     devices.add_argument("--gpu", default="5", help="One physical GPU (default5); trials run sequentially")
     devices.add_argument("--gpus", nargs="+", type=int, help="Physical GPU IDs, e.g. 5 6 7; at most one trial per GPU")
     p.add_argument("--prune-rates", nargs="+", type=int, choices=(50,70,90), default=[50,70,90])
-    p.add_argument("--experiment-group", choices=("all", "baselines", "base_guided", "joint_self"), default="all",
-                   help="Select all methods, six pruning baselines, or one hybrid group; includes the unpruned reference")
+    p.add_argument("--experiment-group", choices=("all", "baselines", "baselines_joint90", "base_guided", "joint_self"),
+                   default="all", help="baselines_joint90: six pruning baselines plus joint_self at 90%%; "
+                   "always includes the unpruned reference")
+    p.add_argument("--resize-mode", choices=("native", "stretch"), default="native",
+                   help="stretch: BICUBIC resize to 1152 square for one Base and nine AnyRes crops")
     p.add_argument("--base-guided-tail", type=int, choices=range(27), default=9, metavar="0..26",
                    help="Extra final layers without image tokens for base_guided only (default9; 0 disables)")
     p.add_argument("--joint-self-tails", type=int, nargs="+", choices=range(27), default=[0], metavar="0..26",
@@ -168,6 +171,45 @@ def make_trial_method(job, core, checkpoint):
     return make_method(job["method"],core,job["prune_rate"],checkpoint)
 
 
+def prepare_stretched_images(records, output, model_config):
+    """Use the same fixed-grid input transform as the VisA stretch experiment."""
+    from tempfile import TemporaryDirectory
+    from types import SimpleNamespace
+
+    from PIL import Image
+    from benchmark_visa_grid3 import CANVAS, resize_image, validate_grid
+
+    validate_grid(SimpleNamespace(**model_config))
+    unique_paths = dict.fromkeys(Path(row["resolved_image"]) for row in records)
+    images = {}
+    target = output / "prepared_images"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+    with TemporaryDirectory(prefix=".mmad-stretch-", dir=output.parent) as temp:
+        prepared = Path(temp) / target.name
+        prepared.mkdir()
+        for index, path in enumerate(unique_paths, start=1):
+            name = f"{index:06d}.png"
+            with Image.open(path) as original:
+                image, transform = resize_image(original, "stretch")
+            with image:
+                image.save(prepared / name, compress_level=1)
+            stat = (prepared / name).stat()
+            images[path] = dict(
+                resolved_image=str(target / name), original_resolved_image=str(path),
+                image_size=[CANVAS, CANVAS], image_bytes=stat.st_size, image_mtime_ns=stat.st_mtime_ns,
+                transform=transform,
+            )
+            if index == 1 or index % 100 == 0 or index == len(unique_paths):
+                elapsed = time.perf_counter() - started
+                eta = elapsed * (len(unique_paths) - index) / index
+                print(f"Prepare MMAD stretch {index}/{len(unique_paths)} ETA={eta:.1f}s", flush=True)
+        output.mkdir(parents=True, exist_ok=True)
+        prepared.rename(target)
+    for row in records:
+        row.update(images[Path(row["resolved_image"])])
+
+
 def setup(args):
     output = args.output_dir.expanduser().resolve()
     if args.resume:
@@ -185,8 +227,10 @@ def setup(args):
         # All options, including per-trial GPU assignments, are restored.
         return output,spec
     if args.reuse_dir:
-        if args.experiment_group == "baselines":
-            raise ValueError("Use a fresh directory for --experiment-group baselines, or --resume that run")
+        previous = json.loads((args.reuse_dir.expanduser() / "run.json").read_text(encoding="utf-8"))
+        if (args.experiment_group in {"baselines", "baselines_joint90"}
+                or args.resize_mode != "native" or previous.get("resize_mode", "native") != "native"):
+            raise ValueError("Use a fresh directory for the selected resize or experiment group, or --resume that run")
         from llava_pruning.mmad_extension import setup_extension
         output,spec=setup_extension(args,sys.modules[__name__])
         record_source_identity(spec)
@@ -194,12 +238,22 @@ def setup(args):
         return output,spec
     gpus=[str(gpu) for gpu in args.gpus] if args.gpus is not None else [str(args.gpu)]
     baselines_only = args.experiment_group == "baselines"
-    group = "all" if baselines_only else args.experiment_group
+    baselines_joint90 = args.experiment_group == "baselines_joint90"
+    if baselines_joint90 and 90 not in args.prune_rates:
+        raise ValueError("--experiment-group baselines_joint90 requires 90 in --prune-rates")
+    # Filter at setup so existing job identities and inference fingerprints stay valid.
+    group = "all" if baselines_only or baselines_joint90 else args.experiment_group
     jobs=schedule(args.prune_rates,gpus,experiment_group=group,
                   base_guided_tail=args.base_guided_tail,include_visa=args.include_visa,
                   joint_self_tails=args.joint_self_tails)
     if baselines_only:
         jobs = [job for job in jobs if job["method"] != "hybrid_baseline"]
+    elif baselines_joint90:
+        jobs = [job for job in jobs if job["method"] != "hybrid_baseline"
+                or (job.get("variant") == "joint_self" and job["prune_rate"] == 90)]
+        for index, job in enumerate(job for job in jobs if job["status"] == "pending"):
+            job["gpu"] = gpus[index % len(gpus)]
+            job["config"] = job["config"].rsplit(";gpu=", 1)[0] + f";gpu={job['gpu']}"
     if (args.warmup<0 or not 0<=args.seed<2**32 or
             len(set(args.prune_rates))!=len(args.prune_rates)):
         raise ValueError("Invalid GPU, seed, warmup or pruning rates")
@@ -209,18 +263,26 @@ def setup(args):
     records,info = load_binary(args.data_root,args.annotations,args.image_root,args.seed,
         exclude_sources=() if args.include_visa else EXCLUDED_SOURCES,mvtec_root=args.mvtec_root)
     model = Path(args.model_path).expanduser().resolve()
-    if json.loads((model/"config.json").read_text(encoding="utf-8")).get("num_hidden_layers")!=28:
+    model_config = json.loads((model / "config.json").read_text(encoding="utf-8"))
+    if model_config.get("num_hidden_layers") != 28:
         raise ValueError("The matched pruning schedules require the existing 28-layer Qwen2 model")
     checkpoint = {"path": None} if baselines_only else student_identity(args.checkpoint, "visa")
-    from PIL import Image
-    images = {}
-    for row in records:
-        image_path = Path(row["resolved_image"])
-        if image_path not in images:
-            with Image.open(image_path) as image: size = list(image.size)
-            stat = image_path.stat()
-            images[image_path] = dict(image_size=size,image_bytes=stat.st_size,image_mtime_ns=stat.st_mtime_ns)
-        row.update(images[image_path])
+    if args.resize_mode == "stretch":
+        prepare_stretched_images(records, output, model_config)
+        for job in jobs:
+            job["config"] += ";resize=stretch;canvas=1152;grid=3x3"
+    else:
+        from PIL import Image
+
+        images = {}
+        for row in records:
+            image_path = Path(row["resolved_image"])
+            if image_path not in images:
+                with Image.open(image_path) as image:
+                    size = list(image.size)
+                stat = image_path.stat()
+                images[image_path] = dict(image_size=size, image_bytes=stat.st_size, image_mtime_ns=stat.st_mtime_ns)
+            row.update(images[image_path])
     output.mkdir(parents=True,exist_ok=True)
     input_path = output/"mmad_binary.jsonl"
     input_path.write_text("".join(json.dumps(r,ensure_ascii=False)+"\n" for r in records),encoding="utf-8")
@@ -249,6 +311,14 @@ def setup(args):
             "parallelism":"Fixed round-robin trial-to-GPU assignment, one fresh single-GPU process per trial, at most one active trial per GPU. All processes share the same frozen questions; only parent writes aggregate CSV. Per-GPU performance is recorded, not normalized across devices.",
             "units_csv":"acc/pre/recall/tnr/bacc/f1/mmad_score/relative_accuracy_pct are percentages; Lat is mean TTFT in ms; mem is full-generation peak allocated GiB."})
     apply_source_policy(spec)
+    if args.resize_mode == "stretch":
+        spec["resize_mode"] = "stretch"
+        spec["definitions"]["preprocessing"] = (
+            "RGB BICUBIC stretch to 1152x1152 before native preprocessing, with original checkpoint grid candidates. "
+            "Each query yields one Base and nine AnyRes crops. CPU resize and input-cache I/O are outside Lat/Mem."
+        )
+    if baselines_joint90:
+        spec["definitions"].pop("hybrid")
     if baselines_only:
         spec["training_overlap"] = dict(
             declared_student_training_source=None,
