@@ -22,12 +22,18 @@ from test_pool_ablations import model_and_options
 
 class BaseOnlyPruningTests(unittest.TestCase):
     def test_native_matched_masks_and_three_images(self):
+        self.check_native_matched_masks_and_three_images([], rate=70, kept=179)
+
+    def test_50_percent_layer_average_and_rate_specific_resume(self):
+        self.check_native_matched_masks_and_three_images(["--prune-rate", "50"], rate=50, kept=336)
+
+    def check_native_matched_masks_and_three_images(self, cli, *, rate, kept):
         threads = torch.get_num_threads()
         torch.set_num_threads(1)
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 args = fixture(Path(temporary))
-                args = entry.parser().parse_args([], namespace=args)
+                args = entry.parser().parse_args(cli, namespace=args)
                 for path in Path(args.data_root).glob("*.png"):
                     Image.new("RGB", (768, 384), (12, 44, 76)).save(path)
                 model, options = model_and_options(28)
@@ -39,6 +45,7 @@ class BaseOnlyPruningTests(unittest.TestCase):
                 save_student(args.checkpoint, student, student_precision="float32", backbone_depth=28,
                              teacher_layer=22, signature=backbone_signature(core.config))
                 output, spec = entry.setup(args)
+                self.assertEqual(spec["prune_rate"], rate)
                 samples = entry.samples_for(spec)
                 configure_image_mode(model.config, "base_only")
                 backend = LlavaBackend.__new__(LlavaBackend)
@@ -51,30 +58,38 @@ class BaseOnlyPruningTests(unittest.TestCase):
                         patch.object(model, "generate", side_effect=lambda **kw: native_generate(**dict(kw, max_new_tokens=2))), \
                         patch.object(torch.cuda, "synchronize"), torch.inference_mode():
                     for mode in entry.MODES:
-                        method = entry.BaseOnlyPruning(core, mode, args.checkpoint)
-                        self.assertEqual(method.target, 179)
+                        method = entry.BaseOnlyPruning(core, mode, args.checkpoint, prune_rate=spec["prune_rate"])
+                        self.assertEqual(method.target, kept)
                         with observe_prefill(core) as lengths:
                             entry.render_samples(backend, method, samples, spec, output / mode)
-                        expected = [733] * 28 if mode == "fastv" else [733] * 2 + [183] * 26
+                        expected = [733] * 28 if mode == "fastv" else [733] * 2 + [kept + 4] * 26
                         self.assertEqual(list(lengths.values()), expected)
                         self.assertEqual(model.config.image_aspect_ratio, "base_only")
                         self.assertNotIn("prepare_inputs_labels_for_multimodal", model.__dict__)
                         rows = entry.restored(output / mode, samples, mode)
-                        self.assertTrue(all(row["image_tokens"] == 729 and row["kept_tokens"] == 179 for row in rows))
+                        self.assertTrue(all(row["image_tokens"] == 729 and row["kept_tokens"] == kept for row in rows))
                         for row in rows:
                             with Image.open(output / mode / row["output"]) as image:
                                 rgb = np.asarray(image)
                                 self.assertEqual(image.size, (384, 384))
-                                self.assertEqual(np.all(rgb == 255, axis=2).sum(), 550 * 14 ** 2)
+                                self.assertEqual(np.all(rgb == 255, axis=2).sum(), (729 - kept) * 14 ** 2)
                                 self.assertTrue(np.all(rgb[378:, :, :] == [12, 44, 76]))
                         entry.render_samples(backend, method, samples, spec, output / mode)
                     self.assertEqual(model.generate.call_count, len(samples) * 2)
 
-                entry.comparison_images(output, samples)
+                entry.comparison_images(output, samples, prune_rate=spec["prune_rate"])
                 self.assertEqual(len(list(output.rglob("*.png"))), len(samples) * 3)
                 with Image.open(output / "comparisons" / "sample_000000000.png") as image:
                     self.assertEqual(image.size, (1600, 472))
                 args.resume = True
                 self.assertEqual(entry.setup(args), (output, spec))
+                args.prune_rate = 70 if rate == 50 else 50
+                with self.assertRaisesRegex(ValueError, "differs from the saved experiment"):
+                    entry.setup(args)
+                if rate == 70:
+                    args.prune_rate = None
+                    spec["version"] = entry.LEGACY_VERSION
+                    entry.common.save_json(output / "run.json", spec)
+                    self.assertEqual(entry.setup(args), (output, spec))
         finally:
             torch.set_num_threads(threads)

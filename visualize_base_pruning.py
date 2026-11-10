@@ -1,4 +1,4 @@
-"""Compare FastV and distilled 70% layer-average pruning on Base-only MVTec."""
+"""Compare FastV and distilled layer-average pruning on Base-only MVTec."""
 
 import argparse
 import json
@@ -16,7 +16,9 @@ from visualize_mvtec_baseline import freeze, restored, samples_for
 
 
 PROJECT = Path(__file__).resolve().parent
-VERSION = "base-only-layer-average-70-v1"
+VERSION = "base-only-layer-average-v2"
+LEGACY_VERSION = "base-only-layer-average-70-v1"
+RATES = (50, RATE)
 
 
 def parser():
@@ -28,7 +30,9 @@ def parser():
     p.add_argument("--data-root", default="/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/")
     p.add_argument("--prompt-version", choices=("v0", "v1", "v2", "v3"), default="v0")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--output-dir", type=Path, default=Path("output/mvtec_base_only_fastv_distilled_70_gpu34_01"))
+    p.add_argument("--prune-rate", type=int, choices=RATES,
+                   help="Target LLM layer-average pruning percentage (default: 70; resume uses saved rate)")
+    p.add_argument("--output-dir", type=Path)
     p.add_argument("--resume", action="store_true", help="Continue with the saved inputs, checkpoint, and GPU assignments")
     p.add_argument("--worker", choices=MODES, help=argparse.SUPPRESS)
     p.add_argument("--manifest", type=Path, help=argparse.SUPPRESS)
@@ -36,8 +40,9 @@ def parser():
 
 
 def verify(spec):
-    if spec["version"] != VERSION:
-        raise ValueError("Wrong Base-only visualization experiment version")
+    valid_rates = {VERSION: RATES, LEGACY_VERSION: (RATE,)}
+    if spec["prune_rate"] not in valid_rates.get(spec["version"], ()):
+        raise ValueError("Unsupported Base-only visualization version or saved prune rate")
     for path, digest in ((spec["input_json"], spec["input_sha256"]),
                          (Path(spec["model_path"]) / "config.json", spec["model_config_sha256"])):
         if common.digest(path) != digest:
@@ -45,11 +50,15 @@ def verify(spec):
 
 
 def setup(args):
-    output = args.output_dir.expanduser().resolve()
+    rate = RATE if args.prune_rate is None else args.prune_rate
+    default_output = Path(f"output/mvtec_base_only_fastv_distilled_{rate}_gpu34_01")
+    output = (args.output_dir or default_output).expanduser().resolve()
     manifest = output / "run.json"
     if args.resume:
         spec = json.loads(manifest.read_text(encoding="utf-8"))
         verify(spec)
+        if args.prune_rate is not None and args.prune_rate != spec["prune_rate"]:
+            raise ValueError("Requested prune rate differs from the saved experiment; use a new output directory")
         if student_identity(spec["checkpoint"]["path"], "visa") != spec["checkpoint"]:
             raise ValueError("The saved student checkpoint or training manifest changed")
         return output, spec
@@ -73,7 +82,7 @@ def setup(args):
         input_json=str(frozen), input_sha256=common.digest(frozen), sample_count=len(rows),
         prompt_version=args.prompt_version, seed=args.seed, gpus=args.gpus,
         jobs=[dict(mode=mode, gpu=str(args.gpus[i % len(args.gpus)])) for i, mode in enumerate(MODES)],
-        rate_semantics="layer_average", prune_rate=RATE, pruning_layer=BOUNDARY, roi_mode="base_only",
+        rate_semantics="layer_average", prune_rate=rate, pruning_layer=BOUNDARY, roi_mode="base_only",
         definitions=dict(fastv="Native visibility mask", distilled="Student attention, physical drop of Base top-k complement",
                          visualization="White RGB255 at removed Base positions; comparison starts with the disk original"),
     )
@@ -144,15 +153,16 @@ def worker(manifest, mode):
     device = torch.cuda.get_device_properties(0)
     folder.mkdir(parents=True, exist_ok=True)
     inference = dict(backend.inference_config, attention_source=mode,
-                     prune_rate=RATE, rate_semantics="layer_average", pruning_layer=BOUNDARY)
+                     prune_rate=spec["prune_rate"], rate_semantics="layer_average", pruning_layer=BOUNDARY)
     common.verify_runtime(folder, inference, device.name, device.total_memory)
-    method = BaseOnlyPruning(backend.model.get_model(), mode, spec["checkpoint"]["path"])
+    method = BaseOnlyPruning(backend.model.get_model(), mode, spec["checkpoint"]["path"],
+                             prune_rate=spec["prune_rate"])
     with torch.inference_mode():
         render_samples(backend, method, samples, spec, folder)
     return 0
 
 
-def comparison_images(output, samples):
+def comparison_images(output, samples, *, prune_rate=RATE):
     from PIL import Image, ImageDraw
     from llava_pruning.pool_compact_visualization import font
     from llava_pruning.visualization import prediction_caption
@@ -174,7 +184,7 @@ def comparison_images(output, samples):
                 gap, header = 16, 72
                 with Image.new("RGB", (width + first.width + second.width + gap * 4, height + header + gap), "white") as canvas:
                     draw = ImageDraw.Draw(canvas)
-                    draw.text((gap, 8), f"ID {sample.sample_id} | Base only | {RATE}% layer average | after block {BOUNDARY}",
+                    draw.text((gap, 8), f"ID {sample.sample_id} | Base only | {prune_rate}% layer average | after block {BOUNDARY}",
                               fill="black", font=font(17))
                     panels = (("Original", reference, None), ("FastV", first, left), ("Distilled", second, right))
                     x = gap
@@ -221,7 +231,7 @@ def run(args):
                         process.wait()
         if any(codes):
             return 1
-    comparison_images(output, samples_for(spec))
+    comparison_images(output, samples_for(spec), prune_rate=spec["prune_rate"])
     return 0
 
 

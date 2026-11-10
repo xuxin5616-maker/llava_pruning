@@ -11,13 +11,13 @@ MODES = ("fastv", "distilled")
 
 
 class BaseOnlyPruning:
-    def __init__(self, core, mode, checkpoint):
+    def __init__(self, core, mode, checkpoint, *, prune_rate=RATE):
         if mode not in MODES or len(core.layers) != 28:
             raise ValueError("Expected FastV or distilled pruning on the 28-block model")
         self.core, self.mode, self.checkpoint = core, mode, checkpoint
         self.side = core.get_vision_tower().num_patches_per_side
         self.original = self.side ** 2
-        self.target = single_drop_keep(self.original, RATE, len(core.layers), BOUNDARY)
+        self.target = single_drop_keep(self.original, prune_rate, len(core.layers), BOUNDARY)
 
     def configure(self, core, rate, *, capture_attention, capture_visualization):
         # Use the legacy Base-only backend's input path; this adapter owns the budget and capture.
