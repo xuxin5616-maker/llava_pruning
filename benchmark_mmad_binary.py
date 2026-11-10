@@ -46,7 +46,8 @@ def parser():
                    help="VisA-trained student used by hybrid_baseline only")
     devices=p.add_mutually_exclusive_group()
     devices.add_argument("--gpu", default="5", help="One physical GPU (default5); trials run sequentially")
-    devices.add_argument("--gpus", nargs="+", type=int, help="Physical GPU IDs, e.g. 5 6 7; at most one trial per GPU")
+    devices.add_argument("--gpus", nargs="+", type=int,
+                         help="Physical GPU IDs; with --append-joint-self-rates, select GPUs from the saved run")
     p.add_argument("--prune-rates", nargs="+", type=int, choices=(50,70,90), default=[50,70,90])
     p.add_argument("--experiment-group", choices=("all", "baselines", "baselines_joint90", "base_guided", "joint_self"),
                    default="all", help="baselines_joint90: six pruning baselines plus joint_self at 90%%; "
@@ -212,7 +213,7 @@ def prepare_stretched_images(records, output, model_config):
         row.update(images[Path(row["resolved_image"])])
 
 
-def append_joint_self_jobs(output, spec, rates, tails):
+def append_joint_self_jobs(output, spec, rates, tails, requested_gpus):
     if (spec.get("experiment_group") != "baselines_joint90" or spec.get("resize_mode") != "stretch"
             or spec.get("include_visa") or not spec["checkpoint"]["path"]):
         raise ValueError("Append requires the existing no-VisA stretch baselines_joint90 experiment")
@@ -221,26 +222,39 @@ def append_joint_self_jobs(output, spec, rates, tails):
     if len(rates) != len(set(rates)) or not set(tails).issubset(spec["joint_self_tails"]):
         raise ValueError("Provide distinct rates and choose --joint-self-tails from the saved experiment")
 
-    candidates = schedule(rates, spec["gpus"], experiment_group="joint_self", joint_self_tails=tails)
+    devices = spec["gpus"] if requested_gpus is None else [str(gpu) for gpu in requested_gpus]
+    if not set(devices).issubset(spec["gpus"]):
+        raise ValueError("Append GPUs must belong to the saved GPU list")
+    candidates = schedule(rates, devices, experiment_group="joint_self", joint_self_tails=tails)
+    candidates = [job for job in candidates if job.get("variant") == "joint_self"]
     existing = {job["job_id"]: job for job in spec["jobs"]}
-    appended = []
-    for job in candidates:
-        if job.get("variant") != "joint_self":
-            continue
-        previous = existing.get(job["job_id"])
+    changes = {}
+    for index, job in enumerate(candidates):
+        job_id = job["job_id"]
+        previous = existing.get(job_id)
+        config = job["config"].rsplit(";gpu=", 1)[0] + ";gpu={gpu};resize=stretch;canvas=1152;grid=3x3"
+        gpu = job["gpu"] if requested_gpus is None else devices[index % len(devices)]
         if previous is not None:
-            job["gpu"] = previous["gpu"]
-        config = job["config"].rsplit(";gpu=", 1)[0]
-        job["config"] = f"{config};gpu={job['gpu']};resize=stretch;canvas=1152;grid=3x3"
-        if previous is None:
-            appended.append(job)
-        elif previous != job:
-            raise ValueError(f"Saved job has a different configuration: {job['job_id']}")
-    if appended:
-        spec["jobs"].extend(appended)
+            saved_gpu = previous["gpu"]
+            if previous != dict(job, gpu=saved_gpu, config=config.format(gpu=saved_gpu)):
+                raise ValueError(f"Saved job has a different configuration: {job_id}")
+            if requested_gpus is None or saved_gpu == gpu:
+                continue
+            folder = output / job_id
+            report_path = folder / "metrics.json"
+            report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
+            if report.get("status") == "success" and report.get("complete"):
+                continue
+            predictions = folder / "predictions.jsonl"
+            if (folder / "inference.json").is_file() or (predictions.is_file() and predictions.stat().st_size):
+                raise ValueError(f"{job_id} already started on GPU {saved_gpu}. Resume it without --gpus.")
+        changes[job_id] = dict(job, gpu=gpu, config=config.format(gpu=gpu))
+    if changes:
+        spec["jobs"] = [changes.get(job["job_id"], job) for job in spec["jobs"]]
+        spec["jobs"].extend(job for job_id, job in changes.items() if job_id not in existing)
         spec["complete"] = False
         common.save_json(output / "run.json", spec)
-        print("Appended " + ", ".join(job["job_id"] for job in appended), flush=True)
+        print("Scheduled " + ", ".join(f"{job['job_id']} on GPU {job['gpu']}" for job in changes.values()), flush=True)
 
 
 def setup(args):
@@ -260,7 +274,7 @@ def setup(args):
             common.save_json(output/"run.json",spec)
             print("Verified legacy source; resume with unchanged MMAD inference dependencies. Old manifest: "+str(backup),flush=True)
         if args.append_joint_self_rates:
-            append_joint_self_jobs(output, spec, args.append_joint_self_rates, args.joint_self_tails)
+            append_joint_self_jobs(output, spec, args.append_joint_self_rates, args.joint_self_tails, args.gpus)
         # All options, including per-trial GPU assignments, are restored.
         return output,spec
     if args.reuse_dir:

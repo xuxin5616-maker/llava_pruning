@@ -92,7 +92,7 @@ class JointTailScheduleTests(unittest.TestCase):
                 spec = json.loads(manifest.read_text(encoding="utf-8"))
                 job_id = command[command.index("--worker") + 1]
                 job = next(j for j in spec["jobs"] if j["job_id"] == job_id)
-                calls.append(job_id)
+                calls.append((job_id, job["gpu"]))
                 self.assertEqual(kwargs["env"]["CUDA_VISIBLE_DEVICES"], job["gpu"])
                 samples = load_frozen(spec["input_json"], exclude_sources=("VisA",))
                 records = [prediction(s, s.source["correct_option"]) for s in samples]
@@ -111,17 +111,23 @@ class JointTailScheduleTests(unittest.TestCase):
                 old_summary = (output / "summary.csv").read_bytes()
                 old_assets = {path: path.stat().st_mtime_ns for path in (output / "prepared_images").glob("*.png")}
                 extra = entry.parser().parse_args([
-                    "--resume", "--append-joint-self-rates", "50", "70", "--joint-self-tails", "8",
+                    "--resume", "--append-joint-self-rates", "50", "--joint-self-tails", "8",
                     "--output-dir", str(output),
                 ])
+                entry.setup(extra)  # Register 50% under the old default before any samples exist.
+                extra.append_joint_self_rates = [50, 70]
+                extra.gpus = [3, 4]
                 self.assertEqual(entry.run(extra), 0)
-                self.assertEqual(calls[20:], ["hybrid_joint_self_tail08_50", "hybrid_joint_self_tail08_70"])
+                self.assertEqual(calls[20:], [("hybrid_joint_self_tail08_50", "3"),
+                                              ("hybrid_joint_self_tail08_70", "4")])
+                extra.gpus = [4, 3]
                 self.assertEqual(entry.run(extra), 0)
                 self.assertEqual(len(calls), 22)
                 new = json.loads((output / "run.json").read_text(encoding="utf-8"))
                 self.assertEqual(new["jobs"][:len(old["jobs"])], old["jobs"])
                 self.assertEqual(new["input_sha256"], old["input_sha256"])
                 self.assertEqual(new["gpus"], old["gpus"])
+                self.assertEqual([job["gpu"] for job in new["jobs"][-2:]], ["3", "4"])
                 self.assertEqual(new["completed_trials"], 22)
                 self.assertTrue(new["complete"])
                 self.assertTrue((output / "summary.csv").read_bytes().startswith(old_summary))
