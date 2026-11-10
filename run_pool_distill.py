@@ -390,7 +390,9 @@ def run_sweep(args, *, run_process=None, process_factory=None):
     return output
 
 
-def run_worker(args):
+def run_worker(args, *, student_layer=None):
+    layer_ablation = student_layer is not None
+    student_layer = 2 if student_layer is None else student_layer
     output = validate(args)
     if len(args.prune_rates) != 1 or len(args.lambdas) != 1 or len(args.selection_modes) != 1:
         raise ValueError("Worker requires one rate/lambda/mode")
@@ -412,6 +414,8 @@ def run_worker(args):
         previous = json.loads((output / "run.json").read_text(encoding="utf-8"))
         require_current_prompt_format(previous)
         validate_configuration(args, previous["configuration"], rate, share, mode)
+        if previous["configuration"].get("student_layer", 2) != student_layer:
+            raise ValueError("Resume student layer differs from the original experiment")
     input_digest = file_hash(args.input_json)
     checkpoint = args.checkpoint.stat() if args.checkpoint.is_file() else None
     checkpoint_identity = dict(size=checkpoint.st_size, mtime_ns=checkpoint.st_mtime_ns) if checkpoint else None
@@ -440,7 +444,8 @@ def run_worker(args):
         spatial_strength=args.spatial_mix_weight)
     method = PoolDistillMethod(core, args.checkpoint, rate=rate, share=share, mode=mode, settings=settings,
                               pruning_audit=args.pruning_audit, tail_drop_layers=args.tail_drop_layers,
-                              predictor_input=args.predictor_input, base_mapping=args.base_mapping, base_policy=args.base_policy)
+                              predictor_input=args.predictor_input, base_mapping=args.base_mapping,
+                              base_policy=args.base_policy, student_layer=student_layer)
     # Feasibility checks do not score images, skip records, or loosen budgets.
     if share == 1:
         method.native.validate_input_budgets(backend, samples, {rate: method.native.resolve_budget(rate, len(core.layers))})
@@ -457,6 +462,8 @@ def run_worker(args):
                 seen.add(size)
     output.mkdir(parents=True, exist_ok=True)
     metadata = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
+    if layer_ablation:
+        metadata["student_layer"] = student_layer
     run_metadata = dict(configuration=metadata, inference=backend.inference_config,
         pruning_auxiliary_profile=auxiliary_profile(args.pruning_audit),
         latency_policy="resident prepared inputs -> first token; actual pruning scoring/selection/merging INCLUDED; no subtraction",
@@ -466,7 +473,7 @@ def run_worker(args):
             base_mapping=args.base_mapping, base_policy=args.base_policy,
             tail_budget_policy="extra removal; original two-stage budgets unchanged",
             tail_cache_policy="earlier layers retain image KV; final layers encode/decode text only",
-            side_input_policy="Base+Text means selecting H2 rows, preserving position IDs; H2 already contains multimodal information"),
+            side_input_policy=f"Base+Text selects H{student_layer} rows and preserves position IDs; hidden states already contain multimodal information"),
         definitions=dict(DEFINITIONS, **METRIC_DEFINITIONS), baseline_accuracy_reference=baseline_reference(args.baseline_acc),
         method="pool_distill", prompt_format=PROMPT_FORMAT, predictor_training="unchanged dense-input checkpoint",
         budget_reference="native unpruned packed Base+AnyRes+newlines; per-image baseline",
@@ -561,6 +568,8 @@ def run_worker(args):
     for key in ("actual_average_prune_rate", "actual_pre_contribution", "actual_distill_contribution",
                 "baseline_packed_tokens", "pre_llm_tokens", "final_llm_tokens", "pre_base_tokens", "final_anyres_tokens"):
         metrics[key] = statistics.mean(row[key] for row in budgets)
+    if layer_ablation:
+        metrics["two_stage_average_prune_rate"] = metrics["actual_pre_contribution"] + metrics["actual_distill_contribution"]
     metrics = extended_metrics(metrics, args.baseline_acc / 100)
     write_csv(output / "budgets.csv", budgets)
     write_csv(output / "summary.csv", summary_rows([metrics], args.summary_format))

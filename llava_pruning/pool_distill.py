@@ -116,8 +116,9 @@ def mapped_scores(base_log, base_records, anyres_records, geometry):
 
 class PoolDistillAdapter(pool.CustomPruningAdapter):
     def __init__(self, core, settings, *, rate, share, mode, lean=False, predictor_input="full", base_mapping="reference",
-                 base_policy="protect"):
+                 base_policy="protect", student_layer=2):
         super().__init__(core, settings)
+        self.student_layer = student_layer
         self.rate, self.share, self.mode = rate, share, mode
         self.plan, self.records = None, None
         self.lean = lean
@@ -141,7 +142,7 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         super().set_image_context(original_size)
         original = pool.baseline_packed_count(self.original_size, self.geometry.grid, 27,
                                              self.core.config.mm_patch_merge_type)
-        self.plan = hybrid_budget(original, self.rate, self.share, len(self.core.layers))
+        self.plan = hybrid_budget(original, self.rate, self.share, len(self.core.layers), self.student_layer)
         self.plan["raw_grid_height"] = self.geometry.grid[1]
         self.view_plan = pre_view_budget(self.plan, self.geometry.tile_count,
                                         final_newline=self.core.config.mm_patch_merge_type.endswith("_add_newl"),
@@ -304,11 +305,15 @@ class PoolDistillMethod:
     name = "pool_distill"
 
     def __init__(self, core, checkpoint, *, rate, share, mode, settings, pruning_audit="lean",
-                 tail_drop_layers=0, predictor_input="full", base_mapping="reference", base_policy="protect"):
+                 tail_drop_layers=0, predictor_input="full", base_mapping="reference", base_policy="protect",
+                 student_layer=2):
         if mode not in {"base_full", "anyres_self"}:
             raise ValueError("Choose base_full or anyres_self")
         from .attention_predictor import AttentionPredictorMethod
-        self.native = AttentionPredictorMethod(checkpoint, (rate,), frozenset(), selection_mode=mode)
+        self.native = AttentionPredictorMethod(checkpoint, (rate,), frozenset(), layer=student_layer, selection_mode=mode)
+        self.student_layer = student_layer
+        if type(student_layer) is not int or not 1 <= student_layer < len(core.layers):
+            raise ValueError("Student layer must be before the final decoder block")
         if pruning_audit not in {"lean","full"}:
             raise ValueError("pruning_audit must be lean or full")
         if base_mapping not in {"reference","fast"} or (base_mapping=="fast" and pruning_audit!="lean"):
@@ -318,15 +323,16 @@ class PoolDistillMethod:
         if base_policy in {"anyres_first", "joint"} and not (0 < share < 1 and rate > 0):
             raise ValueError(f"{base_policy} requires an active two-stage hybrid (0 < lambda < 1)")
         self.base_policy = base_policy
-        if type(tail_drop_layers) is not int or not 0 <= tail_drop_layers <= len(core.layers)-2:
-            raise ValueError("Tail removal must be nonnegative and begin after block2")
+        if type(tail_drop_layers) is not int or not 0 <= tail_drop_layers <= len(core.layers)-student_layer:
+            raise ValueError("Tail removal must be nonnegative and begin after the student boundary")
         if predictor_input not in {"full","base_text"} or (predictor_input=="base_text" and mode!="base_full"):
             raise ValueError("Base+Text predictor input requires base_full mode")
         if (tail_drop_layers or predictor_input=="base_text") and (share==0 or rate==0):
             raise ValueError("Ablations require an active distilled pruning stage")
         self.tail_drop_layers, self.predictor_input = tail_drop_layers, predictor_input
         self.adapter = PoolDistillAdapter(core, settings, rate=rate, share=share, mode=mode,
-            lean=pruning_audit=="lean", predictor_input=predictor_input, base_mapping=base_mapping, base_policy=base_policy)
+            lean=pruning_audit=="lean", predictor_input=predictor_input, base_mapping=base_mapping,
+            base_policy=base_policy, student_layer=student_layer)
         self.rate, self.share, self.mode = rate, share, mode
 
     def prepare_inputs(self, original_size, tokens):
@@ -354,7 +360,7 @@ class PoolDistillMethod:
             # skipping checkpoint loading. Actual ratio is assigned after the
             # pre-LLM adapter knows this image's original and sparse lengths.
             core.configure_attention_predictor(enabled=self.share > 0, keep_ratio=.5 if self.share > 0 else 1.,
-                checkpoint=self.native.checkpoint, selection_mode=self.mode)
+                checkpoint=self.native.checkpoint, selection_mode=self.mode, student_layer=self.student_layer)
             self.adapter.configure(self.adapter.settings.prune_rate, capture_visualization=False)
 
     @contextmanager
@@ -403,7 +409,7 @@ class PoolDistillMethod:
         if self.share == 1 or rate == 0:
             raw = self.native.stats(core, rate)
             plan = hybrid_budget(raw.get("original_image_tokens") or raw["final_llm_visual_tokens"],
-                                 rate, self.share, len(core.layers))
+                                 rate, self.share, len(core.layers), self.student_layer)
             original, pre = plan["baseline_packed_tokens"], plan["pre_llm_tokens"]
             final = raw.get("stage2_llm_visual_tokens", raw["final_llm_visual_tokens"])
         else:
@@ -416,7 +422,7 @@ class PoolDistillMethod:
         depth = len(core.layers)
         rows = raw.get("layers")
         observed = sum(row["image_tokens_in"] for row in rows) if rows else depth * pre
-        expected = 2 * pre + (depth - 2 - self.tail_drop_layers) * final
+        expected = self.student_layer * pre + (depth - self.student_layer - self.tail_drop_layers) * final
         if observed != expected:
             raise RuntimeError("Actual per-layer token accounting differs from hybrid budget")
         if self.share == 1 or rate == 0:
@@ -474,7 +480,7 @@ class PoolDistillMethod:
             grid = get_anyres_image_grid_shape(original_size, core.config.image_grid_pinpoints, tower.image_size)
             base, anyres, protected = native_anyres_counts(int(tower.num_patches_per_side), grid, original_size,
                 final_newline=core.config.mm_patch_merge_type.endswith("_add_newl"))
-            plan = hybrid_budget(base+anyres+protected, self.rate, self.share, len(core.layers))
+            plan = hybrid_budget(base+anyres+protected, self.rate, self.share, len(core.layers), self.student_layer)
         else:
             self.adapter.set_image_context(original_size)
             plan = dict(self.adapter.plan)
@@ -484,7 +490,7 @@ class PoolDistillMethod:
         final = plan["final_llm_tokens"]
         stage2 = stage2_view_budget(final, base, protected, self.base_policy)
         tail, depth = self.tail_drop_layers, len(core.layers)
-        expected = 2*plan["pre_llm_tokens"]+(depth-2-tail)*final
+        expected = self.student_layer * plan["pre_llm_tokens"] + (depth - self.student_layer - tail) * final
         return dict(plan, selection_mode=self.mode, predictor_input=self.predictor_input,
                     tail_drop_layers=tail, tail_drop_first_layer=depth-tail+1 if tail else None,
                     two_stage_average_prune_rate=plan["actual_average_prune_rate"],

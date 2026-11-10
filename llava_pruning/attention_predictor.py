@@ -30,8 +30,9 @@ class AttentionPredictorMethod:
         allowed = {"checkpoint", "layer", "rate_semantics", "prune_rates", "visualize_rates", "selection_mode", "crop_temperature", "crop_min_keep"}
         if set(config) - allowed:
             raise ValueError(f"Unknown attention_predictor keys: {sorted(set(config) - allowed)}")
-        if type(config.get("layer", 2)) is not int or config.get("layer", 2) != 2:
-            raise ValueError("attention_predictor prunes after completed LLM block 2")
+        layer = config.get("layer", 2)
+        if type(layer) is not int or layer < 1:
+            raise ValueError("Predictor layer must identify a completed LLM block")
         if config.get("rate_semantics", "layer_average") != "layer_average":
             raise ValueError("attention_predictor requires layer_average rates")
         selection_mode = config.get("selection_mode", "base_full")
@@ -55,7 +56,7 @@ class AttentionPredictorMethod:
         if any(r != 0 for r in rates) and not checkpoint.is_file():
             raise FileNotFoundError(f"Predictor checkpoint not found: {checkpoint}. Run train_attention_predictor.py first; "
                                     "then use its output method.json.")
-        return cls(checkpoint, rates, frozenset(visual), selection_mode=selection_mode,
+        return cls(checkpoint, rates, frozenset(visual), layer=layer, selection_mode=selection_mode,
                    crop_temperature=temperature, crop_min_keep=minimum)
 
     resolve_budget = PriorTRMethod.resolve_budget
@@ -106,7 +107,8 @@ class AttentionPredictorMethod:
                                            keep_ratio=(100 - budget["requested_layer_prune_rate"]) / 100,
                                            checkpoint=self.checkpoint, capture_attention=capture_attention,
                                            capture_visualization=capture_visualization, selection_mode=self.selection_mode,
-                                           crop_temperature=self.crop_temperature, crop_min_keep=self.crop_min_keep)
+                                           crop_temperature=self.crop_temperature, crop_min_keep=self.crop_min_keep,
+                                           student_layer=self.layer)
 
     def details(self):
         digest = None
@@ -118,7 +120,7 @@ class AttentionPredictorMethod:
             digest = sha.hexdigest()
         return dict(checkpoint=str(self.checkpoint), checkpoint_sha256=digest,
                     algorithm="KL-trained three-layer side attention; not full MAP/TwigVLM reproduction",
-                    student="architecture comes from checkpoint: v2 independently pretrained native Qwen2 blocks 3/4/5 (no LM head); v1 legacy small branch",
+                    student="architecture comes from checkpoint: v2 independent copies of the next three pretrained Qwen2 blocks; v1 legacy small branch",
                     teacher="fixed checkpoint teacher block (default22); last prompt query -> visual keys, mean heads; independent QK",
                     gradient="frozen backbone; student trained separately with KL(teacher||student); no GT",
                     selection_mode=self.selection_mode,
@@ -146,7 +148,7 @@ class AttentionPredictorMethod:
                     checkpoint_compatibility="selection policy is inference-only; existing v1/v2 weights do not need retraining",
                     position_policy="preserve original IDs, physically compact all existing KV caches",
                     inference="native backbone FP16/FlashAttention2; student precision stored in checkpoint",
-                    rate_semantics="layer_average", pruning_layer=2)
+                    rate_semantics="layer_average", pruning_layer=self.layer)
 
     def visualize(self, *, result, vision_tower, output_dir, sample_id, save_prune, save_attention, ground_truth=None):
         from .visualization import prediction_caption, save_vico_visualizations

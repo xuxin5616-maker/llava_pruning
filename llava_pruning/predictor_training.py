@@ -42,17 +42,18 @@ def architecture_signature(core):
 
 
 @torch.no_grad()
-def extract_teacher(core, packed, span, layout, *, teacher_layer=22):
+def extract_teacher(core, packed, span, layout, *, teacher_layer=22, student_layer=2):
     """Run native blocks 1..21; read only Q/K of block22, not its output.
 
-    H2 is the RAW second-block output, not final RMSNorm or student features.
+    Capture the raw output of the requested completed student source block.
     Native decoder attention outputs are never requested and no KV is stored.
     """
     from llava.model.language_model.fastv_attention import last_prompt_attention
     if core.training or any(p.requires_grad for p in core.parameters()):
         raise ValueError("Teacher must be frozen and in eval mode")
-    if type(teacher_layer) is not int or not 2 < teacher_layer <= len(core.layers):
-        raise ValueError("Teacher layer must be after block2 and within actual model depth")
+    if (type(teacher_layer) is not int or type(student_layer) is not int
+            or not 1 <= student_layer < teacher_layer <= len(core.layers)):
+        raise ValueError("Teacher layer must follow the student boundary within the backbone depth")
     if getattr(core.config, "use_sliding_window", False):
         raise ValueError("Teacher extraction currently requires non-sliding native attention")
     if packed.ndim != 3 or packed.shape[0] != 1:
@@ -63,7 +64,7 @@ def extract_teacher(core, packed, span, layout, *, teacher_layer=22):
     relative = [i for group in layout["grids"] for i in group["indices"]]
     spatial = torch.tensor(relative, device=packed.device) + start
     ids = torch.arange(packed.shape[1], device=packed.device)[None]
-    hidden, h2 = packed, None
+    hidden, student_hidden = packed, None
     positions = ids[0]
     for index, layer in enumerate(core.layers):
         rotary = core.rotary_emb(hidden, ids)
@@ -71,19 +72,19 @@ def extract_teacher(core, packed, span, layout, *, teacher_layer=22):
             attention = last_prompt_attention(layer, hidden, rotary)[0, spatial]
             if not torch.isfinite(attention).all() or float(attention.sum()) <= 0:
                 raise FloatingPointError("Invalid teacher visual attention distribution")
-            return dict(hidden=h2.detach(), position_ids=ids.detach(), spatial_indices=spatial.detach(),
+            return dict(hidden=student_hidden, position_ids=ids.detach(), spatial_indices=spatial.detach(),
                         target=(attention / attention.sum()).detach())
         causal = core._pyramiddrop_causal_mask(hidden, 0, core.config._attn_implementation)
         hidden = layer(hidden, attention_mask=causal, position_ids=ids, past_key_value=None,
                        output_attentions=False, use_cache=False, cache_position=positions,
                        position_embeddings=rotary)[0]
-        if index == 1:
-            h2 = hidden.clone().detach()
+        if index + 1 == student_layer:
+            student_hidden = hidden.clone().detach()
     raise RuntimeError("Teacher attention was not captured")
 
 
 @torch.no_grad()
-def prepare_teacher_example(backend, sample, teacher_layer=22):
+def prepare_teacher_example(backend, sample, teacher_layer=22, *, student_layer=2):
     from PIL import Image
     from llava.constants import (DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_TOKEN_INDEX)
     from llava.mm_utils import process_images, tokenizer_image_token
@@ -109,7 +110,8 @@ def prepare_teacher_example(backend, sample, teacher_layer=22):
             tokens, None, None, None, None, pixels, image_sizes=[image.size])[4]
         if len(core._clse_spans) != 1 or len(core._clse_spans[0]) != 1 or core._clse_layout is None:
             raise ValueError("Missing actual teacher image geometry")
-        return extract_teacher(core, packed, core._clse_spans[0][0], core._clse_layout, teacher_layer=teacher_layer)
+        return extract_teacher(core, packed, core._clse_spans[0][0], core._clse_layout,
+                               teacher_layer=teacher_layer, student_layer=student_layer)
     finally:
         core._attention_teacher_capture = previous
 
@@ -138,8 +140,8 @@ def backbone_file_identity(model_path, vision_path=None):
 
 
 class TeacherExamples:
-    def __init__(self, backend, *, teacher_layer=22, cache_dir=None, identity=None):
-        self.backend, self.teacher_layer = backend, teacher_layer
+    def __init__(self, backend, *, teacher_layer=22, student_layer=2, cache_dir=None, identity=None):
+        self.backend, self.teacher_layer, self.student_layer = backend, teacher_layer, student_layer
         self.cache_dir = Path(cache_dir).resolve() if cache_dir else None
         self.identity = identity
         if self.cache_dir:
@@ -149,7 +151,7 @@ class TeacherExamples:
         key, path = None, None
         if self.cache_dir:
             stat = sample.image.stat()
-            source = dict(version=1, scoring="last_prompt_mean_heads_spatial_l1", student_layer=2,
+            source = dict(version=1, scoring="last_prompt_mean_heads_spatial_l1", student_layer=self.student_layer,
                           teacher_layer=self.teacher_layer, prompt=GENERIC_PROMPT_V0,
                           identity=self.identity, image=[str(sample.image.resolve()), stat.st_size, stat.st_mtime_ns])
             key = hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest()
@@ -159,7 +161,8 @@ class TeacherExamples:
                 if payload.get("key") != key:
                     raise ValueError(f"Teacher cache identity mismatch: {path}")
                 return payload["example"]
-        example = prepare_teacher_example(self.backend, sample, self.teacher_layer)
+        options = {} if self.student_layer == 2 else {"student_layer": self.student_layer}
+        example = prepare_teacher_example(self.backend, sample, self.teacher_layer, **options)
         if path is not None:
             cpu = {key: value.detach().cpu() for key, value in example.items()}
             atomic_save(dict(key=key, example=cpu), path)
@@ -239,10 +242,10 @@ def epoch_pass(student, examples, samples, *, device, precision, optimizer=None,
     return dict({key: value / len(samples) for key, value in totals.items()}, optimizer_steps=updates)
 
 
-def save_student(path, student, *, student_precision, backbone_depth, teacher_layer=22,
+def save_student(path, student, *, student_precision, backbone_depth, teacher_layer=22, student_layer=2,
                  signature=None, provenance=None, epoch=0, validation_kl=None):
     atomic_save(dict(version=student.checkpoint_version, architecture=asdict(student.config),
                      state_dict={key: value.detach().cpu() for key, value in student.state_dict().items()},
-                     student_layer=2, teacher_layer=teacher_layer, backbone_depth=backbone_depth,
+                     student_layer=student_layer, teacher_layer=teacher_layer, backbone_depth=backbone_depth,
                      student_precision=student_precision, backbone_signature=signature,
                      epoch=epoch, validation_kl=validation_kl, provenance=provenance or {}), path)

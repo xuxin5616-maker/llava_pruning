@@ -182,8 +182,8 @@ class CopiedPredictorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "blocks 3, 4, 5"):
             CopiedAttentionPredictor.from_backbone(LlavaQwenModel(tiny_config()))
         config = CopiedAttentionPredictor.from_backbone(core_model()).config
-        with self.assertRaisesRegex(ValueError, "original blocks 3, 4, 5"):
-            CopiedPredictorConfig(config.qwen_config, "sdpa", source_layers=(2, 3, 4))
+        with self.assertRaisesRegex(ValueError, "three consecutive blocks"):
+            CopiedPredictorConfig(config.qwen_config, "sdpa", source_layers=(2, 4, 5))
 
     def test_real_generate_zero_identity_and_copied_branch_pruning_original_features_once(self):
         torch.manual_seed(914)

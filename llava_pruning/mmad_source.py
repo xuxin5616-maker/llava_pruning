@@ -28,6 +28,19 @@ TAIL0_FUNCTION_PAIRS={
 EXTENSION='llava_pruning/mmad_extension.py'
 TAIL0_EXTENSION_PAIR=('fe6f8f3b0c6cdd9af7d91227f62328bfb75b2b1c39e306eff9321b77e4f2628f',
                       '69d0fce97b11e5356b212f052acb8e5f1262f57b3c345347612fa56b584b4b2f')
+# Exact reviewed before/after digests. MMAD still uses the default block 2
+# everywhere; only the separate MVTec layer ablation supplies another block.
+STUDENT_LAYER_PAIRS = {
+    'llava_pruning/attention_predictor.py': (
+        '64a49902aeb3e374ab77406da12918339ba960df011b6a061fd0d45eceea6b5e',
+        '898f54ef83cb68243a3850e96d3d3d2276798d5c39f255bca2c950f3c8693f99'),
+    'llava_pruning/pool_distill.py': (
+        'cd0f64d81bcd4e0f07fc1563741900bbcd7b70d928c68b54da4e8314f5d68c19',
+        'f21349cee7bcc4275310850ba19ed7f8b2cb29cb4fbee66c594e3da32583b5dc'),
+    'vendor/llava/llava/model/language_model/attention_predictor.py': (
+        '5a16c112a87c23125b182e4bc738b11f5294ac9d2c9f895e5c089941bf6c8022',
+        '82abf3cc49b89b14528c013c19e6f317ffbe2f611aadd0495973d6ac26343e0e'),
+}
 
 
 def digest(data):
@@ -132,6 +145,11 @@ def changed_paths(before,after):
     return [p for p in sorted(set(left)|set(right)) if left.get(p)!=right.get(p)]
 
 
+def default_student_layer_updates(before, after):
+    return [p for p in changed_paths(before, after)
+            if STUDENT_LAYER_PAIRS.get(p) == (before['files'].get(p), after['files'].get(p))]
+
+
 def local_changes(files,head):
     """Use file contents, including ignored Python files seen by the old guard.
 
@@ -199,10 +217,14 @@ def verify_source(spec,root):
     root=Path(root);files=working_files(root);current=scope_identity(files)
     saved=spec.get('mmad_source_identity')
     if saved is not None:
-        if saved!=current:
-            changed=', '.join(changed_paths(saved,current)[:8])
+        if saved==current:
+            return dict(identity=current)
+        updated=default_student_layer_updates(saved,current)
+        remaining=[p for p in changed_paths(saved,current) if p not in updated]
+        if remaining or not updated or saved.get('policy')!=current['policy']:
+            changed=', '.join((remaining or changed_paths(saved,current))[:8])
             raise ValueError('MMAD inference dependencies changed: '+changed+'; use the original inference code')
-        return dict(identity=current)
+        return dict(identity=current, compatibility=dict(transition='default_student_layer_2',reviewed_files=updated))
     legacy=spec['source_identity']
     if legacy in (whole_identity(files),whole_identity(files,windows=True)):
         return dict(identity=current,legacy_recovery=dict(reference='unchanged working source',legacy_identity=legacy))
@@ -220,14 +242,23 @@ def verify_source(spec,root):
             previous=scope_identity(candidate)
             compatibility=None
             if previous!=current:
-                compatibility=tail0_compatibility(candidate,files,spec,current)
-                if compatibility is None:
-                    changed=', '.join(changed_paths(previous,current)[:8])
+                updated=default_student_layer_updates(previous,current)
+                adjusted=dict(candidate,**{p:files[p] for p in updated})
+                adjusted_scope=scope_identity(adjusted) if updated else previous
+                if adjusted_scope!=current:
+                    compatibility=tail0_compatibility(adjusted,files,spec,current)
+                if adjusted_scope!=current and compatibility is None:
+                    changed=', '.join(changed_paths(adjusted_scope,current)[:8])
                     raise ValueError(f'Historical source matches Git {revision[:12]} ({overlay["mode"]}), '
                                      f'but MMAD inference dependencies changed: {changed}')
+                if updated:
+                    if compatibility is None:
+                        compatibility=dict(transition='default_student_layer_2',reviewed_files=updated)
+                    else:
+                        compatibility['default_student_layer_updates']=updated
             return dict(identity=current,legacy_recovery=dict(reference=revision,legacy_identity=legacy,
                 local_overlay=overlay,compatibility=compatibility,
-                verification='Exact legacy whole-source hash matched reconstructed Git/local files; inference is unchanged or exactly verified default-tail0 compatible'))
+                verification='Exact legacy whole-source hash matched reconstructed Git/local files; inference is unchanged or matches an exact reviewed default transition'))
     raise ValueError('Cannot identify the saved legacy source hash in the latest 100 Git revisions plus current local Python files; '
         f'saved_files={legacy.get("files")}, current_files={len(files)}, local_additions={len(additions)}, '
         f'local_modified={len(modified)}, local_deleted={len(deleted)}. '

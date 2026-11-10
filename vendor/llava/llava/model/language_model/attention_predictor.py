@@ -146,16 +146,18 @@ class CopiedPredictorConfig:
     source_layers: tuple = (3, 4, 5)
 
     def __post_init__(self):
-        if tuple(self.source_layers) != (3, 4, 5):
-            raise ValueError("Copied predictor must initialize from original blocks 3, 4, 5")
+        layers = tuple(self.source_layers)
+        if (len(layers) != 3 or any(type(layer) is not int for layer in layers)
+                or layers[0] < 2 or layers != tuple(range(layers[0], layers[0] + 3))):
+            raise ValueError("Copied predictor requires three consecutive blocks after the student boundary")
         if self.attention_implementation not in {"eager", "sdpa", "flash_attention_2"}:
             raise ValueError("Unsupported copied Qwen2 attention implementation")
         if type(self.gradient_checkpointing) is not bool:
             raise ValueError("gradient_checkpointing must be boolean")
         if set(self.qwen_config) != set(QWEN_FIELDS):
             raise ValueError("Incomplete copied Qwen2 architecture")
-        if self.qwen_config["num_hidden_layers"] < 5:
-            raise ValueError("Copied predictor requires backbone blocks 3, 4, 5")
+        if self.qwen_config["num_hidden_layers"] < layers[-1]:
+            raise ValueError("Copied predictor source blocks exceed the backbone depth")
         if self.qwen_config["use_sliding_window"]:
             raise ValueError("Copied predictor currently requires non-sliding attention")
 
@@ -186,12 +188,15 @@ class CopiedAttentionPredictor(nn.Module):
             module.requires_grad_(True)
 
     @classmethod
-    def from_backbone(cls, core, *, gradient_checkpointing=True):
+    def from_backbone(cls, core, *, gradient_checkpointing=True, student_layer=2):
         from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer, Qwen2RotaryEmbedding
-        if len(core.layers) < 5 or not isinstance(core.rotary_emb, Qwen2RotaryEmbedding):
-            raise ValueError("Copied predictor requires native Qwen2 blocks 3, 4, 5 and RoPE")
+        if type(student_layer) is not int or student_layer < 1:
+            raise ValueError("Student layer must identify a completed decoder block")
+        source_layers = tuple(range(student_layer + 1, student_layer + 4))
+        if source_layers[-1] > len(core.layers) or not isinstance(core.rotary_emb, Qwen2RotaryEmbedding):
+            raise ValueError(f"Copied predictor requires native Qwen2 blocks {', '.join(map(str, source_layers))} and RoPE")
         config = CopiedPredictorConfig(copied_qwen_config(core.config), core.config._attn_implementation,
-                                       gradient_checkpointing=gradient_checkpointing)
+                                       gradient_checkpointing=gradient_checkpointing, source_layers=source_layers)
         # Allocate independent FP32 masters on CPU, then copy one block at a time.
         # Never deepcopy the resident GPU modules/hooks or change the main model.
         result = cls(config).float()
@@ -282,20 +287,26 @@ def student_autocast(device, precision):
     return torch.autocast("cuda", dtype=torch.bfloat16)
 
 
-def load_predictor(path, device, input_size):
+def load_predictor(path, device, input_size, *, student_layer=2):
     # weights_only avoids executing arbitrary pickle objects; all payload fields
     # are tensors or primitive containers, including the training provenance.
     saved = torch.load(path, map_location="cpu", weights_only=True)
+    if type(saved.get("student_layer")) is not int or saved["student_layer"] != student_layer:
+        raise ValueError("Predictor checkpoint source-layer mismatch")
     if saved.get("version") == LEGACY_CHECKPOINT_VERSION:
+        if student_layer != 2:
+            raise ValueError("Legacy predictor checkpoints require student layer 2")
         config = PredictorConfig(**saved["architecture"])
         model = AttentionPredictor(config)
     elif saved.get("version") == CHECKPOINT_VERSION:
         config = CopiedPredictorConfig(**saved["architecture"])
+        if tuple(config.source_layers) != tuple(range(student_layer + 1, student_layer + 4)):
+            raise ValueError("Copied source blocks do not match the checkpoint student layer")
         model = CopiedAttentionPredictor(config)
     else:
         raise ValueError("Unsupported attention predictor checkpoint version")
-    if config.input_size != input_size or saved["student_layer"] != 2:
-        raise ValueError("Predictor backbone dimension or source-layer mismatch")
+    if config.input_size != input_size:
+        raise ValueError("Predictor backbone dimension mismatch")
     model.load_state_dict(saved["state_dict"], strict=True)
     model.to(device=device).eval().requires_grad_(False)
     precision = saved.get("student_precision", "float32")
@@ -338,7 +349,7 @@ class AttentionPredictorMixin:
 
     def configure_attention_predictor(self, *, enabled, keep_ratio, checkpoint=None,
                                       capture_attention=False, capture_visualization=False, selection_mode="base_full",
-                                      crop_temperature=0.05, crop_min_keep=0):
+                                      crop_temperature=0.05, crop_min_keep=0, student_layer=2):
         # Old training method.json files explicitly used base_guided. Upgrade
         # that alias to the current policy; explicit old modes remain available.
         selection_mode = "base_full" if selection_mode == "base_guided" else selection_mode
@@ -348,8 +359,8 @@ class AttentionPredictorMixin:
         validate_crop_options(crop_temperature, crop_min_keep)
         self._predictor_crop_temperature, self._predictor_crop_min_keep = crop_temperature, crop_min_keep
         self._predictor_selection_mode = selection_mode
-        if enabled and len(self.layers) <= 2:
-            raise ValueError("Attention predictor needs a decoder deeper than block2")
+        if enabled and (type(student_layer) is not int or not 1 <= student_layer < len(self.layers)):
+            raise ValueError("Attention predictor boundary must be before the last decoder block")
         # Preserve already loaded side weights across rate/sample resets, but not
         # when switching to an unrelated method or the zero-rate baseline.
         self._preserve_predictor_weights = bool(enabled)
@@ -363,12 +374,13 @@ class AttentionPredictorMixin:
             return
         from pathlib import Path
         path = Path(checkpoint).resolve()
-        identity = (str(path), path.stat().st_size, path.stat().st_mtime_ns)
+        identity = (str(path), path.stat().st_size, path.stat().st_mtime_ns, student_layer)
         if identity != self._predictor_checkpoint:
-            model, precision, saved = load_predictor(path, self.embed_tokens.weight.device, self.config.hidden_size)
+            model, precision, saved = load_predictor(path, self.embed_tokens.weight.device, self.config.hidden_size,
+                                                     student_layer=student_layer)
             if saved.get("backbone_depth") != len(self.layers):
                 raise ValueError("Predictor was trained for a different backbone depth")
-            if type(saved.get("teacher_layer")) is not int or not 2 < saved["teacher_layer"] <= len(self.layers):
+            if type(saved.get("teacher_layer")) is not int or not student_layer < saved["teacher_layer"] <= len(self.layers):
                 raise ValueError("Predictor checkpoint has an invalid teacher layer")
             if saved.get("backbone_signature") != backbone_signature(self.config):
                 raise ValueError("Predictor backbone architecture/AnyRes packing/order does not match training")
@@ -379,9 +391,10 @@ class AttentionPredictorMixin:
             self.attention_predictor, self._predictor_precision = model, precision
             self._predictor_teacher_layer = saved["teacher_layer"]
             self._predictor_checkpoint = identity
+            self._predictor_student_layer = student_layer
 
     def _clse_boundary(self):
-        return 2 if self.attention_predictor_enabled else super()._clse_boundary()
+        return self._predictor_student_layer if self.attention_predictor_enabled else super()._clse_boundary()
 
     def _clse_reference(self, hidden, start, end):
         if not self.attention_predictor_enabled:
@@ -467,7 +480,7 @@ class AttentionPredictorMixin:
         full = self._predictor_selection_mode in {"base_full", "anyres_self"}
         mapped = self._predictor_selection_mode == "base_full"
         return dict(score="predicted_layer_attention", attention_source=("copied_qwen2_blocks_3_4_5" if copied else "legacy_small_transformer"),
-                    pruning_layer=2, teacher_layer=self._predictor_teacher_layer,
+                    pruning_layer=self._clse_boundary(), teacher_layer=self._predictor_teacher_layer,
                     selection_mode=self._predictor_selection_mode,
                     budget_scope=("Base fully retained; all original packed-budget deletions transferred to ONE global AnyRes top-k"
                                   if full else "equal-rate Base/whole AnyRes; Base region means -> bounded crop softmax; own AnyRes top-k"
@@ -486,7 +499,7 @@ class AttentionPredictorMixin:
                     pre_llm_pruning_enabled=False, baseline_reference="unpruned native packed sequence",
                     student_layers=3, student_precision=self._predictor_precision,
                     student_hidden_size=self.attention_predictor.config.input_size if copied else self.attention_predictor.config.hidden_size,
-                    student_source_layers=[3, 4, 5] if copied else None)
+                    student_source_layers=list(self.attention_predictor.config.source_layers) if copied else None)
 
     def _clse_score_kind(self):
         if not self.attention_predictor_enabled:

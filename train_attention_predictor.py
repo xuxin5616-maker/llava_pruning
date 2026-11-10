@@ -1,4 +1,4 @@
-"""Distill attention into independently copied Qwen2 blocks 3/4/5; no GT loss."""
+"""Distill attention into three independently copied Qwen2 blocks; no GT loss."""
 
 import argparse
 import csv
@@ -17,14 +17,14 @@ from llava_pruning.training_schedule import training_step_plan
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Frozen LLaVA H2 -> three-layer side attention, supervised by block22")
+    parser = argparse.ArgumentParser(description="Frozen LLaVA hidden states -> three-layer side attention")
     parser.add_argument("--dataset", choices=("visa","mvtec"), default="visa")
     parser.add_argument("--model-path", default="/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/")
     parser.add_argument("--data-root", default="/home/yz/xxy/data/datasets/VisA")
     parser.add_argument("--visa-split-csv", default=None, help="FULL CSV, not test-only list; defaults to data-root/split_csv/1cls.csv")
     parser.add_argument("--output-dir", type=Path, default=Path("output/attention_predictor_copied_train_01"))
     parser.add_argument("--cache-dir", type=Path, default=None,
-                        help="Optional teacher H2 cache. Can consume hundreds of GB; omitted = recompute teacher each epoch")
+                        help="Optional teacher hidden-state cache. Can consume hundreds of GB; omitted = recompute teacher each epoch")
     parser.add_argument("--validation-fraction", type=float, default=.1,
                         help="Internal held-out fraction; 0 trains on every image and saves last.pt without validation")
     parser.add_argument("--seed", type=int, default=42)
@@ -41,13 +41,15 @@ def build_parser():
                         help="Disable training recomputation of the first two copied blocks (uses more VRAM)")
     parser.add_argument("--student-precision", choices=("bfloat16", "float32"), default="bfloat16",
                         help="Affects ONLY student autocast; copied FlashAttention2 blocks require bfloat16. Backbone stays FP16")
-    parser.add_argument("--teacher-layer", type=int, default=22, help="1-based teacher attention block; default22, student source fixed block2")
+    parser.add_argument("--teacher-layer", type=int, default=22, help="1-based teacher attention block; default22")
+    parser.add_argument("--student-layer", type=int, default=2,
+                        help="Take the output of this completed block; copy the next three backbone blocks")
     parser.add_argument("--log-every", type=int, default=20,
                         help="Print progress, phase ETA and total ETA every N images (first/last always printed)")
     return parser
 
 
-def main(argv=None, *, defaults=None):
+def main(argv=None, *, defaults=None, reference=None):
     parser = build_parser()
     if defaults: parser.set_defaults(**defaults)
     args = parser.parse_args(argv)
@@ -75,6 +77,14 @@ def main(argv=None, *, defaults=None):
     final_dataset = "independent VisA" if args.dataset=="mvtec" else "independent MVTec"
     checkpoint_name = "best.pt" if validation else "last.pt"
     plan = training_step_plan(len(train), args.epochs, args.gradient_accumulation, args.warmup_ratio)
+    split_data = {name: "".join(json.dumps(dict(question_id=sample.sample_id, image=sample.origin_path,
+                             category=sample.category, text=GENERIC_PROMPT_V0), ensure_ascii=False) + "\n"
+                             for sample in split).encode("utf-8") for name, split, _ in phases}
+    split_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in split_data.items()}
+    if reference is not None and (data_info["source_sha256"] != reference["source"]["source_sha256"]
+                                  or split_hashes != reference["split_sha256"]
+                                  or GENERIC_PROMPT_V0 != reference["prompt"]):
+        raise ValueError("VisA source, internal split or prompt differs from the previous training run")
     import numpy as np
     import torch
     from benchmark_fastv import validate_single_gpu
@@ -91,8 +101,8 @@ def main(argv=None, *, defaults=None):
     backend.model.requires_grad_(False).eval()
     validate_single_gpu(backend.model, torch)
     core = backend.model.get_model()
-    if not 2 < args.teacher_layer <= len(core.layers):
-        raise ValueError("Teacher layer must be after block2 and within the model depth")
+    if not 1 <= args.student_layer < args.teacher_layer <= len(core.layers):
+        raise ValueError("Teacher layer must follow the student boundary within the backbone depth")
     vendor_imports()  # Add the project's pinned LLaVA to sys.path before vendor imports.
     device = core.embed_tokens.weight.device
     from llava.model.language_model.attention_predictor import CopiedAttentionPredictor, student_autocast
@@ -100,7 +110,8 @@ def main(argv=None, *, defaults=None):
         raise ValueError("Copied FlashAttention2 blocks need --student-precision bfloat16; main model stays FP16")
     with student_autocast(device, args.student_precision):
         pass
-    student = CopiedAttentionPredictor.from_backbone(core, gradient_checkpointing=args.gradient_checkpointing).to(device)
+    student = CopiedAttentionPredictor.from_backbone(core, gradient_checkpointing=args.gradient_checkpointing,
+                                                    student_layer=args.student_layer).to(device)
     architecture = student.config
     optimizer = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad),
                                  lr=args.learning_rate, weight_decay=args.weight_decay,
@@ -115,40 +126,38 @@ def main(argv=None, *, defaults=None):
     file_identity = backbone_file_identity(args.model_path, getattr(core.config, "mm_vision_tower", None))
     identity = dict(backbone_files=file_identity, backbone_signature=signature,
                     inference=backend.inference_config, image_token_order="base_first")
-    examples = TeacherExamples(backend, teacher_layer=args.teacher_layer, cache_dir=args.cache_dir, identity=identity)
+    if reference is not None and json.loads(json.dumps(signature)) != reference["backbone_signature"]:
+        raise ValueError("Backbone architecture differs from the previous VisA training run")
+    examples = TeacherExamples(backend, teacher_layer=args.teacher_layer, student_layer=args.student_layer,
+                               cache_dir=args.cache_dir, identity=identity)
     output.mkdir(parents=True, exist_ok=True)
-    split_hashes = {}
-    for name, split, _ in phases:
-        path = output / f"{name}.jsonl"
-        with path.open("w", encoding="utf-8") as stream:
-            for sample in split:
-                stream.write(json.dumps(dict(question_id=sample.sample_id, image=sample.origin_path,
-                                             category=sample.category, text=GENERIC_PROMPT_V0), ensure_ascii=False) + "\n")
-        split_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    for name, data in split_data.items():
+        (output / f"{name}.jsonl").write_bytes(data)
+    source_layers = "/".join(map(str, architecture.source_layers))
     metadata = dict(version=student.checkpoint_version, configuration={key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
                     source=data_info, training_samples=len(train), validation_samples=len(validation), split_sha256=split_hashes,
                     prompt=GENERIC_PROMPT_V0, architecture=asdict(architecture), backbone_signature=signature,
                     inference=backend.inference_config, objective="KL(teacher last-prompt mean-head spatial attention || side block3 attention)",
-                    teacher_layer=args.teacher_layer, student_source_layer=2, backbone_frozen=True,
+                    teacher_layer=args.teacher_layer, student_source_layer=args.student_layer, backbone_frozen=True,
                     original_visa_test_is_training_source=args.dataset=="visa",
                     original_mvtec_test_is_training_source=args.dataset=="mvtec", final_test_dataset=final_dataset,
                     validation_enabled=bool(validation),
                     checkpoint_selection="lowest internal validation KL" if validation else "last epoch; no validation or test-based selection",
-                    cache_policy="optional H2 + target; keys include prompt/layers/backbone+image file identity and inference config",
-                    initialization="independent pretrained copies of original Qwen2 decoder blocks 3, 4, 5; no LM head",
+                    cache_policy="optional student hidden state + target; keys include prompt/layers/backbone+image file identity and inference config",
+                    initialization=f"independent pretrained copies of original Qwen2 decoder blocks {source_layers}; no LM head",
                     optimization=optimization,
-                    frozen_student_parts="block5 V/O/MLP/post-attention norm: downstream of the attention loss, never executed",
+                    frozen_student_parts=f"copied block{architecture.source_layers[-1]} V/O/MLP/post-attention norm: downstream of the attention loss, never executed",
                     student_parameters=sum(p.numel() for p in student.parameters()),
                     student_trainable_parameters=sum(p.numel() for p in student.parameters() if p.requires_grad))
     (output / "train_run.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     # Relative checkpoint makes this config portable when the training folder moves.
-    method_config = dict(checkpoint=checkpoint_name, layer=2, rate_semantics="layer_average", selection_mode="base_full",
+    method_config = dict(checkpoint=checkpoint_name, layer=args.student_layer, rate_semantics="layer_average", selection_mode="base_full",
                          prune_rates=[30, 50, 70], visualize_rates=[70])
     (output / "method.json").write_text(json.dumps(method_config, indent=2), encoding="utf-8")
     label = "MVTec-AD ALL train+test" if args.dataset=="mvtec" else "VisA ALL-CSV"
     print(f"{label} pool: {len(samples)} images -> train={len(train)}, validation={len(validation)}; no GT/masks", flush=True)
     if not validation: print("Validation disabled; all images train the student. Evaluation checkpoint: last.pt.",flush=True)
-    print(f"Frozen teacher block{args.teacher_layer}; H2 -> copied native blocks 3/4/5, "
+    print(f"Frozen teacher block{args.teacher_layer}; H{args.student_layer} -> copied native blocks {source_layers}, "
           f"width={architecture.input_size}, attention={architecture.attention_implementation}; "
           f"student={metadata['student_parameters']:,} parameters "
           f"(trainable={metadata['student_trainable_parameters']:,}); "
@@ -159,7 +168,7 @@ def main(argv=None, *, defaults=None):
           f"linear warmup={plan['warmup_steps']} updates ({args.warmup_ratio:.1%}), then cosine to zero. "
           f"Epoch-tail batch={plan['last_batch_size']}.", flush=True)
     print("Cache disabled: teacher is recomputed each epoch." if not args.cache_dir else
-          f"Teacher cache: {args.cache_dir}. H2 is large; monitor disk space (potentially hundreds of GB).", flush=True)
+          f"Teacher cache: {args.cache_dir}. Hidden states are large; monitor disk space (potentially hundreds of GB).", flush=True)
     print("ETA: estimating after the first image; updates use recent train/validation speeds. "
           "Approximate, especially during cache warm-up; future checkpoint-save overhead is not estimated.", flush=True)
     fieldnames = ["epoch", "split", "samples", "seconds", "kl", "optimizer_steps", "global_step", "lr_next"]
@@ -201,7 +210,8 @@ def main(argv=None, *, defaults=None):
                 print(f"epoch={epoch} {name}: mean_loss={metrics['kl']:.6f}(KL), seconds={seconds:.2f}", flush=True)
                 if not training or not validation:
                     options = dict(student_precision=args.student_precision, backbone_depth=len(core.layers),
-                                   teacher_layer=args.teacher_layer, signature=signature, provenance=dict(
+                                   teacher_layer=args.teacher_layer, student_layer=args.student_layer,
+                                   signature=signature, provenance=dict(
                                        source_sha256=data_info["source_sha256"], split_sha256=split_hashes,
                                        backbone_path=str(Path(args.model_path).resolve()), prompt=GENERIC_PROMPT_V0,
                                        image_token_order="base_first", optimization=optimization,
@@ -212,12 +222,12 @@ def main(argv=None, *, defaults=None):
                     if not training and metrics["kl"] < best:
                         best = metrics["kl"]
                         save_student(output / "best.pt", student, **options)
-                    (output / "training_status.json").write_text(json.dumps(dict(completed_epochs=epoch, best_validation_kl=best,
-                                                                                global_step=scheduler.last_epoch,
-                                                                                total_steps=plan["total_steps"],
-                                                                                validation_enabled=bool(validation),
-                                                                                evaluation_checkpoint=checkpoint_name,
-                                                                                complete=epoch == args.epochs), indent=2), encoding="utf-8")
+                    status = dict(completed_epochs=epoch, best_validation_kl=best, global_step=scheduler.last_epoch,
+                                  total_steps=plan["total_steps"], validation_enabled=bool(validation),
+                                  evaluation_checkpoint=checkpoint_name, complete=epoch == args.epochs)
+                    pending = output / "training_status.tmp"
+                    pending.write_text(json.dumps(status, indent=2), encoding="utf-8")
+                    pending.replace(output / "training_status.json")
     if validation:
         print(f"Done. Best validation loss={best:.6f}(KL); evaluate {final_dataset} with --method attention_predictor --method-config {output / 'method.json'}", flush=True)
     else:

@@ -15,6 +15,9 @@ from llava.constants import IMAGE_TOKEN_INDEX
 from llava_pruning.pool_distill import PoolDistillMethod
 from llava_pruning.pool_distill_resume import validate_configuration
 from llava_pruning.pool_ablation_report import FIELDS, compact_row
+from llava_pruning.predictor_training import extract_teacher, save_student
+from llava.model.language_model.attention_predictor import backbone_signature
+from test_clse import layout
 from test_fastv_attention import tiny_config
 from test_attention_predictor import make_checkpoint
 from test_pool_spatial import _Tower
@@ -50,6 +53,63 @@ class PoolAblationTests(unittest.TestCase):
         cls.threads=torch.get_num_threads();torch.set_num_threads(1)
     @classmethod
     def tearDownClass(cls): torch.set_num_threads(cls.threads)
+
+    def test_distillation_placement_moves_teacher_capture_and_real_hybrid_boundary(self):
+        torch.manual_seed(941)
+        with tempfile.TemporaryDirectory() as directory, torch.no_grad():
+            model, options = model_and_options(depth=28)
+            core = model.get_model().requires_grad_(False)
+            image_layout = layout()
+            length = image_layout["packed_tokens"]
+            hidden = torch.randn(1, length + 4, 32)
+            observed = {}
+
+            def record(number):
+                def hook(_, __, output):
+                    observed[number] = output[0].clone()
+                return hook
+
+            handles = [core.layers[k - 1].register_forward_hook(record(k)) for k in range(1, 5)]
+            fixed_target = None
+            try:
+                for boundary in range(1, 5):
+                    example = extract_teacher(core, hidden, (1, 1 + length), image_layout,
+                                              teacher_layer=22, student_layer=boundary)
+                    torch.testing.assert_close(example["hidden"], observed[boundary], rtol=0, atol=0)
+                    if fixed_target is None:
+                        fixed_target = example["target"]
+                    torch.testing.assert_close(example["target"], fixed_target, rtol=0, atol=0)
+            finally:
+                for handle in handles:
+                    handle.remove()
+
+            for boundary in range(1, 5):
+                student = CopiedAttentionPredictor.from_backbone(core, student_layer=boundary)
+                self.assertEqual(student.config.source_layers, tuple(range(boundary + 1, boundary + 4)))
+                for src, dst in zip(core.layers[boundary:boundary + 3], student.layers):
+                    self.assertEqual(src.self_attn.layer_idx, dst.self_attn.layer_idx)
+                    torch.testing.assert_close(src.self_attn.q_proj.weight, dst.self_attn.q_proj.weight)
+                    self.assertNotEqual(src.self_attn.q_proj.weight.data_ptr(), dst.self_attn.q_proj.weight.data_ptr())
+                checkpoint = Path(directory) / f"layer_{boundary}.pt"
+                save_student(checkpoint, student, student_precision="float32", student_layer=boundary,
+                             backbone_depth=28, teacher_layer=22, signature=backbone_signature(core.config))
+                method = PoolDistillMethod(core, checkpoint, rate=70, share=.7, mode="base_full",
+                    settings=pool.MethodSettings(prune_rate=0), tail_drop_layers=8, predictor_input="base_text",
+                    base_mapping="fast", base_policy="anyres_first", student_layer=boundary)
+                method.configure(core, 70)
+                method.prepare_inputs((384, 384), options["inputs"])
+                with method.generation_context(model):
+                    model.generate(**options)
+                stats = method.stats(core, 70)
+                self.assertEqual(stats["pruning_layer"], boundary)
+                self.assertEqual(stats["tail_drop_first_layer"], 21)
+                pre, final = stats["pre_llm_tokens"], stats["stage2_llm_visual_tokens"]
+                rows = core.get_clse_stats()["layers"]
+                self.assertEqual([row["image_tokens_in"] for row in rows],
+                                 [pre] * boundary + [final] * (20 - boundary) + [0] * 8)
+            with self.assertRaisesRegex(ValueError, "source-layer mismatch"):
+                core.configure_attention_predictor(enabled=True, keep_ratio=.5, checkpoint=checkpoint,
+                                                   student_layer=1)
 
     def test_base_text_input_selects_only_base_and_text_preserving_position_gaps(self):
         hidden=torch.arange(40.).reshape(1,10,4)
