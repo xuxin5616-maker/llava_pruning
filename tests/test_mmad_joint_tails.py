@@ -76,6 +76,57 @@ class JointTailScheduleTests(unittest.TestCase):
             self.assertEqual(len(source_rows),136)
             self.assertEqual({r['source'] for r in source_rows},{'GoodsAD','MVTec-AD','MVTec-LOCO','VisA'})
 
+    def test_append_stretched_tail8_rates_reuses_inputs_and_preserves_original_results(self):
+        with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
+            root = Path(temporary)
+            args = entry.parser().parse_args([
+                "--experiment-group", "baselines_joint90", "--resize-mode", "stretch",
+                "--joint-self-tails", "8", "9", "--gpus", "0", "1", "2", "3", "4", "5",
+            ], namespace=fixture(root))
+            common.save_json(Path(args.model_path) / "config.json",
+                             {"num_hidden_layers": 28, "image_grid_pinpoints": [[1152, 1152]]})
+            calls = []
+
+            def process(command, **kwargs):
+                manifest = Path(command[command.index("--manifest") + 1])
+                spec = json.loads(manifest.read_text(encoding="utf-8"))
+                job_id = command[command.index("--worker") + 1]
+                job = next(j for j in spec["jobs"] if j["job_id"] == job_id)
+                calls.append(job_id)
+                self.assertEqual(kwargs["env"]["CUDA_VISIBLE_DEVICES"], job["gpu"])
+                samples = load_frozen(spec["input_json"], exclude_sources=("VisA",))
+                records = [prediction(s, s.source["correct_option"]) for s in samples]
+                report = entry.summarize_records(records, samples, job, 2**30)
+                folder = manifest.parent / job_id
+                folder.mkdir()
+                common.save_json(folder / "metrics.json", dict(report, job_id=job_id, status="success",
+                                                               input_sha256=spec["input_sha256"]))
+                return SimpleNamespace(poll=lambda: 0, wait=lambda **kw: 0)
+
+            with patch.object(entry.subprocess, "Popen", side_effect=process):
+                self.assertEqual(entry.run(args), 0)
+                self.assertEqual(len(calls), 20)
+                output = args.output_dir
+                old = json.loads((output / "run.json").read_text(encoding="utf-8"))
+                old_summary = (output / "summary.csv").read_bytes()
+                old_assets = {path: path.stat().st_mtime_ns for path in (output / "prepared_images").glob("*.png")}
+                extra = entry.parser().parse_args([
+                    "--resume", "--append-joint-self-rates", "50", "70", "--joint-self-tails", "8",
+                    "--output-dir", str(output),
+                ])
+                self.assertEqual(entry.run(extra), 0)
+                self.assertEqual(calls[20:], ["hybrid_joint_self_tail08_50", "hybrid_joint_self_tail08_70"])
+                self.assertEqual(entry.run(extra), 0)
+                self.assertEqual(len(calls), 22)
+                new = json.loads((output / "run.json").read_text(encoding="utf-8"))
+                self.assertEqual(new["jobs"][:len(old["jobs"])], old["jobs"])
+                self.assertEqual(new["input_sha256"], old["input_sha256"])
+                self.assertEqual(new["gpus"], old["gpus"])
+                self.assertEqual(new["completed_trials"], 22)
+                self.assertTrue(new["complete"])
+                self.assertTrue((output / "summary.csv").read_bytes().startswith(old_summary))
+                self.assertTrue(all(path.stat().st_mtime_ns == stamp for path, stamp in old_assets.items()))
+
     def test_custom_tail_list_survives_historical_visa_extension(self):
         from test_mmad_extension import historical
         def custom_fixture(root):

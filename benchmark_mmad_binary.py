@@ -62,6 +62,8 @@ def parser():
     p.add_argument("--output-dir", type=Path, default=Path("output/mmad_no_visa_two_hybrids_gpu567_01"))
     p.add_argument("--check-data", action="store_true", help="Validate/count local questions and images; no model/GPU/output files")
     p.add_argument("--resume", action="store_true", help="Resume saved configuration, GPU and question order")
+    p.add_argument("--append-joint-self-rates", type=int, nargs="+", choices=(50, 70, 90),
+                   help="With --resume, append and run only these joint_self rates at the selected saved tails")
     p.add_argument("--include-visa", action="store_true", help="Evaluate all four MMAD sources; VisA-trained hybrids are labelled as training overlap")
     p.add_argument("--reuse-dir", type=Path, help="With --include-visa, import a previous no-VisA run read-only. Restore its model/student/rates/settings; only infer missing questions into a NEW --output-dir")
     p.add_argument("--worker", help=argparse.SUPPRESS)
@@ -210,8 +212,41 @@ def prepare_stretched_images(records, output, model_config):
         row.update(images[Path(row["resolved_image"])])
 
 
+def append_joint_self_jobs(output, spec, rates, tails):
+    if (spec.get("experiment_group") != "baselines_joint90" or spec.get("resize_mode") != "stretch"
+            or spec.get("include_visa") or not spec["checkpoint"]["path"]):
+        raise ValueError("Append requires the existing no-VisA stretch baselines_joint90 experiment")
+    if "completed_trials" not in spec:
+        raise ValueError("Wait for the original experiment to finish before appending. Use plain --resume if it stopped.")
+    if len(rates) != len(set(rates)) or not set(tails).issubset(spec["joint_self_tails"]):
+        raise ValueError("Provide distinct rates and choose --joint-self-tails from the saved experiment")
+
+    candidates = schedule(rates, spec["gpus"], experiment_group="joint_self", joint_self_tails=tails)
+    existing = {job["job_id"]: job for job in spec["jobs"]}
+    appended = []
+    for job in candidates:
+        if job.get("variant") != "joint_self":
+            continue
+        previous = existing.get(job["job_id"])
+        if previous is not None:
+            job["gpu"] = previous["gpu"]
+        config = job["config"].rsplit(";gpu=", 1)[0]
+        job["config"] = f"{config};gpu={job['gpu']};resize=stretch;canvas=1152;grid=3x3"
+        if previous is None:
+            appended.append(job)
+        elif previous != job:
+            raise ValueError(f"Saved job has a different configuration: {job['job_id']}")
+    if appended:
+        spec["jobs"].extend(appended)
+        spec["complete"] = False
+        common.save_json(output / "run.json", spec)
+        print("Appended " + ", ".join(job["job_id"] for job in appended), flush=True)
+
+
 def setup(args):
     output = args.output_dir.expanduser().resolve()
+    if args.append_joint_self_rates and (not args.resume or args.reuse_dir):
+        raise ValueError("--append-joint-self-rates requires --resume on the existing output directory")
     if args.resume:
         spec = json.loads((output/"run.json").read_text(encoding="utf-8"))
         source_check=verify_inputs(spec)
@@ -224,6 +259,8 @@ def setup(args):
             record_source_identity(spec,source_check)
             common.save_json(output/"run.json",spec)
             print("Verified legacy source; resume with unchanged MMAD inference dependencies. Old manifest: "+str(backup),flush=True)
+        if args.append_joint_self_rates:
+            append_joint_self_jobs(output, spec, args.append_joint_self_rates, args.joint_self_tails)
         # All options, including per-trial GPU assignments, are restored.
         return output,spec
     if args.reuse_dir:
@@ -523,6 +560,7 @@ def write_reports(output, spec):
     common.save_csv(output/"summary.csv",rows,FIELDS)
     common.save_csv(output/"summary_by_source.csv",source_rows,SOURCE_FIELDS)
     common.save_csv(output/"budget_summary.csv",budgets,BUDGET_FIELDS)
+    return results
 
 
 def run(args):
@@ -544,10 +582,14 @@ def run(args):
               flush=True)
     queues={gpu:deque() for gpu in spec["gpus"]}
     for job in spec["jobs"]:
+        if args.append_joint_self_rates and (job.get("variant") != "joint_self"
+                or job["prune_rate"] not in args.append_joint_self_rates
+                or job["tail_drop_layers"] not in args.joint_self_tails):
+            continue
         if job["status"]=="unreachable":
             print(f"SKIP {job['job_id']}: {job['reason']}",flush=True)
         else: queues[job["gpu"]].append(job)
-    failures=[];active={};completed=0
+    failures=[];active={}
     last_progress=time.perf_counter()
     try:
         while active or any(queues.values()):
@@ -556,7 +598,6 @@ def run(args):
                     job=queue.popleft();path=output/job["job_id"]/"metrics.json"
                     old=json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
                     if old.get("status")=="success" and old.get("complete"):
-                        completed+=1
                         print(f"Reuse {job['job_id']} on GPU {gpu}",flush=True);continue
                     command=[sys.executable,"-u",str(PROJECT/"benchmark_mmad_binary.py"),"--worker",job["job_id"],
                              "--manifest",str(output/"run.json")]
@@ -581,7 +622,6 @@ def run(args):
                     common.save_json(path,dict(result,job_id=job["job_id"],gpu_id=gpu,status="failed",complete=False,
                         input_sha256=spec["input_sha256"],error=error))
                     print(f"FAILED {job['job_id']}: {error}",flush=True)
-                else: completed+=1
                 print(f"Finished GPU {gpu}: {job['job_id']}; exit={code}; elapsed={time.perf_counter()-started:.1f}s",flush=True)
                 write_reports(output,spec)
             if time.perf_counter()-last_progress>=30:
@@ -605,8 +645,11 @@ def run(args):
             try: process.wait(timeout=15)
             except subprocess.TimeoutExpired: process.kill();process.wait()
             finally: log.close()
-        write_reports(output,spec)
-    spec.update(complete=not failures,completed_trials=completed,failed_trials=failures)
+        results = write_reports(output, spec)
+    pending_ids = [job["job_id"] for job in spec["jobs"] if job["status"] == "pending"]
+    completed = sum(results[key].get("status") == "success" and bool(results[key].get("complete")) for key in pending_ids)
+    failed = [key for key in pending_ids if results[key].get("status") == "failed"]
+    spec.update(complete=completed == len(pending_ids), completed_trials=completed, failed_trials=failed)
     common.save_json(output/"run.json",spec)
     print(f"Summary: {output/'summary.csv'}; sources: {output/'summary_by_source.csv'}",flush=True)
     if failures: print("Failed trials (see logs, then --resume): "+", ".join(failures),flush=True)
