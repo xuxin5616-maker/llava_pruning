@@ -134,6 +134,39 @@ class CopiedPredictorTests(unittest.TestCase):
         prediction = student(example["hidden"], example["position_ids"], example["spatial_indices"])
         torch.testing.assert_close(prediction.exp(), example["target"], rtol=1e-5, atol=1e-7)
 
+    def test_depth_ablation_executes_only_the_requested_full_blocks_and_trains_the_head(self):
+        torch.manual_seed(1015)
+        core = core_model("eager")
+        hidden = torch.randn(1, 19, 32)
+        with tempfile.TemporaryDirectory() as directory:
+            for full_blocks in range(4):
+                with self.subTest(full_blocks=full_blocks):
+                    score_layer = 3 + full_blocks
+                    student = CopiedAttentionPredictor.from_backbone(
+                        core, full_blocks=full_blocks, gradient_checkpointing=False)
+                    self.assertEqual(student.config.source_layers, tuple(range(3, score_layer + 1)))
+                    example = extract_teacher(core, hidden, (2, 16), layout(), teacher_layer=score_layer)
+                    inputs = (example["hidden"], example["position_ids"], example["spatial_indices"])
+                    with patch.object(student, "_run_block", wraps=student._run_block) as run_block:
+                        scores = student(*inputs)
+                    self.assertEqual([call.args[0] for call in run_block.call_args_list],
+                                     list(student.layers[:-1]))
+                    torch.testing.assert_close(scores.exp(), example["target"], rtol=1e-5, atol=1e-7)
+
+                    target = torch.zeros_like(scores)
+                    target[0] = 1
+                    distillation_loss(scores, target).backward()
+                    head = student.layers[-1].self_attn
+                    self.assertGreater(head.q_proj.weight.grad.abs().sum().item(), 0)
+                    self.assertGreater(head.k_proj.weight.grad.abs().sum().item(), 0)
+                    self.assertIsNone(head.v_proj.weight.grad)
+
+                    path = Path(directory) / f"depth_{full_blocks}.pt"
+                    save_student(path, student, student_precision="float32", backbone_depth=6, teacher_layer=6,
+                                 signature=backbone_signature(core.config))
+                    restored, _, _ = load_predictor(path, "cpu", 32)
+                    torch.testing.assert_close(restored(*inputs), scores.detach(), rtol=0, atol=0)
+
     def test_kl_training_reduces_loss_without_changing_copied_frozen_tail_or_teacher(self):
         torch.manual_seed(913)
         core = core_model()
@@ -182,7 +215,7 @@ class CopiedPredictorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "blocks 3, 4, 5"):
             CopiedAttentionPredictor.from_backbone(LlavaQwenModel(tiny_config()))
         config = CopiedAttentionPredictor.from_backbone(core_model()).config
-        with self.assertRaisesRegex(ValueError, "three consecutive blocks"):
+        with self.assertRaisesRegex(ValueError, "consecutive blocks"):
             CopiedPredictorConfig(config.qwen_config, "sdpa", source_layers=(2, 4, 5))
 
     def test_real_generate_zero_identity_and_copied_branch_pruning_original_features_once(self):

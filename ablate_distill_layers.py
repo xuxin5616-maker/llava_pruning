@@ -1,4 +1,4 @@
-"""Retrain four VisA side-branch placements and compare them on MVTec AD."""
+"""Ablate VisA side-branch placement or depth and evaluate on MVTec AD."""
 
 import argparse
 import gc
@@ -19,6 +19,8 @@ from llava_pruning.pool_distill_resume import file_hash
 
 PROJECT = Path(__file__).resolve().parent
 LAYERS = (1, 2, 3, 4)
+DEPTHS = (0, 1, 2, 3)
+BASELINE_LAYER, BASELINE_DEPTH = 2, 2
 RATES = (50, 70, 90)
 SHARE, TAIL, MODE = .7, 8, "base_full"
 
@@ -52,7 +54,16 @@ def previous_recipe(path):
     return saved, recipe
 
 
-def preflight(model_config, input_json, data_root):
+def groups(axis):
+    return DEPTHS if axis == "depth" else LAYERS
+
+
+def group_dir(root, spec, group):
+    prefix = "depth" if spec.get("axis") == "depth" else "layer"
+    return root / f"{prefix}_{group}"
+
+
+def preflight(model_config, input_json, data_root, *, axis="placement"):
     from PIL import Image
     from llava_pruning.data import load_samples
     from llava_pruning.predictor_training import vendor_imports
@@ -67,8 +78,14 @@ def preflight(model_config, input_json, data_root):
     merge = model_config["mm_patch_merge_type"]
     if depth != 28 or merge not in {"spatial_unpad", "spatial_unpad_add_newl"}:
         raise ValueError("Expected the 28-block LLaVA-OneVision model with spatial_unpad packing")
-    jobs = {f"{layer}/{rate}": dict(layer=layer, rate=rate, infeasible_samples=0, reason=None)
-            for layer in LAYERS for rate in RATES}
+    jobs = {}
+    for group in groups(axis):
+        for rate in RATES:
+            layer = BASELINE_LAYER if axis == "depth" else group
+            job = dict(layer=layer, rate=rate, infeasible_samples=0, reason=None)
+            if axis == "depth":
+                job["full_blocks"] = group
+            jobs[f"{group}/{rate}"] = job
     checked = {}
     for sample in samples:
         with Image.open(sample.image) as image:
@@ -93,12 +110,15 @@ def preflight(model_config, input_json, data_root):
     return jobs
 
 
-def evaluate_layer(root, spec, layer, gpu, checkpoint):
+def evaluate_layer(root, spec, group, gpu, checkpoint):
     failed = False
     for rate in RATES:
-        if spec["jobs"][f"{layer}/{rate}"]["infeasible_samples"]:
+        job = spec["jobs"][f"{group}/{rate}"]
+        if job["infeasible_samples"]:
             continue
-        folder = root / f"layer_{layer}" / f"prune_{rate}"
+        layer = job["layer"]
+        group_path = group_dir(root, spec, group)
+        folder = group_path / f"prune_{rate}"
         args = evaluation.build_parser().parse_args([
             "--worker", "--gpu", str(gpu), "--output-dir", str(folder), "--resume",
             "--model-path", spec["model_path"], "--input-json", spec["input_json"],
@@ -107,7 +127,7 @@ def evaluate_layer(root, spec, layer, gpu, checkpoint):
             "--predictor-input", "base_text", "--base-mapping", "fast", "--base-policy", "anyres_first",
             "--tail-drop-layers", str(TAIL), "--pruning-audit", "lean", "--summary-format", "compact",
         ])
-        print(f"MVTec layer {layer}, {rate}%", flush=True)
+        print(f"MVTec {group_path.name}, prune={rate}%", flush=True)
         try:
             if evaluation.verified_complete(folder, args, rate, SHARE, MODE):
                 saved = read_json(folder / "run.json")
@@ -127,32 +147,40 @@ def evaluate_layer(root, spec, layer, gpu, checkpoint):
     return int(failed)
 
 
-def run_layer(root, spec, layer, gpu):
+def run_layer(root, spec, group, gpu):
     manifest = Path(spec["previous_training"])
     if file_hash(manifest) != spec["previous_training_sha256"]:
         raise ValueError("Reference training manifest changed")
     saved, recipe = previous_recipe(manifest)
-    folder = root / f"layer_{layer}" / "student"
+    job = spec["jobs"][f"{group}/{RATES[0]}"]
+    layer = job["layer"]
+    full_blocks = job.get("full_blocks", BASELINE_DEPTH)
+    source_layers = tuple(range(layer + 1, layer + full_blocks + 2))
+    group_path = group_dir(root, spec, group)
+    folder = group_path / "student"
     status_path = folder / "training_status.json"
     status = read_json(status_path) if status_path.is_file() else {}
     if status.get("complete"):
         metadata = read_json(folder / "train_run.json")
-        if (metadata["student_source_layer"] != layer or metadata["split_sha256"] != saved["split_sha256"]
+        if (metadata["student_source_layer"] != layer
+                or tuple(metadata["architecture"]["source_layers"]) != source_layers
+                or metadata["split_sha256"] != saved["split_sha256"]
                 or metadata["source"]["source_sha256"] != saved["source"]["source_sha256"]):
-            raise ValueError(f"Existing training run does not match layer {layer} or the reference split")
-        print(f"Reusing completed VisA layer {layer} training", flush=True)
+            raise ValueError(f"Existing training run does not match {group_path.name} or the reference split")
+        print(f"Reusing completed VisA {group_path.name} training", flush=True)
     else:
         if folder.exists() and any(folder.iterdir()):
             archive = folder.with_name(f"student_interrupted_{time.time_ns()}")
             folder.rename(archive)
-            print(f"Archived incomplete training to {archive}; restarting layer {layer}", flush=True)
-        training.main(["--student-layer", str(layer), "--output-dir", str(folder)],
+            print(f"Archived incomplete training to {archive}; restarting {group_path.name}", flush=True)
+        training.main(["--student-layer", str(layer), "--student-full-blocks", str(full_blocks),
+                       "--output-dir", str(folder)],
                       defaults=recipe, reference=saved)
         status = read_json(status_path)
     checkpoint = folder / status["evaluation_checkpoint"]
     if not status["complete"] or not checkpoint.is_file():
         raise ValueError(f"Training did not produce its selected checkpoint: {checkpoint}")
-    return evaluate_layer(root, spec, layer, gpu, checkpoint)
+    return evaluate_layer(root, spec, group, gpu, checkpoint)
 
 
 def write_report(root, spec, exit_codes):
@@ -161,10 +189,15 @@ def write_report(root, spec, exit_codes):
         layer, rate = job["layer"], job["rate"]
         config = (f"layer={layer};prune={rate}%;lambda={SHARE:g};{MODE};input=base_text;"
                   f"tail={TAIL};mapping=fast;base_policy=anyres_first")
+        group = job.get("full_blocks", layer)
+        full_blocks = job.get("full_blocks", BASELINE_DEPTH)
         row = dict.fromkeys((*FIELDS, "status", "reason", "infeasible_samples", "source_blocks",
                              "validation_kl", "gpu_id", "actual_two_stage_pct", "actual_with_tail_pct"))
+        if "full_blocks" in job:
+            config = f"depth={full_blocks};{config}"
+            row.update(full_blocks=full_blocks, score_head_layer=layer + full_blocks + 1)
         row["config"] = config
-        folder = root / f"layer_{layer}"
+        folder = group_dir(root, spec, group)
         metric_path = folder / f"prune_{rate}" / "metrics.json"
         trial_run = metric_path.with_name("run.json")
         if job["infeasible_samples"]:
@@ -177,40 +210,40 @@ def write_report(root, spec, exit_codes):
                        actual_with_tail_pct=metrics["actual_average_prune_rate"])
             status, reason = "complete", ""
         else:
-            status = "failed" if exit_codes.get(layer) else "pending"
+            status = "failed" if exit_codes.get(group) else "pending"
             reason = str(folder / "worker.log")
         status_path = folder / "student" / "training_status.json"
         row.update(status=status, reason=reason, infeasible_samples=job["infeasible_samples"],
-                   source_blocks="/".join(map(str, range(layer + 1, layer + 4))),
+                   source_blocks="/".join(map(str, range(layer + 1, layer + full_blocks + 2))),
                    validation_kl=read_json(status_path).get("best_validation_kl") if status_path.is_file() else None)
         rows.append(row)
     evaluation.write_csv(root / "summary.csv", rows)
 
 
 def run_all(root, spec, gpus):
-    waiting, active, exit_codes = list(LAYERS), {}, {}
+    waiting, active, exit_codes = list(groups(spec.get("axis", "placement"))), {}, {}
     try:
         while waiting or active:
             for gpu in gpus:
                 if gpu in active or not waiting:
                     continue
-                layer = waiting.pop(0)
-                folder = root / f"layer_{layer}"
+                group = waiting.pop(0)
+                folder = group_dir(root, spec, group)
                 folder.mkdir(exist_ok=True)
                 log = folder / "worker.log"
                 with log.open("a", encoding="utf-8") as stream:
-                    active[gpu] = (layer, subprocess.Popen(
+                    active[gpu] = (group, subprocess.Popen(
                         [sys.executable, "-u", __file__, "--output-dir", str(root),
-                         "--worker-layer", str(layer), "--gpus", str(gpu)],
+                         "--worker-group", str(group), "--gpus", str(gpu)],
                         cwd=PROJECT, env=dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu)),
                         stdout=stream, stderr=subprocess.STDOUT))
-                print(f"Layer {layer} on GPU {gpu} | {log}", flush=True)
-            for gpu, (layer, child) in list(active.items()):
+                print(f"{folder.name} on GPU {gpu} | {log}", flush=True)
+            for gpu, (group, child) in list(active.items()):
                 code = child.poll()
                 if code is not None:
-                    exit_codes[layer] = code
+                    exit_codes[group] = code
                     del active[gpu]
-                    print(f"Layer {layer} finished | exit={code}", flush=True)
+                    print(f"{group_dir(root, spec, group).name} finished | exit={code}", flush=True)
             write_report(root, spec, exit_codes)
             if active:
                 time.sleep(5)
@@ -227,18 +260,27 @@ def run_all(root, spec, gpus):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     defaults = evaluation.build_parser().parse_args([])
-    parser.add_argument("--gpus", type=int, nargs="+", default=[0, 1, 2, 3])
+    parser.add_argument("--axis", choices=("placement", "depth"), default="placement")
+    parser.add_argument("--gpus", type=int, nargs="+",
+                        help="Physical GPUs (placement default: 0 1 2 3; depth default: 1 2 3 4)")
     parser.add_argument("--previous-training", type=Path, default=defaults.checkpoint.parent / "train_run.json")
     parser.add_argument("--input-json", type=Path, default=defaults.input_json)
     parser.add_argument("--data-root", type=Path, default=defaults.data_root)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--worker-layer", type=int, choices=LAYERS, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-group", "--worker-layer", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
     root = args.output_dir.resolve()
     manifest = root / "run.json"
-    if args.worker_layer:
-        return run_layer(root, read_json(manifest), args.worker_layer, args.gpus[0])
+    if args.worker_group is not None:
+        spec = read_json(manifest)
+        if args.worker_group not in groups(spec.get("axis", "placement")):
+            parser.error("Invalid worker group for the saved ablation")
+        if args.gpus is None or len(args.gpus) != 1:
+            parser.error("The worker needs one physical GPU")
+        return run_layer(root, spec, args.worker_group, args.gpus[0])
+    if args.gpus is None:
+        args.gpus = [1, 2, 3, 4] if args.axis == "depth" else [0, 1, 2, 3]
     if len(set(args.gpus)) != len(args.gpus) or min(args.gpus) < 0:
         parser.error("--gpus requires distinct nonnegative device IDs")
     if root.exists() and any(root.iterdir()) and not args.resume:
@@ -251,14 +293,18 @@ def main():
                 model_path=str(model), model_config_sha256=file_hash(model_config),
                 input_json=str(args.input_json.resolve()), input_json_sha256=file_hash(args.input_json),
                 data_root=str(args.data_root.resolve()), lambda_share=SHARE, tail_drop_layers=TAIL,
-                jobs=preflight(read_json(model_config), args.input_json, args.data_root))
+                jobs=preflight(read_json(model_config), args.input_json, args.data_root, axis=args.axis))
+    if args.axis == "depth":
+        spec["axis"] = "depth"
     if args.resume and (not manifest.is_file() or read_json(manifest) != spec):
         parser.error("Resume requires the same recipe, model configuration, evaluation input and preflight jobs")
     root.mkdir(parents=True, exist_ok=True)
     evaluation.write_json(manifest, spec)
     for job in spec["jobs"].values():
         if job["infeasible_samples"]:
-            print(f"Skipping layer {job['layer']}, {job['rate']}% | {job['infeasible_samples']} infeasible images | {job['reason']}", flush=True)
+            group = job.get("full_blocks", job["layer"])
+            print(f"Skipping {group_dir(root, spec, group).name}, {job['rate']}% | "
+                  f"{job['infeasible_samples']} infeasible images | {job['reason']}", flush=True)
     code = run_all(root, spec, args.gpus)
     print(f"Summary | {root / 'summary.csv'}", flush=True)
     return code

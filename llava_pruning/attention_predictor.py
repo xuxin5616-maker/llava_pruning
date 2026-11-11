@@ -119,8 +119,8 @@ class AttentionPredictorMethod:
                     sha.update(block)
             digest = sha.hexdigest()
         return dict(checkpoint=str(self.checkpoint), checkpoint_sha256=digest,
-                    algorithm="KL-trained three-layer side attention; not full MAP/TwigVLM reproduction",
-                    student="architecture comes from checkpoint: v2 independent copies of the next three pretrained Qwen2 blocks; v1 legacy small branch",
+                    algorithm="KL-trained side attention predictor",
+                    student="architecture comes from checkpoint: v2 copied Qwen2 blocks and Q/K scoring head; v1 legacy small branch",
                     teacher="fixed checkpoint teacher block (default22); last prompt query -> visual keys, mean heads; independent QK",
                     gradient="frozen backbone; student trained separately with KL(teacher||student); no GT",
                     selection_mode=self.selection_mode,

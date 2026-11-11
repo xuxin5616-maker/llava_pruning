@@ -28,18 +28,19 @@ TAIL0_FUNCTION_PAIRS={
 EXTENSION='llava_pruning/mmad_extension.py'
 TAIL0_EXTENSION_PAIR=('fe6f8f3b0c6cdd9af7d91227f62328bfb75b2b1c39e306eff9321b77e4f2628f',
                       '69d0fce97b11e5356b212f052acb8e5f1262f57b3c345347612fa56b584b4b2f')
-# Exact reviewed before/after digests. MMAD still uses the default block 2
-# everywhere; only the separate MVTec layer ablation supplies another block.
-STUDENT_LAYER_PAIRS = {
+# Reviewed file histories. MMAD's default attachment and depth are preserved.
+STUDENT_LAYER_HASHES = {
     'llava_pruning/attention_predictor.py': (
         '64a49902aeb3e374ab77406da12918339ba960df011b6a061fd0d45eceea6b5e',
-        '898f54ef83cb68243a3850e96d3d3d2276798d5c39f255bca2c950f3c8693f99'),
+        '898f54ef83cb68243a3850e96d3d3d2276798d5c39f255bca2c950f3c8693f99',
+        '7be508bfd41bb105dcf85ec73d2ddbc255cde0600b909335766284a3ad4788ed'),
     'llava_pruning/pool_distill.py': (
         'cd0f64d81bcd4e0f07fc1563741900bbcd7b70d928c68b54da4e8314f5d68c19',
         'f21349cee7bcc4275310850ba19ed7f8b2cb29cb4fbee66c594e3da32583b5dc'),
     'vendor/llava/llava/model/language_model/attention_predictor.py': (
         '5a16c112a87c23125b182e4bc738b11f5294ac9d2c9f895e5c089941bf6c8022',
-        '82abf3cc49b89b14528c013c19e6f317ffbe2f611aadd0495973d6ac26343e0e'),
+        '82abf3cc49b89b14528c013c19e6f317ffbe2f611aadd0495973d6ac26343e0e',
+        '1a5b941fda5b5c58a192a768cf51f79544544ef3e66ff07b1b26f12ee2616342'),
 }
 
 
@@ -146,8 +147,8 @@ def changed_paths(before,after):
 
 
 def default_student_layer_updates(before, after):
-    return [p for p in changed_paths(before, after)
-            if STUDENT_LAYER_PAIRS.get(p) == (before['files'].get(p), after['files'].get(p))]
+    return [path for path, hashes in STUDENT_LAYER_HASHES.items()
+            if before['files'].get(path) in hashes[:-1] and after['files'].get(path) == hashes[-1]]
 
 
 def local_changes(files,head):

@@ -147,9 +147,9 @@ class CopiedPredictorConfig:
 
     def __post_init__(self):
         layers = tuple(self.source_layers)
-        if (len(layers) != 3 or any(type(layer) is not int for layer in layers)
-                or layers[0] < 2 or layers != tuple(range(layers[0], layers[0] + 3))):
-            raise ValueError("Copied predictor requires three consecutive blocks after the student boundary")
+        if (not 1 <= len(layers) <= 4 or any(type(layer) is not int for layer in layers)
+                or layers[0] < 2 or layers != tuple(range(layers[0], layers[0] + len(layers)))):
+            raise ValueError("Copied predictor requires one to four consecutive blocks after the student boundary")
         if self.attention_implementation not in {"eager", "sdpa", "flash_attention_2"}:
             raise ValueError("Unsupported copied Qwen2 attention implementation")
         if type(self.gradient_checkpointing) is not bool:
@@ -182,17 +182,19 @@ class CopiedAttentionPredictor(nn.Module):
                                      for i in config.source_layers])
         self.rotary_emb = Qwen2RotaryEmbedding(config=native_config)
         self.requires_grad_(True)
-        last = self.layers[2]
+        last = self.layers[-1]
         last.requires_grad_(False)
         for module in (last.input_layernorm, last.self_attn.q_proj, last.self_attn.k_proj):
             module.requires_grad_(True)
 
     @classmethod
-    def from_backbone(cls, core, *, gradient_checkpointing=True, student_layer=2):
+    def from_backbone(cls, core, *, gradient_checkpointing=True, student_layer=2, full_blocks=2):
         from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer, Qwen2RotaryEmbedding
         if type(student_layer) is not int or student_layer < 1:
             raise ValueError("Student layer must identify a completed decoder block")
-        source_layers = tuple(range(student_layer + 1, student_layer + 4))
+        if type(full_blocks) is not int or not 0 <= full_blocks <= 3:
+            raise ValueError("Student depth must be zero to three full decoder blocks")
+        source_layers = tuple(range(student_layer + 1, student_layer + full_blocks + 2))
         if source_layers[-1] > len(core.layers) or not isinstance(core.rotary_emb, Qwen2RotaryEmbedding):
             raise ValueError(f"Copied predictor requires native Qwen2 blocks {', '.join(map(str, source_layers))} and RoPE")
         config = CopiedPredictorConfig(copied_qwen_config(core.config), core.config._attn_implementation,
@@ -232,7 +234,7 @@ class CopiedAttentionPredictor(nn.Module):
             raise ValueError("Predictor needs distinct original spatial token indices")
         # Detach is intentional: training must never backpropagate into H2/main.
         value = hidden.detach().to(self.layers[0].input_layernorm.weight.dtype)
-        for layer in self.layers[:2]:
+        for layer in self.layers[:-1]:
             if self.training and self.config.gradient_checkpointing and torch.is_grad_enabled():
                 from torch.utils.checkpoint import checkpoint
                 # Bind layer now; a loop closure would recompute the wrong layer.
@@ -241,7 +243,7 @@ class CopiedAttentionPredictor(nn.Module):
                 value = checkpoint(run_block, value, position_ids, use_reentrant=False)
             else:
                 value = self._run_block(layer, value, position_ids)
-        last = self.layers[2]
+        last = self.layers[-1]
         attention = last.self_attn
         normalized = last.input_layernorm(value)
         query = attention.q_proj(normalized[:, -1:]).view(1, 1, attention.num_heads, attention.head_dim).transpose(1, 2)
@@ -300,7 +302,7 @@ def load_predictor(path, device, input_size, *, student_layer=2):
         model = AttentionPredictor(config)
     elif saved.get("version") == CHECKPOINT_VERSION:
         config = CopiedPredictorConfig(**saved["architecture"])
-        if tuple(config.source_layers) != tuple(range(student_layer + 1, student_layer + 4)):
+        if config.source_layers[0] != student_layer + 1:
             raise ValueError("Copied source blocks do not match the checkpoint student layer")
         model = CopiedAttentionPredictor(config)
     else:
@@ -475,11 +477,14 @@ class AttentionPredictorMixin:
         if not self.attention_predictor_enabled:
             return super()._clse_extra_stats()
         copied = isinstance(self.attention_predictor, CopiedAttentionPredictor)
+        source_layers = list(self.attention_predictor.config.source_layers) if copied else None
         guided = self._predictor_selection_mode == "base_interpolated"
         crop = self._predictor_selection_mode == "base_crop"
         full = self._predictor_selection_mode in {"base_full", "anyres_self"}
         mapped = self._predictor_selection_mode == "base_full"
-        return dict(score="predicted_layer_attention", attention_source=("copied_qwen2_blocks_3_4_5" if copied else "legacy_small_transformer"),
+        return dict(score="predicted_layer_attention",
+                    attention_source=("copied_qwen2_blocks_" + "_".join(map(str, source_layers))
+                                      if copied else "legacy_small_transformer"),
                     pruning_layer=self._clse_boundary(), teacher_layer=self._predictor_teacher_layer,
                     selection_mode=self._predictor_selection_mode,
                     budget_scope=("Base fully retained; all original packed-budget deletions transferred to ONE global AnyRes top-k"
@@ -497,9 +502,9 @@ class AttentionPredictorMixin:
                     crop_temperature=self._predictor_crop_temperature if crop else None,
                     crop_min_keep=self._predictor_crop_min_keep if crop else None,
                     pre_llm_pruning_enabled=False, baseline_reference="unpruned native packed sequence",
-                    student_layers=3, student_precision=self._predictor_precision,
+                    student_layers=len(source_layers) if copied else 3, student_precision=self._predictor_precision,
                     student_hidden_size=self.attention_predictor.config.input_size if copied else self.attention_predictor.config.hidden_size,
-                    student_source_layers=list(self.attention_predictor.config.source_layers) if copied else None)
+                    student_source_layers=source_layers)
 
     def _clse_score_kind(self):
         if not self.attention_predictor_enabled:

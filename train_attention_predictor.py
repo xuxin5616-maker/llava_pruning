@@ -1,4 +1,4 @@
-"""Distill attention into three independently copied Qwen2 blocks; no GT loss."""
+"""Distill attention into independently copied Qwen2 blocks and a Q/K head."""
 
 import argparse
 import csv
@@ -17,7 +17,7 @@ from llava_pruning.training_schedule import training_step_plan
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Frozen LLaVA hidden states -> three-layer side attention")
+    parser = argparse.ArgumentParser(description="Distill side attention from frozen LLaVA hidden states")
     parser.add_argument("--dataset", choices=("visa","mvtec"), default="visa")
     parser.add_argument("--model-path", default="/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/")
     parser.add_argument("--data-root", default="/home/yz/xxy/data/datasets/VisA")
@@ -38,12 +38,14 @@ def build_parser():
                         help="One image per microbatch, one visible GPU: default effective batch=128")
     parser.add_argument("--max-grad-norm", type=float, default=1.)
     parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false",
-                        help="Disable training recomputation of the first two copied blocks (uses more VRAM)")
+                        help="Disable training recomputation of the full copied blocks (uses more VRAM)")
     parser.add_argument("--student-precision", choices=("bfloat16", "float32"), default="bfloat16",
                         help="Affects ONLY student autocast; copied FlashAttention2 blocks require bfloat16. Backbone stays FP16")
     parser.add_argument("--teacher-layer", type=int, default=22, help="1-based teacher attention block; default22")
     parser.add_argument("--student-layer", type=int, default=2,
-                        help="Take the output of this completed block; copy the next three backbone blocks")
+                        help="Take the output of this completed backbone block")
+    parser.add_argument("--student-full-blocks", type=int, choices=range(4), default=2,
+                        help="Number of full copied blocks before the Q/K head (default: 2)")
     parser.add_argument("--log-every", type=int, default=20,
                         help="Print progress, phase ETA and total ETA every N images (first/last always printed)")
     return parser
@@ -111,7 +113,8 @@ def main(argv=None, *, defaults=None, reference=None):
     with student_autocast(device, args.student_precision):
         pass
     student = CopiedAttentionPredictor.from_backbone(core, gradient_checkpointing=args.gradient_checkpointing,
-                                                    student_layer=args.student_layer).to(device)
+                                                    student_layer=args.student_layer,
+                                                    full_blocks=args.student_full_blocks).to(device)
     architecture = student.config
     optimizer = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad),
                                  lr=args.learning_rate, weight_decay=args.weight_decay,
@@ -137,7 +140,7 @@ def main(argv=None, *, defaults=None, reference=None):
     metadata = dict(version=student.checkpoint_version, configuration={key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
                     source=data_info, training_samples=len(train), validation_samples=len(validation), split_sha256=split_hashes,
                     prompt=GENERIC_PROMPT_V0, architecture=asdict(architecture), backbone_signature=signature,
-                    inference=backend.inference_config, objective="KL(teacher last-prompt mean-head spatial attention || side block3 attention)",
+                    inference=backend.inference_config, objective="KL(teacher last-prompt mean-head spatial attention || student Q/K head attention)",
                     teacher_layer=args.teacher_layer, student_source_layer=args.student_layer, backbone_frozen=True,
                     original_visa_test_is_training_source=args.dataset=="visa",
                     original_mvtec_test_is_training_source=args.dataset=="mvtec", final_test_dataset=final_dataset,
@@ -157,7 +160,8 @@ def main(argv=None, *, defaults=None, reference=None):
     label = "MVTec-AD ALL train+test" if args.dataset=="mvtec" else "VisA ALL-CSV"
     print(f"{label} pool: {len(samples)} images -> train={len(train)}, validation={len(validation)}; no GT/masks", flush=True)
     if not validation: print("Validation disabled; all images train the student. Evaluation checkpoint: last.pt.",flush=True)
-    print(f"Frozen teacher block{args.teacher_layer}; H{args.student_layer} -> copied native blocks {source_layers}, "
+    print(f"Frozen teacher block{args.teacher_layer}; H{args.student_layer} -> copied native blocks {source_layers} "
+          f"({args.student_full_blocks} full + Q/K head), "
           f"width={architecture.input_size}, attention={architecture.attention_implementation}; "
           f"student={metadata['student_parameters']:,} parameters "
           f"(trainable={metadata['student_trainable_parameters']:,}); "

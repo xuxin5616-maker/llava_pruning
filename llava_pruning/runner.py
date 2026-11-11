@@ -158,7 +158,7 @@ def run(*, model_path, input_json, data_root, prompt_version, method_name,
             score_dtype="FP32 relevance, novelty and importance branch; native decoder dtype/backend unchanged")
         metadata["extended_metric_definitions"] = METRIC_DEFINITIONS
     if method.name == "attention_predictor":
-        metadata["inference"] = dict(metadata["inference"], attention_source="trained three-layer side Transformer",
+        metadata["inference"] = dict(metadata["inference"], attention_source="trained side attention predictor",
                                      score_dtype="FP32 final QK/softmax/mapping; student precision in checkpoint; backbone untouched",
                                      predictor_selection_mode=method.selection_mode,
                                      ranking_source=("Base region means allocate crop quotas; own AnyRes prediction selects tokens"
