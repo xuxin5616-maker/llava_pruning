@@ -97,7 +97,7 @@ def export_source_decisions(decisions):
     return result
 
 
-def encode(adapter, images):
+def encode(adapter, images, *, compress_global=None):
     if adapter.core.training or adapter.geometry is None:
         raise ValueError("Lean MyPool requires eval mode and prepared image geometry")
     expected = 1+adapter.geometry.tile_count
@@ -127,17 +127,24 @@ def encode(adapter, images):
         handles.append(attention.k_proj.register_forward_hook(key_hook))
         for layer in adapter.settings.visionzip_layers:
             handles.append(blocks[layer-1].self_attn.register_forward_hook(score_hook(layer),with_kwargs=True))
-        for layer in adapter.settings.redundancy_layers:
-            handles.append(blocks[layer-1].register_forward_hook(feature_hook(layer)))
+        if compress_global is None:
+            for layer in adapter.settings.redundancy_layers:
+                handles.append(blocks[layer-1].register_forward_hook(feature_hook(layer)))
         features = adapter.tower(images)
     finally:
         for handle in handles: handle.remove()
+    expected_redundancies = set(adapter.settings.redundancy_layers) if compress_global is None else set()
     if (set(scores)!=set(adapter.settings.visionzip_layers)
-            or set(redundancies)!=set(adapter.settings.redundancy_layers)
+            or set(redundancies)!=expected_redundancies
             or "metric" not in keys or features.shape[:2]!=(expected,729)):
         raise RuntimeError("Incomplete lean SigLIP capture")
     selected_scores = (scores[adapter.settings.visionzip_layers[0]] if len(scores)==1 else
         torch.stack([scores[layer].float() for layer in adapter.settings.visionzip_layers]).mean(0))
+    if compress_global is not None:
+        packed, decisions, roles = compress_global(adapter, features, selected_scores, keys["metric"])
+        adapter.device_decisions, adapter.roles = decisions, roles
+        adapter.stats = dict(final_llm_visual_tokens=len(packed), full_grid_identity=False)
+        return packed
     first = redundancies[adapter.settings.redundancy_layers[0]]
     redundancy = (first["redundancy"] if len(redundancies)==1 else
         torch.stack([redundancies[layer]["redundancy"] for layer in adapter.settings.redundancy_layers]).mean(0))

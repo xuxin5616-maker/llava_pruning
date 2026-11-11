@@ -37,6 +37,9 @@ STUDENT_LAYER_HASHES = {
     'llava_pruning/pool_distill.py': (
         'cd0f64d81bcd4e0f07fc1563741900bbcd7b70d928c68b54da4e8314f5d68c19',
         'f21349cee7bcc4275310850ba19ed7f8b2cb29cb4fbee66c594e3da32583b5dc'),
+    'llava_pruning/pool_lean.py': (
+        '419dda1e61e2981e718699da52a0ad8c946d86e5e2c8c34d8703e27472dc06e9',
+        '114136631883422d28a826bc0b58e7471146cdcad5d06890df44516398358452'),
     'vendor/llava/llava/model/language_model/attention_predictor.py': (
         '5a16c112a87c23125b182e4bc738b11f5294ac9d2c9f895e5c089941bf6c8022',
         '82abf3cc49b89b14528c013c19e6f317ffbe2f611aadd0495973d6ac26343e0e',

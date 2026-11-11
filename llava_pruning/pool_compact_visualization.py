@@ -26,21 +26,22 @@ def anchor_decisions(decisions):
             for d in decisions]
 
 
-def render_compact(method,trace,processor,result,sample,rate,panel_height=768):
+def render_compact(method,trace,processor,result,sample,rate,panel_height=768,*,pre_llm_label=None):
     from .visualization import prediction_caption
     if type(panel_height) is not int or panel_height<1: raise ValueError('panel-height must be positive')
-    if 'pixels' not in trace or 'selected' not in trace:
-        raise RuntimeError('Missing actual encoder input or pre-tail distillation selection')
+    if 'pixels' not in trace or (pre_llm_label is None and 'selected' not in trace):
+        raise RuntimeError('Missing actual encoder input or pruning selection')
     adapter=method.adapter;grid=tuple(adapter.geometry.grid);width,height=grid
     views=input_rgb(trace['pixels'],processor)
     decisions=anchor_decisions(adapter.device_decisions)
-    selected=trace['selected'].cpu().tolist()
+    plan=adapter.plan
+    selected=trace['selected'].cpu().tolist() if pre_llm_label is None else range(plan['pre_llm_tokens'])
     before,after,newlines=anchor_masks(decisions,grid,selected,
         final_newline=adapter.core.config.mm_patch_merge_type.endswith('_add_newl'))
     if len(views)!=1+width*height or after.shape!=(len(views),729):
         raise ValueError('Input views differ from actual AnyRes geometry')
-    plan=adapter.plan
-    if int(before.sum())+newlines!=plan['pre_llm_tokens'] or int(after.sum())+newlines!=plan['final_llm_tokens']:
+    expected = plan['final_llm_tokens'] if pre_llm_label is None else plan['pre_llm_tokens']
+    if int(before.sum())+newlines!=plan['pre_llm_tokens'] or int(after.sum())+newlines!=expected:
         raise RuntimeError('Rendered anchors disagree with the actual two-stage token budget')
     patch=int(adapter.geometry.patch_size)
     base=Image.fromarray(white_positions(views[0],after[0],patch))
@@ -58,8 +59,11 @@ def render_compact(method,trace,processor,result,sample,rate,panel_height=768):
         canvas=Image.new('RGB',(2*margin+sum(p.width for p in scaled)+2*gap,header+panel_height+footer),'white')
         draw=ImageDraw.Draw(canvas)
         title='Joint self-attention Top-k' if getattr(method,'base_policy','anyres_first')=='joint' else 'Baseline'
-        draw.text((margin,10),f'{title} | Avg pruning {rate:g}% | lambda=0.7 | ID: {sample.sample_id}',fill='black',font=font(20))
-        draw.text((margin,40),prediction_caption(sample.gt,result['answer'])+' | After MyPool + distillation, BEFORE tail9',fill='black',font=font(16))
+        heading = (f'{title} | Avg pruning {rate:g}% | lambda=0.7' if pre_llm_label is None
+                   else f'{pre_llm_label} | Target pruning {rate:g}%')
+        stage = 'After MyPool + distillation, BEFORE tail9' if pre_llm_label is None else 'After MyPool, before LLM'
+        draw.text((margin,10),f'{heading} | ID: {sample.sample_id}',fill='black',font=font(20))
+        draw.text((margin,40),prediction_caption(sample.gt,result['answer'])+' | '+stage,fill='black',font=font(16))
         labels=('Original',f'Base (pruned; {int(after[0].sum())}/729)',
                 f'AnyRes (pruned; {width} x {height}; {int(after[1:].sum())}/{729*(len(views)-1)})')
         left=margin;panels=[]
@@ -70,8 +74,13 @@ def render_compact(method,trace,processor,result,sample,rate,panel_height=768):
         draw.text((margin,header+panel_height+8),'White = removed independent token position (merged sources included). Unencoded crop edges unchanged.',fill='black',font=font(13))
     finally:
         for picture in pictures+scaled: picture.close()
-    return canvas,dict(native_grid=list(grid),encoder_views=len(views),
+    details = dict(native_grid=list(grid),encoder_views=len(views),
         base_kept=int(after[0].sum()),anyres_kept=int(after[1:].sum()),protected_newlines=newlines,
-        baseline_packed_tokens=plan['baseline_packed_tokens'],pre_llm_tokens=plan['pre_llm_tokens'],post_distill_tokens=len(selected),
-        panels=panels,post_snapshot='after MyPool and block2 distillation, before tail9',
+        baseline_packed_tokens=plan['baseline_packed_tokens'],pre_llm_tokens=plan['pre_llm_tokens'],
+        panels=panels,post_snapshot=stage,
         mask_semantics='RGB255 at removed independent anchors, including merged-away source positions')
+    if pre_llm_label is None:
+        details.update(post_distill_tokens=len(selected), post_snapshot='after MyPool and block2 distillation, before tail9')
+    else:
+        details['anyres_kept_per_crop'] = after[1:].sum(axis=1).tolist()
+    return canvas, details
