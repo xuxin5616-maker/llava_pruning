@@ -218,14 +218,15 @@ def samples_for(spec):
     return samples
 
 
-def restored(folder,samples,selection_mode='baseline'):
+def restored(folder,samples,selection_mode='baseline',*,sample_indices=None):
     path=folder/'predictions.jsonl';rows,valid=common.read_prefix(path)
     if len(rows)>len(samples): raise ValueError('Too many saved visualization rows')
     for i,(row,sample) in enumerate(zip(rows,samples)):
         if row.get('index')!=i or row.get('question_id')!=sample.sample_id or row.get('gt')!=sample.gt:
             raise ValueError('Saved image ID/order/GT changed')
         if row.get('selection_mode','baseline')!=selection_mode: raise ValueError('Saved image selection mode changed')
-        if row.get('output')!=f'visualizations/sample_{i:09d}.png' or not isinstance(row.get('answer'),str):
+        sample_index=i if sample_indices is None else sample_indices[i]
+        if row.get('output')!=f'visualizations/sample_{sample_index:09d}.png' or not isinstance(row.get('answer'),str):
             raise ValueError('Invalid saved image/output record')
         if not (folder/row['output']).is_file(): raise FileNotFoundError(folder/row['output'])
     if path.is_file() and path.stat().st_size!=valid:

@@ -27,7 +27,11 @@ class BaseOnlyPruningTests(unittest.TestCase):
     def test_50_percent_layer_average_and_rate_specific_resume(self):
         self.check_native_matched_masks_and_three_images(["--prune-rate", "50"], rate=50, kept=336)
 
-    def check_native_matched_masks_and_three_images(self, cli, *, rate, kept):
+    def test_rerender_selected_sample_with_translucent_mask(self):
+        self.check_native_matched_masks_and_three_images(["--prune-rate", "50"], rate=50, kept=336,
+                                                        overlay=True)
+
+    def check_native_matched_masks_and_three_images(self, cli, *, rate, kept, overlay=False):
         threads = torch.get_num_threads()
         torch.set_num_threads(1)
         try:
@@ -45,8 +49,25 @@ class BaseOnlyPruningTests(unittest.TestCase):
                 save_student(args.checkpoint, student, student_precision="float32", backbone_depth=28,
                              teacher_layer=22, signature=backbone_signature(core.config))
                 output, spec = entry.setup(args)
+                indices = None
+                sample_name, mask_color = "sample_000000000.png", [255, 255, 255]
+                if overlay:
+                    source = output
+                    spec["version"] = entry.PREVIOUS_VERSION
+                    spec.pop("mask_opacity")
+                    entry.common.save_json(source / "run.json", spec)
+                    args = entry.parser().parse_args(["--source-run", str(source), "--sample-indices", "1",
+                                                      "--mask-opacity", "0.3", "--gpus", "0"])
+                    output, spec = entry.setup(args)
+                    self.assertEqual(output, source / "mask_30pct")
+                    self.assertEqual(spec["gpus"], [0])
+                    self.assertEqual(spec["sample_count"], 1)
+                    indices = [1]
+                    sample_name, mask_color = "sample_000000001.png", [84, 107, 129]
                 self.assertEqual(spec["prune_rate"], rate)
                 samples = entry.samples_for(spec)
+                if overlay:
+                    self.assertEqual(samples[0].sample_id, "000000001")
                 configure_image_mode(model.config, "base_only")
                 backend = LlavaBackend.__new__(LlavaBackend)
                 backend.model, backend.vision_tower = model, tower
@@ -58,7 +79,8 @@ class BaseOnlyPruningTests(unittest.TestCase):
                         patch.object(model, "generate", side_effect=lambda **kw: native_generate(**dict(kw, max_new_tokens=2))), \
                         patch.object(torch.cuda, "synchronize"), torch.inference_mode():
                     for mode in entry.MODES:
-                        method = entry.BaseOnlyPruning(core, mode, args.checkpoint, prune_rate=spec["prune_rate"])
+                        method = entry.BaseOnlyPruning(core, mode, spec["checkpoint"]["path"],
+                                                       prune_rate=spec["prune_rate"])
                         self.assertEqual(method.target, kept)
                         with observe_prefill(core) as lengths:
                             entry.render_samples(backend, method, samples, spec, output / mode)
@@ -66,20 +88,20 @@ class BaseOnlyPruningTests(unittest.TestCase):
                         self.assertEqual(list(lengths.values()), expected)
                         self.assertEqual(model.config.image_aspect_ratio, "base_only")
                         self.assertNotIn("prepare_inputs_labels_for_multimodal", model.__dict__)
-                        rows = entry.restored(output / mode, samples, mode)
+                        rows = entry.restored(output / mode, samples, mode, sample_indices=indices)
                         self.assertTrue(all(row["image_tokens"] == 729 and row["kept_tokens"] == kept for row in rows))
                         for row in rows:
                             with Image.open(output / mode / row["output"]) as image:
                                 rgb = np.asarray(image)
                                 self.assertEqual(image.size, (384, 384))
-                                self.assertEqual(np.all(rgb == 255, axis=2).sum(), (729 - kept) * 14 ** 2)
+                                self.assertEqual(np.all(rgb == mask_color, axis=2).sum(), (729 - kept) * 14 ** 2)
                                 self.assertTrue(np.all(rgb[378:, :, :] == [12, 44, 76]))
                         entry.render_samples(backend, method, samples, spec, output / mode)
                     self.assertEqual(model.generate.call_count, len(samples) * 2)
 
-                entry.comparison_images(output, samples, prune_rate=spec["prune_rate"])
+                entry.comparison_images(output, samples, prune_rate=spec["prune_rate"], sample_indices=indices)
                 self.assertEqual(len(list(output.rglob("*.png"))), len(samples) * 3)
-                with Image.open(output / "comparisons" / "sample_000000000.png") as image:
+                with Image.open(output / "comparisons" / sample_name) as image:
                     self.assertEqual(image.size, (1600, 472))
                 args.resume = True
                 self.assertEqual(entry.setup(args), (output, spec))
