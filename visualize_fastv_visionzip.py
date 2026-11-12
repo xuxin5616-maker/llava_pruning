@@ -14,15 +14,15 @@ from PIL import Image
 import benchmark_visa_methods as common
 import visualize_mvtec_baseline as baseline
 from llava_pruning.pool_distill_visualization import input_rgb, white_positions
-from llava_pruning.visa_comparison_methods import AverageFastV, VisionZipMethod
+from llava_pruning.visa_comparison_methods import AverageFastV, VisionZipMethod, make_method
 
 
 RATE = 50
 INDICES = (55, 1200, 286, 403, 488, 1705)
 
 
-def fastv_view_keeps(image_mask, metadata, side):
-    """Map packed FastV decisions to the original encoder tile grid."""
+def packed_view_keeps(image_mask, metadata, side):
+    """Map packed decoder pruning decisions to the original encoder tile grid."""
     import torch
     from llava.model.llava_arch import unpad_image
 
@@ -39,10 +39,10 @@ def fastv_view_keeps(image_mask, metadata, side):
     anyres_end = base_count + rows * (cols + 1)
     start, end = image_mask["span"]
     if len(packed) != anyres_end + int(metadata["final_newline"]) or end - start != len(packed):
-        raise ValueError("FastV mask does not match the packed Base/AnyRes geometry")
+        raise ValueError("Decoder mask does not match the packed Base/AnyRes geometry")
     anyres = packed[base_count:anyres_end].reshape(rows, cols + 1)[:, :cols]
     # Max9 can pool the unpadded features. Project each coarse decision onto
-    # its nearest cell; padding positions never entered the FastV ranking.
+    # its nearest cell; unpadded positions were outside the packed grid.
     with Image.fromarray(anyres) as mask:
         with mask.resize((unpadded.shape[1], unpadded.shape[0]), Image.Resampling.NEAREST) as projected:
             keep = np.ones((raw_rows, raw_cols), dtype=bool)
@@ -116,23 +116,30 @@ def run(args):
     core = backend.model.get_model()
     tower = backend.vision_tower
     side, patch_size = int(tower.num_patches_per_side), int(tower.config.patch_size)
-    method = (AverageFastV(RATE, len(core.layers)) if args.method == "fastv"
-              else VisionZipMethod(core, RATE, capture_anchors=True))
+    if args.method == "fastv":
+        method = AverageFastV(RATE, len(core.layers))
+    elif args.method == "visionzip":
+        method = VisionZipMethod(core, RATE, capture_anchors=True)
+    else:
+        method = make_method("clse", core, RATE, None)
     with torch.inference_mode():
         for index, sample in zip(INDICES, samples):
             with Image.open(sample.image) as image:
                 pixels, crop_metadata = process_images([image.convert("RGB")], backend.processor,
                                                        core.config, return_pro_data=True)
             metadata = crop_metadata[0]
-            backend.generate(sample, sample.source["prompt"], method, RATE, "anyres_max_9",
-                             capture_visualization=False, capture_attention=False,
-                             random_seed=spec["seed"] + index, do_sample=False,
-                             include_pruning_time=True, benchmark_metrics=False)
-            if args.method == "fastv":
-                (image_mask,), = core.get_fastv_image_masks()
-                keeps = fastv_view_keeps(image_mask, metadata, side)
-            else:
+            result = backend.generate(sample, sample.source["prompt"], method, RATE, "anyres_max_9",
+                                      capture_visualization=args.method == "clse", capture_attention=False,
+                                      random_seed=spec["seed"] + index, do_sample=False,
+                                      include_pruning_time=True, benchmark_metrics=False)
+            if args.method == "visionzip":
                 keeps = visionzip_view_anchors(method.adapter, side)
+            elif args.method == "fastv":
+                (image_mask,), = core.get_fastv_image_masks()
+                keeps = packed_view_keeps(image_mask, metadata, side)
+            else:
+                stage, = result["stages"]
+                keeps = packed_view_keeps(stage["mask"], metadata, side)
             directory = output / f"sample_{index:09d}"
             save_views(input_rgb(pixels[0], backend.processor), keeps, metadata["grid_patches"], patch_size, directory)
             print(f"{args.method} | {index}={sample.sample_id} | {directory}", flush=True)
@@ -141,7 +148,7 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-run", type=Path, required=True)
-    parser.add_argument("--method", choices=("fastv", "visionzip"), required=True)
+    parser.add_argument("--method", choices=("fastv", "visionzip", "clse"), required=True)
     parser.add_argument("--gpu", type=int, required=True)
     args = parser.parse_args()
     try:
