@@ -75,9 +75,9 @@ def parser():
     p.add_argument('--seed',type=int,default=42)
     p.add_argument('--panel-height',type=int,default=768)
     p.add_argument('--output-dir',type=Path,help='Override the output directory, including for a source-run subset')
-    p.add_argument('--source-run',type=Path,help='Existing full MVTec visualization run for a baseline lambda subset')
+    p.add_argument('--source-run',type=Path,help='Existing full MVTec visualization run for a lambda subset')
     p.add_argument('--sample-indices',type=int,nargs='+',help='Zero-based numbers in the source sample PNG filenames')
-    p.add_argument('--distill-share',type=float,help='Lambda for the selected-sample baseline run')
+    p.add_argument('--distill-share',type=float,help='Lambda for the selected-sample run')
     p.add_argument('--resume',action='store_true',help='Restore saved settings, skip completed PNGs, continue missing samples')
     p.add_argument('--check-data',action='store_true',help='Validate/count the FULL input; no model, GPU or output files')
     p.add_argument('--find-existing',action='store_true',help='Read-only search of output/outputs for MVTec visualization records')
@@ -169,31 +169,37 @@ def verify(spec):
 def subset_spec(args, source_dir, output):
     source=json.loads((source_dir/'run.json').read_text(encoding='utf-8'))
     verify(source)
-    if 'sample_indices' in source or 'baseline' not in source.get('selection_modes',['baseline']):
-        raise ValueError('Select samples from the original full baseline run')
+    if 'sample_indices' in source:
+        raise ValueError('Select samples from the original full visualization run')
     rows,_=common.read_prefix(Path(source['input_json']))
     indices=args.sample_indices
     if (len(rows)!=source['sample_count'] or len(set(indices))!=len(indices) or
             min(indices)<0 or max(indices)>=len(rows)):
         raise ValueError('Use distinct sample indices within the original frozen sample list')
-    rates={job['prune_rate'] for job in source['jobs'] if job.get('selection_mode','baseline')=='baseline'}
-    if not set(args.prune_rates).issubset(rates):
-        raise ValueError('Requested rates are absent from the original baseline run')
+    for mode in args.selection_modes:
+        rates={job['prune_rate'] for job in source['jobs'] if job.get('selection_mode','baseline')==mode}
+        if not set(args.prune_rates).issubset(rates):
+            raise ValueError(f'Requested rates for {mode} are absent from the original run')
     if student_identity(source['checkpoint']['path'],'visa')!=source['checkpoint']:
         raise ValueError('Original student or training manifest changed')
 
     share=args.distill_share
-    config=mode_configuration('baseline',share)
+    configs={mode:mode_configuration(mode,share) for mode in args.selection_modes}
     selected=[rows[index] for index in indices]
     output.mkdir(parents=True,exist_ok=True)
     frozen=output/'input_frozen.jsonl'
     frozen.write_text(''.join(json.dumps(row,ensure_ascii=False)+'\n' for row in selected),encoding='utf-8')
     spec=dict(source,version=VERSION,created_utc=datetime.now(timezone.utc).isoformat(),
               source_run=str(source_dir),sample_indices=indices,sample_count=len(selected),distill_share=share,
-              input_json=str(frozen),input_sha256=common.digest(frozen),configuration=config,
-              selection_modes=['baseline'],mode_configurations={'baseline':config},
-              jobs=schedule(args.prune_rates,args.gpus,['baseline']),source_identity=common.source_identity())
-    spec['definitions']=dict(source['definitions'],selection=f'Base-mapped AnyRes ranking, Base+Text side input, anyres_first, lambda={share:g}, tail9.')
+              input_json=str(frozen),input_sha256=common.digest(frozen),configuration=configs[args.selection_modes[0]],
+              selection_modes=args.selection_modes,mode_configurations=configs,
+              jobs=schedule(args.prune_rates,args.gpus,args.selection_modes),source_identity=common.source_identity())
+    descriptions={
+        'baseline':'Base-mapped AnyRes ranking, Base+Text side input, anyres_first.',
+        'joint_self':'Base+AnyRes+Text side input, predicted self-attention, joint Base/AnyRes Top-k.',
+    }
+    selection=' '.join(descriptions[mode] for mode in args.selection_modes)
+    spec['definitions']=dict(source['definitions'],selection=f'{selection} lambda={share:g}, tail9.')
     common.save_json(output/'run.json',spec)
     return output,spec
 
@@ -204,17 +210,18 @@ def setup(args):
     if source_dir is None and (args.sample_indices is not None or args.distill_share is not None):
         raise ValueError('--sample-indices and --distill-share require --source-run')
     if source_dir is not None:
-        if (not args.sample_indices or args.distill_share is None or not 0<args.distill_share<1
-                or args.selection_modes!=['baseline'] or args.add_joint_self):
-            raise ValueError('--source-run requires sample indices, 0 < lambda < 1 and baseline mode')
-        default_output=source_dir/f'lambda_{args.distill_share:g}'
+        if not args.sample_indices or args.distill_share is None or not 0<args.distill_share<1 or args.add_joint_self:
+            raise ValueError('--source-run requires sample indices, 0 < lambda < 1 and explicit selection modes for new jobs')
+        suffix='' if args.selection_modes==['baseline'] else '_'+ '_'.join(args.selection_modes)
+        default_output=source_dir/f'lambda_{args.distill_share:g}{suffix}'
     output=(args.output_dir or default_output).expanduser().resolve()
     if args.resume:
         spec=json.loads((output/'run.json').read_text(encoding='utf-8'));verify(spec)
         if source_dir is not None and (str(source_dir)!=spec.get('source_run') or
                 args.sample_indices!=spec.get('sample_indices') or args.distill_share!=spec.get('distill_share') or
+                args.selection_modes!=spec.get('selection_modes') or
                 set(args.prune_rates)!={job['prune_rate'] for job in spec['jobs']}):
-            raise ValueError('Source run, sample indices, lambda or rates differ from the saved subset')
+            raise ValueError('Source run, sample indices, lambda, modes or rates differ from the saved subset')
         if student_identity(spec['checkpoint']['path'],'visa')!=spec['checkpoint']:
             raise ValueError('Saved student or training manifest changed')
         if args.add_joint_self and 'joint_self' not in spec.get('selection_modes',['baseline']):
@@ -224,7 +231,8 @@ def setup(args):
                 previous=next(j for j in existing if j['prune_rate']==rate)
                 added+=schedule([rate],[int(previous['gpu'])],['joint_self'])
             spec.update(version=VERSION,selection_modes=[*spec.get('selection_modes',['baseline']),'joint_self'],
-                mode_configurations={**spec.get('mode_configurations',{'baseline':dict(BASELINE)}),'joint_self':mode_configuration('joint_self')},
+                mode_configurations={**spec.get('mode_configurations',{'baseline':dict(BASELINE)}),
+                    'joint_self':mode_configuration('joint_self',spec.get('distill_share',BASELINE['distill_share']))},
                 jobs=existing+added)
             common.save_json(output/'run.json',spec)
             print('Appended joint_self jobs; saved baseline pictures and progress are retained.',flush=True)

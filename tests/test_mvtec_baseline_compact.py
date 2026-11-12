@@ -132,8 +132,15 @@ class CompactTests(unittest.TestCase):
             self.assertNotIn('select',method.adapter.__dict__)
 
     def test_lambda_subset_uses_original_filenames_and_runs_the_new_budget(self):
+        self.check_lambda_subset('baseline')
+
+    def test_joint_lambda_subset_uses_full_input_and_joint_topk(self):
+        self.check_lambda_subset('joint_self')
+
+    def check_lambda_subset(self, mode):
         with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
             args = fixture(Path(temporary))
+            args.selection_modes = ['baseline', 'joint_self']
             model, options = model_and_options(28)
             core = model.get_model()
             model.config.max_position_embeddings = 4096
@@ -141,11 +148,14 @@ class CompactTests(unittest.TestCase):
             original, old = entry.setup(args)
             old_manifest = (original / 'run.json').read_bytes()
             cli = ['--source-run', str(original), '--sample-indices', '1',
-                   '--distill-share', '0.3', '--gpus', '0', '1']
+                   '--distill-share', '0.3', '--selection-modes', mode, '--gpus', '0', '1']
             subset, spec = entry.setup(entry.parser().parse_args(cli))
             entry.verify(spec)
-            self.assertEqual(subset, original / 'lambda_0.3')
-            self.assertEqual(spec['configuration'], dict(old['configuration'], distill_share=.3))
+            expected_folder = 'lambda_0.3' if mode == 'baseline' else 'lambda_0.3_joint_self'
+            self.assertEqual(subset, original / expected_folder)
+            config = old['mode_configurations'][mode]
+            self.assertEqual(spec['configuration'], dict(config, distill_share=.3))
+            self.assertEqual(spec['selection_modes'], [mode])
             self.assertEqual([job['gpu'] for job in spec['jobs']], ['0', '1'])
             self.assertEqual((original / 'run.json').read_bytes(), old_manifest)
             samples = entry.samples_for(spec)
@@ -159,11 +169,13 @@ class CompactTests(unittest.TestCase):
                     patch.object(mm_utils, 'tokenizer_image_token', return_value=options['inputs'][0]):
                 for job in spec['jobs']:
                     rate = job['prune_rate']
-                    method = entry.make_method(core, spec['checkpoint']['path'], rate, 'baseline',
+                    method = entry.make_method(core, spec['checkpoint']['path'], rate, mode,
                                                share=spec['distill_share'])
+                    self.assertEqual((method.predictor_input, method.base_policy),
+                                     (config['predictor_input'], config['base_policy']))
                     folder = entry.job_folder(subset, job)
                     entry.render_samples(backend, method, samples, spec, job, folder)
-                    rows = entry.restored(folder, samples, sample_indices=[1])
+                    rows = entry.restored(folder, samples, mode, sample_indices=[1])
                     self.assertEqual(rows[0]['question_id'], '000000001')
                     self.assertEqual(rows[0]['output'], 'visualizations/sample_000000001.png')
                     self.assertEqual(rows[0]['sample_seed'], spec['seed'] + 1)
