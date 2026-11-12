@@ -67,10 +67,10 @@ def compress_global_anyres(adapter, features, scores, metric):
 
 
 class PreLlmMethod:
-    def __init__(self, core, mode, rate):
+    def __init__(self, core, mode, rate, *, temperature=pool.DEFAULT_ALLOCATION_TEMPERATURE):
         self.mode, self.rate = mode, rate
         settings = pool.MethodSettings(prune_rate=0, redundancy_layers=(26,), visionzip_layers=(26,),
-                                       allocation_temperature=.05, spatial_strength=0.)
+                                       allocation_temperature=temperature, spatial_strength=0.)
         self.adapter = PreLlmAdapter(core, settings, rate=rate, share=0, mode="anyres_self", lean=True)
         self.adapter.compress_global = compress_global_anyres if mode == "global_anyres" else None
 
@@ -128,22 +128,28 @@ def run_trial(backend, samples, spec, folder, mode, rate):
     folder.mkdir(parents=True, exist_ok=True)
     pictures = folder / "visualizations"
     pictures.mkdir(exist_ok=True)
-    rows = baseline.restored(folder, samples, mode)
+    sample_indices = spec.get("sample_indices")
+    rows = baseline.restored(folder, samples, mode, sample_indices=sample_indices)
     start = len(rows)
     started = time.perf_counter()
-    method = PreLlmMethod(backend.model.get_model(), mode, rate)
+    temperature = spec.get("allocation_temperature", pool.DEFAULT_ALLOCATION_TEMPERATURE)
+    method = PreLlmMethod(backend.model.get_model(), mode, rate, temperature=temperature)
+    label = MODES[mode]
+    if "allocation_temperature" in spec:
+        label += f" | tau={temperature:g}"
     with (folder / "predictions.jsonl").open("a", encoding="utf-8") as stream:
         for index in range(start, len(samples)):
             sample = samples[index]
+            source_index = index if sample_indices is None else sample_indices[index]
             with capture_baseline_views(method) as trace:
                 result = backend.generate(
                     sample, sample.source["prompt"], method, rate, "anyres_max_9",
-                    capture_visualization=False, capture_attention=False, random_seed=spec["seed"] + index,
+                    capture_visualization=False, capture_attention=False, random_seed=spec["seed"] + source_index,
                     do_sample=False, include_pruning_time=True, benchmark_metrics=False,
                 )
             picture, details = render_compact(method, trace, backend.processor, result, sample, rate,
-                                              spec["panel_height"], pre_llm_label=MODES[mode])
-            name = f"visualizations/sample_{index:09d}.png"
+                                              spec["panel_height"], pre_llm_label=label)
+            name = f"visualizations/sample_{source_index:09d}.png"
             with picture:
                 save_png(picture, folder / name)
             row = dict(index=index, question_id=sample.sample_id, gt=sample.gt, answer=result["answer"],
