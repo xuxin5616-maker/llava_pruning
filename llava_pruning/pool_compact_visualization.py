@@ -26,7 +26,7 @@ def anchor_decisions(decisions):
             for d in decisions]
 
 
-def render_compact(method,trace,processor,result,sample,rate,panel_height=768,*,pre_llm_label=None):
+def render_compact(method,trace,processor,result,sample,rate,panel_height=768,*,pre_llm_label=None,crop_only=False):
     from .visualization import prediction_caption
     if type(panel_height) is not int or panel_height<1: raise ValueError('panel-height must be positive')
     if 'pixels' not in trace or (pre_llm_label is None and 'selected' not in trace):
@@ -44,12 +44,32 @@ def render_compact(method,trace,processor,result,sample,rate,panel_height=768,*,
     if int(before.sum())+newlines!=plan['pre_llm_tokens'] or int(after.sum())+newlines!=expected:
         raise RuntimeError('Rendered anchors disagree with the actual two-stage token budget')
     patch=int(adapter.geometry.patch_size)
-    base=Image.fromarray(white_positions(views[0],after[0],patch))
+    stage='After MyPool + distillation, BEFORE tail9' if pre_llm_label is None else 'After MyPool, before LLM'
+    details=dict(native_grid=list(grid),encoder_views=len(views),
+        base_kept=int(after[0].sum()),anyres_kept=int(after[1:].sum()),protected_newlines=newlines,
+        baseline_packed_tokens=plan['baseline_packed_tokens'],pre_llm_tokens=plan['pre_llm_tokens'],
+        post_snapshot=stage,mask_semantics='RGB255 at removed independent anchors, including merged-away source positions')
+    if pre_llm_label is None:
+        details.update(post_distill_tokens=len(selected), post_snapshot='after MyPool and block2 distillation, before tail9')
+    else:
+        details['anyres_kept_per_crop']=after[1:].sum(axis=1).tolist()
     tile_h,tile_w=views.shape[1:3]
     mosaic=Image.new('RGB',(width*tile_w,height*tile_h),'white')
     for tile in range(width*height):
         row,col=divmod(tile,width)
-        mosaic.paste(Image.fromarray(white_positions(views[tile+1],after[tile+1],patch)),(col*tile_w,row*tile_h))
+        rgb=views[tile+1]
+        position=(col*tile_w,row*tile_h)
+        with Image.fromarray(white_positions(rgb,after[tile+1],patch)) as masked:
+            if crop_only:
+                with Image.fromarray(rgb) as source, Image.blend(source,masked,.5) as blended:
+                    mosaic.paste(blended,position)
+            else:
+                mosaic.paste(masked,position)
+    if crop_only:
+        details.update(panels=[[0,0,mosaic.width,mosaic.height]],mask_opacity=.5,
+                       mask_semantics='50% source crop pixels + 50% white at removed independent anchors')
+        return mosaic,details
+    base=Image.fromarray(white_positions(views[0],after[0],patch))
     with Image.open(sample.image) as image: original=image.convert('RGB')
     pictures=[original,base,mosaic];scaled=[]
     try:
@@ -62,7 +82,6 @@ def render_compact(method,trace,processor,result,sample,rate,panel_height=768,*,
         share = getattr(method,'share',.7)
         heading = (f'{title} | Avg pruning {rate:g}% | lambda={share:g}' if pre_llm_label is None
                    else f'{pre_llm_label} | Target pruning {rate:g}%')
-        stage = 'After MyPool + distillation, BEFORE tail9' if pre_llm_label is None else 'After MyPool, before LLM'
         draw.text((margin,10),f'{heading} | ID: {sample.sample_id}',fill='black',font=font(20))
         draw.text((margin,40),prediction_caption(sample.gt,result['answer'])+' | '+stage,fill='black',font=font(16))
         labels=('Original',f'Base (pruned; {int(after[0].sum())}/729)',
@@ -75,13 +94,5 @@ def render_compact(method,trace,processor,result,sample,rate,panel_height=768,*,
         draw.text((margin,header+panel_height+8),'White = removed independent token position (merged sources included). Unencoded crop edges unchanged.',fill='black',font=font(13))
     finally:
         for picture in pictures+scaled: picture.close()
-    details = dict(native_grid=list(grid),encoder_views=len(views),
-        base_kept=int(after[0].sum()),anyres_kept=int(after[1:].sum()),protected_newlines=newlines,
-        baseline_packed_tokens=plan['baseline_packed_tokens'],pre_llm_tokens=plan['pre_llm_tokens'],
-        panels=panels,post_snapshot=stage,
-        mask_semantics='RGB255 at removed independent anchors, including merged-away source positions')
-    if pre_llm_label is None:
-        details.update(post_distill_tokens=len(selected), post_snapshot='after MyPool and block2 distillation, before tail9')
-    else:
-        details['anyres_kept_per_crop'] = after[1:].sum(axis=1).tolist()
+    details['panels']=panels
     return canvas, details

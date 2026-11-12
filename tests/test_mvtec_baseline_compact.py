@@ -77,6 +77,17 @@ class CompactTests(unittest.TestCase):
                     self.assertTrue((view[:14,:14]==255).all())
                     self.assertTrue((view[:14,98:112]==colors[tile+1]).all())
                     self.assertTrue((view[378:]==colors[tile+1]).all())
+                crop_image,crop_details=render_compact(SimpleNamespace(adapter=adapter),trace,SigLipImageProcessor(),
+                    {'answer':'B'},SimpleNamespace(image=original,sample_id='000000048',gt=0),50,height,crop_only=True)
+                with crop_image:
+                    self.assertEqual(crop_image.size,(384*grid[0],384*grid[1]))
+                    self.assertEqual(crop_details['mask_opacity'],.5)
+                    self.assertEqual(len(crop_details['panels']),1)
+                    for tile,color in enumerate(colors[1:]):
+                        row,col=divmod(tile,grid[0])
+                        self.assertEqual(crop_image.getpixel((col*384,row*384)),tuple((value+255)//2 for value in color))
+                        self.assertEqual(crop_image.getpixel((col*384+98,row*384)),color)
+                        self.assertEqual(crop_image.getpixel((col*384,row*384+378)),color)
                 self.assertEqual(len(list(root.glob('*.png'))),1)  # renderer writes nothing on its own
                 for panel in panels: panel.close()
                 image.close()
@@ -214,6 +225,21 @@ class CompactTests(unittest.TestCase):
             self.assertEqual(entry.setup(entry.parser().parse_args([*other_cli, '--resume'])),
                              (another, new_spec))
             self.assertEqual(entry.setup(entry.parser().parse_args([*cli, '--resume'])), (subset, spec))
+            if mode == 'joint_self':
+                crop_cli = [*cli, '--crop-only', '--prune-rates', '50']
+                crop_output, crop_spec = entry.setup(entry.parser().parse_args(crop_cli))
+                self.assertEqual(crop_output, original / 'lambda_0.3_joint_self_crop50')
+                self.assertTrue(crop_spec['crop_only'])
+                self.assertEqual(crop_spec['configuration'], spec['configuration'])
+                job = crop_spec['jobs'][0]
+                method = entry.make_method(core, crop_spec['checkpoint']['path'], 50, mode, share=.3)
+                with patch.object(model, 'generate', side_effect=lambda **kw: native(**dict(kw, max_new_tokens=2))), \
+                        patch.object(torch.cuda, 'synchronize'), \
+                        patch.object(mm_utils, 'tokenizer_image_token', return_value=options['inputs'][0]):
+                    report = entry.render_samples(backend, method, samples, crop_spec, job,
+                                                  entry.job_folder(crop_output, job))
+                self.assertEqual(report['pngs'], 1)
+                self.assertEqual(len(list(crop_output.rglob('*.png'))), 1)
 
     def test_two_gpu_launcher_full_input_and_completed_resume(self):
         with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):

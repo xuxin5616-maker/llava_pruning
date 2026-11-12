@@ -78,6 +78,7 @@ def parser():
     p.add_argument('--source-run',type=Path,help='Existing full MVTec visualization run for a lambda subset')
     p.add_argument('--sample-indices',type=int,nargs='+',help='Zero-based numbers in the source sample PNG filenames')
     p.add_argument('--distill-share',type=float,help='Lambda for the selected-sample run')
+    p.add_argument('--crop-only',action='store_true',help='Save the AnyRes mosaic with a 50% white mask on pruned positions')
     p.add_argument('--resume',action='store_true',help='Restore saved settings, skip completed PNGs, continue missing samples')
     p.add_argument('--check-data',action='store_true',help='Validate/count the FULL input; no model, GPU or output files')
     p.add_argument('--find-existing',action='store_true',help='Read-only search of output/outputs for MVTec visualization records')
@@ -191,6 +192,7 @@ def subset_spec(args, source_dir, output):
     frozen.write_text(''.join(json.dumps(row,ensure_ascii=False)+'\n' for row in selected),encoding='utf-8')
     spec=dict(source,version=VERSION,created_utc=datetime.now(timezone.utc).isoformat(),
               source_run=str(source_dir),sample_indices=indices,sample_count=len(selected),distill_share=share,
+              crop_only=args.crop_only,
               input_json=str(frozen),input_sha256=common.digest(frozen),configuration=configs[args.selection_modes[0]],
               selection_modes=args.selection_modes,mode_configurations=configs,
               jobs=schedule(args.prune_rates,args.gpus,args.selection_modes),source_identity=common.source_identity())
@@ -201,6 +203,9 @@ def subset_spec(args, source_dir, output):
     selection=' '.join(descriptions[mode] for mode in args.selection_modes)
     spec['definitions']=dict(source['definitions'],selection=f'{selection} lambda={share:g}, tail9.',
                              images='Original, Base/AnyRes pair and three-panel comparison per sample/rate.')
+    if args.crop_only:
+        spec['definitions'].update(images='AnyRes crop mosaic per sample/rate.',
+                                   mask='50% source crop pixels and 50% white at pruned positions.')
     common.save_json(output/'run.json',spec)
     return output,spec
 
@@ -214,10 +219,14 @@ def setup(args):
         if not args.sample_indices or args.distill_share is None or not 0<args.distill_share<1 or args.add_joint_self:
             raise ValueError('--source-run requires sample indices, 0 < lambda < 1 and explicit selection modes for new jobs')
         suffix='' if args.selection_modes==['baseline'] else '_'+ '_'.join(args.selection_modes)
+        if args.crop_only:
+            suffix+='_crop50'
         default_output=source_dir/f'lambda_{args.distill_share:g}{suffix}'
     output=(args.output_dir or default_output).expanduser().resolve()
     if args.resume:
         spec=json.loads((output/'run.json').read_text(encoding='utf-8'));verify(spec)
+        if args.crop_only and not spec.get('crop_only',False):
+            raise ValueError('--crop-only requires a matching saved run or a fresh output directory')
         if source_dir is not None and (str(source_dir)!=spec.get('source_run') or
                 args.sample_indices!=spec.get('sample_indices') or args.distill_share!=spec.get('distill_share') or
                 args.selection_modes!=spec.get('selection_modes') or
@@ -259,6 +268,7 @@ def setup(args):
         original_input_json=str(Path(args.input_json).expanduser().resolve()),original_input_sha256=common.digest(args.input_json),
         input_json=str(path),input_sha256=common.digest(path),data_root=str(Path(args.data_root).expanduser().resolve()),
         sample_count=len(rows),prompt_version=args.prompt_version,seed=args.seed,panel_height=args.panel_height,jobs=jobs,
+        crop_only=args.crop_only,
         source_identity=common.source_identity(),
         definitions=dict(stage='After MyPool and block2 distillation; BEFORE tail9. Model generation still executes tail9.',
             mask='RGB255 at removed independent token anchors, including merged-away source positions. Native unencoded edges retained.',
@@ -266,6 +276,9 @@ def setup(args):
             measurement='Diagnostic generation/rendering only; no clean Lat/Mem measurements.',
             selection='baseline: Base-mapped AnyRes ranking, Base+Text side input, anyres_first. joint_self: Base+AnyRes+Text side input, each spatial token owns its predicted attention, joint Top-k without separate view quotas. Same MyPool, lambda=.7 and tail9.',
             source='Use current project code; record source fingerprints per job. Resume checks inputs/model/student/runtime. No whole-project source-change blocking.'))
+    if args.crop_only:
+        spec['definitions'].update(images='AnyRes crop mosaic per sample/rate.',
+                                   mask='50% source crop pixels and 50% white at pruned positions.')
     common.save_json(output/'run.json',spec)
     return output,spec
 
@@ -336,6 +349,7 @@ def render_samples(backend,method,samples,spec,job,folder):
     folder.mkdir(parents=True,exist_ok=True);pictures=folder/'visualizations';pictures.mkdir(exist_ok=True)
     mode=job.get('selection_mode','baseline')
     indices=spec.get('sample_indices')
+    crop_only=spec.get('crop_only',False)
     rows=restored(folder,samples,mode,sample_indices=indices);resumed=len(rows);started=time.perf_counter();last=started
     with torch.inference_mode(),method.generation_context(backend.model),(folder/'predictions.jsonl').open('a',encoding='utf-8') as stream:
         for index in range(resumed,len(samples)):
@@ -345,7 +359,8 @@ def render_samples(backend,method,samples,spec,job,folder):
                 result=backend.generate(sample,sample.source['prompt'],method,job['prune_rate'],'anyres_max_9',
                     capture_visualization=False,capture_attention=False,random_seed=spec['seed']+source_index,
                     do_sample=False,include_pruning_time=True,benchmark_metrics=False)
-            picture,details=render_compact(method,trace,backend.processor,result,sample,job['prune_rate'],spec['panel_height'])
+            picture,details=render_compact(method,trace,backend.processor,result,sample,job['prune_rate'],
+                                           spec['panel_height'],crop_only=crop_only)
             name=f'visualizations/sample_{source_index:09d}.png'
             with picture:
                 save_png(picture,folder/name)
@@ -358,12 +373,13 @@ def render_samples(backend,method,samples,spec,job,folder):
                 eta=elapsed*(len(samples)-index-1)/(index+1-resumed)
                 print(f"VIS GPU{job['gpu']} {mode} prune={job['prune_rate']} {index+1}/{len(samples)} elapsed={elapsed:.1f}s ETA={eta:.1f}s",flush=True)
                 last=time.perf_counter()
-    if indices is not None:
+    split_views=indices is not None and not crop_only
+    if split_views:
         export_split_views(folder,samples,rows)
     common.save_csv(folder/'image_index.csv',rows,('index','question_id','gt','answer','selection_mode','output','base_kept','anyres_kept',
         'baseline_packed_tokens','pre_llm_tokens','post_distill_tokens','protected_newlines'))
     return dict(complete=True,samples=len(rows),resumed_samples=resumed,fresh_samples=len(rows)-resumed,
-                pngs=len(rows)*(3 if indices is not None else 1),lat_mem_benchmark=False)
+                pngs=len(rows)*(3 if split_views else 1),lat_mem_benchmark=False)
 
 
 def worker(manifest,job_id):
@@ -397,7 +413,8 @@ def run(args):
     output,spec=setup(args);queues={j['gpu']:deque() for j in spec['jobs']};active={};failures=[]
     for job in spec['jobs']: queues[job['gpu']].append(job)
     indices=spec.get('sample_indices')
-    views=3 if indices is not None else 1
+    split_views=indices is not None and not spec.get('crop_only',False)
+    views=3 if split_views else 1
     print(f"MVTec: {spec['sample_count']} samples/rate; {spec['jobs']}; {views} PNG(s) each; stage=before tail9",flush=True)
     last=time.perf_counter()
     try:
@@ -413,7 +430,7 @@ def run(args):
                         rows=restored(folder,samples,job.get('selection_mode','baseline'),sample_indices=indices)
                         if len(rows)!=spec['sample_count']:
                             raise ValueError('Incomplete completed PNG set')
-                        if indices is not None:
+                        if split_views:
                             export_split_views(folder,samples,rows)
                         print(f"Reuse complete {job['job_id']}",flush=True);continue
                     logpath=output/(job['job_id']+'.log');log=logpath.open('a',encoding='utf-8')
