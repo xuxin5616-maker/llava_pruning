@@ -7,6 +7,7 @@ Diagnostic generation only: no clean Lat/Mem benchmark, no additional PNGs.
 import argparse
 from collections import deque
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -77,6 +78,7 @@ def parser():
     p.add_argument('--output-dir',type=Path,help='Override the output directory, including for a source-run subset')
     p.add_argument('--source-run',type=Path,help='Existing full MVTec visualization run for a lambda subset')
     p.add_argument('--sample-indices',type=int,nargs='+',help='Zero-based numbers in the source sample PNG filenames')
+    p.add_argument('--append-sample-indices',type=int,nargs='+',help='With --resume, add source PNG indices to the existing subset')
     p.add_argument('--distill-share',type=float,help='Lambda for the selected-sample run')
     p.add_argument('--crop-only',action='store_true',help='Save the AnyRes mosaic with a 50% white mask on pruned positions')
     p.add_argument('--resume',action='store_true',help='Restore saved settings, skip completed PNGs, continue missing samples')
@@ -210,6 +212,42 @@ def subset_spec(args, source_dir, output):
     return output,spec
 
 
+def append_samples(output,spec,requested):
+    if 'sample_indices' not in spec or 'source_run' not in spec:
+        raise ValueError('Sample append requires an existing source-run subset')
+    if len(set(requested))!=len(requested) or min(requested)<0:
+        raise ValueError('Use distinct nonnegative sample indices')
+    indices=spec['sample_indices']
+    additions=[index for index in requested if index not in indices]
+    if not additions:
+        return
+    source=json.loads((Path(spec['source_run'])/'run.json').read_text(encoding='utf-8'))
+    verify(source)
+    source_rows,_=common.read_prefix(Path(source['input_json']))
+    if len(source_rows)!=source['sample_count'] or max(indices+additions)>=len(source_rows):
+        raise ValueError('Sample index exceeds the original frozen input')
+    current_path=Path(spec['input_json'])
+    current_rows,_=common.read_prefix(current_path)
+    if len(current_rows)!=spec['sample_count'] or current_rows!=[source_rows[index] for index in indices]:
+        raise ValueError('The saved subset no longer matches the original frozen input')
+    content=current_path.read_bytes()
+    if not content.endswith(b'\n'):
+        content+=b'\n'
+    content+=''.join(json.dumps(source_rows[index],ensure_ascii=False)+'\n' for index in additions).encode('utf-8')
+    digest=hashlib.sha256(content).hexdigest()
+    frozen=output/f'input_frozen_{digest}.jsonl'
+    # Keep the previous manifest valid until the new list has been written.
+    temporary=frozen.with_suffix('.jsonl.tmp')
+    temporary.write_bytes(content)
+    temporary.replace(frozen)
+    prefixes=dict(spec.get('input_prefixes',{}))
+    prefixes[spec['input_sha256']]=len(current_rows)
+    spec.update(sample_indices=indices+additions,sample_count=len(indices)+len(additions),
+                input_json=str(frozen),input_sha256=digest,input_prefixes=prefixes)
+    common.save_json(output/'run.json',spec)
+    print(f'Appended source sample indices {additions} | {output}',flush=True)
+
+
 def setup(args):
     source_dir=args.source_run.expanduser().resolve() if args.source_run else None
     default_output=Path('output/mvtec_baseline_compact_50_70_gpu56_01')
@@ -223,6 +261,8 @@ def setup(args):
             suffix+='_crop50'
         default_output=source_dir/f'lambda_{args.distill_share:g}{suffix}'
     output=(args.output_dir or default_output).expanduser().resolve()
+    if args.append_sample_indices and (not args.resume or args.add_joint_self):
+        raise ValueError('--append-sample-indices requires --resume for an existing subset')
     if args.resume:
         spec=json.loads((output/'run.json').read_text(encoding='utf-8'));verify(spec)
         if args.crop_only and not spec.get('crop_only',False):
@@ -234,6 +274,8 @@ def setup(args):
             raise ValueError('Source run, sample indices, lambda, modes or rates differ from the saved subset')
         if student_identity(spec['checkpoint']['path'],'visa')!=spec['checkpoint']:
             raise ValueError('Saved student or training manifest changed')
+        if args.append_sample_indices:
+            append_samples(output,spec,args.append_sample_indices)
         if args.add_joint_self and 'joint_self' not in spec.get('selection_modes',['baseline']):
             existing=spec['jobs'];rates=list(dict.fromkeys(j['prune_rate'] for j in existing))
             added=[]
@@ -424,15 +466,21 @@ def run(args):
                     job=queue.popleft();folder=job_folder(output,job);marker=folder/'status.json'
                     old=json.loads(marker.read_text(encoding='utf-8')) if marker.is_file() else {}
                     if old.get('complete') and old.get('status')=='success':
-                        if old.get('input_sha256')!=spec['input_sha256'] or old.get('job_id')!=job['job_id']:
+                        old_hash=old.get('input_sha256')
+                        current=old_hash==spec['input_sha256']
+                        prefix_count=spec.get('input_prefixes',{}).get(old_hash)
+                        if old.get('job_id')!=job['job_id'] or (not current and prefix_count is None):
                             raise ValueError('Saved completed images belong to another input/job')
                         samples=samples_for(spec)
                         rows=restored(folder,samples,job.get('selection_mode','baseline'),sample_indices=indices)
-                        if len(rows)!=spec['sample_count']:
-                            raise ValueError('Incomplete completed PNG set')
-                        if split_views:
-                            export_split_views(folder,samples,rows)
-                        print(f"Reuse complete {job['job_id']}",flush=True);continue
+                        if current:
+                            if len(rows)!=spec['sample_count']:
+                                raise ValueError('Incomplete completed PNG set')
+                            if split_views:
+                                export_split_views(folder,samples,rows)
+                            print(f"Reuse complete {job['job_id']}",flush=True);continue
+                        if len(rows)<prefix_count:
+                            raise ValueError('Incomplete saved PNG prefix after sample append')
                     logpath=output/(job['job_id']+'.log');log=logpath.open('a',encoding='utf-8')
                     command=[sys.executable,'-u',str(PROJECT/'visualize_mvtec_baseline.py'),'--worker',job['job_id'],'--manifest',str(output/'run.json')]
                     try:

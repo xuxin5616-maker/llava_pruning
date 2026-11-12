@@ -240,6 +240,35 @@ class CompactTests(unittest.TestCase):
                                                   entry.job_folder(crop_output, job))
                 self.assertEqual(report['pngs'], 1)
                 self.assertEqual(len(list(crop_output.rglob('*.png'))), 1)
+                folder = entry.job_folder(crop_output, job)
+                previous_png = folder / 'visualizations/sample_000000001.png'
+                previous_bytes = previous_png.read_bytes()
+                entry.common.save_json(folder / 'status.json', dict(
+                    report, status='success', job_id=job['job_id'], input_sha256=crop_spec['input_sha256']))
+                append_cli = ['--resume', '--output-dir', str(crop_output), '--append-sample-indices', '0']
+
+                def complete_worker(command, **kwargs):
+                    manifest = Path(command[command.index('--manifest') + 1])
+                    extended = json.loads(manifest.read_text(encoding='utf-8'))
+                    self.assertEqual(extended['sample_indices'], [1, 0])
+                    selected = entry.samples_for(extended)
+                    with patch.object(model, 'generate',
+                                      side_effect=lambda **kw: native(**dict(kw, max_new_tokens=2))) as generate, \
+                            patch.object(torch.cuda, 'synchronize'), \
+                            patch.object(mm_utils, 'tokenizer_image_token', return_value=options['inputs'][0]):
+                        updated = entry.render_samples(backend, method, selected, extended, job, folder)
+                    self.assertEqual(generate.call_count, 1)
+                    self.assertEqual((updated['resumed_samples'], updated['fresh_samples']), (1, 1))
+                    entry.common.save_json(folder / 'status.json', dict(
+                        updated, status='success', job_id=job['job_id'], input_sha256=extended['input_sha256']))
+                    return SimpleNamespace(poll=lambda: 0, wait=lambda: 0)
+
+                with patch.object(entry.subprocess, 'Popen', side_effect=complete_worker) as spawn:
+                    self.assertEqual(entry.run(entry.parser().parse_args(append_cli)), 0)
+                    self.assertEqual(entry.run(entry.parser().parse_args(append_cli)), 0)
+                self.assertEqual(spawn.call_count, 1)
+                self.assertEqual(previous_png.read_bytes(), previous_bytes)
+                self.assertTrue((folder / 'visualizations/sample_000000000.png').is_file())
 
     def test_two_gpu_launcher_full_input_and_completed_resume(self):
         with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
