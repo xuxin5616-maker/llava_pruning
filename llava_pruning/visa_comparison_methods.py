@@ -97,8 +97,9 @@ def pack_variable_visionzip(projected, dominant_indices, dominant_counts, grid, 
 class AverageVisionZip:
     name,visualize_rates = "visionzip",frozenset()
 
-    def __init__(self, core, rate):
+    def __init__(self, core, rate, *, capture_anchors=False):
         self.core,self.rate = core,rate
+        self.capture_anchors = capture_anchors
         self.tower = core.get_vision_tower()
         self.stats = {} # Native VisionZip preparation reads this adapter field.
 
@@ -139,17 +140,21 @@ class AverageVisionZip:
         if features.shape[:2] != (len(self.keeps),729):
             raise ValueError("VisionZip requires the native 729-token SigLIP views")
         projected,indices,dominants = [],[],[]
+        anchors = []
         # At most two consecutive quota groups, differing by one token. Keep
         # the official encoder-axis storage through compression/projector.
         for keep,items in groupby(enumerate(self.keeps),key=lambda pair:pair[1]):
             views = [index for index,_ in items];start,end = views[0],views[-1]+1
             dominant = keep if keep==729 else round(keep*visionzip.DOMINANT_RATIO)
             zipped,decisions = visionzip.compress_tokens(features[start:end],captured["scores"][start:end],
-                captured["metric"][start:end],dominant,keep-dominant,capture=False)
+                captured["metric"][start:end],dominant,keep-dominant,capture=self.capture_anchors)
             encoded = self.core.mm_projector(zipped)
             projected.extend(encoded.unbind(0));indices.extend(decisions.dominant_indices.unbind(0))
             dominants.extend([dominant]*len(views))
+            if self.capture_anchors:
+                anchors.extend(torch.cat((decisions.dominant_indices, decisions.audit["contextual_indices"]), dim=1).unbind(0))
         self.indices,self.dominants = indices,dominants
+        self.view_anchors = anchors
         self.stats = dict(full_grid_identity=False,baseline_packed_tokens=self.original,
             original_image_tokens=self.original,raw_view_keeps=list(self.keeps),protected_newlines=self.protected,
             budget_kind="native_packed_layer_average",selection_layer=26,
@@ -168,7 +173,8 @@ class AverageVisionZip:
 
 class VisionZipMethod:
     name,visualize_rates = "visionzip",frozenset()
-    def __init__(self, core, rate): self.adapter,self.rate = AverageVisionZip(core,rate),rate
+    def __init__(self, core, rate, *, capture_anchors=False):
+        self.adapter,self.rate = AverageVisionZip(core,rate,capture_anchors=capture_anchors),rate
     def configure(self,core,rate,**capture): self.adapter.configure(core,rate,**capture)
     def prepare_inputs(self,size,tokens): self.adapter.prepare_inputs(size,tokens)
     def stats(self,core,rate): return dict(self.adapter.stats)
