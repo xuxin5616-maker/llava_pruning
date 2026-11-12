@@ -186,10 +186,14 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         dominant = keep if keep == 729 else round(keep * pool.DOMINANT_RATIO)
         return allocation, probability, dominant, keep - dominant
 
+    def encode_lean(self, images):
+        from .pool_lean import encode
+        return encode(self, images)
+
     def encode_images(self, images):
         if self.lean:
-            from .pool_lean import encode,export_source_decisions
-            packed = encode(self,images)
+            from .pool_lean import export_source_decisions
+            packed = self.encode_lean(images)
             if self.mode == "base_full" and self.base_mapping=="reference":
                 self.decisions = export_source_decisions(self.device_decisions)
                 self.records = source_records(self.decisions,self.geometry.grid,
@@ -303,6 +307,7 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
 
 class PoolDistillMethod:
     name = "pool_distill"
+    adapter_class = PoolDistillAdapter
 
     def __init__(self, core, checkpoint, *, rate, share, mode, settings, pruning_audit="lean",
                  tail_drop_layers=0, predictor_input="full", base_mapping="reference", base_policy="protect",
@@ -330,7 +335,7 @@ class PoolDistillMethod:
         if (tail_drop_layers or predictor_input=="base_text") and (share==0 or rate==0):
             raise ValueError("Ablations require an active distilled pruning stage")
         self.tail_drop_layers, self.predictor_input = tail_drop_layers, predictor_input
-        self.adapter = PoolDistillAdapter(core, settings, rate=rate, share=share, mode=mode,
+        self.adapter = self.adapter_class(core, settings, rate=rate, share=share, mode=mode,
             lean=pruning_audit=="lean", predictor_input=predictor_input, base_mapping=base_mapping,
             base_policy=base_policy, student_layer=student_layer)
         self.rate, self.share, self.mode = rate, share, mode

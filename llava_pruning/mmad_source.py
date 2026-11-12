@@ -36,7 +36,11 @@ STUDENT_LAYER_HASHES = {
         '7be508bfd41bb105dcf85ec73d2ddbc255cde0600b909335766284a3ad4788ed'),
     'llava_pruning/pool_distill.py': (
         'cd0f64d81bcd4e0f07fc1563741900bbcd7b70d928c68b54da4e8314f5d68c19',
-        'f21349cee7bcc4275310850ba19ed7f8b2cb29cb4fbee66c594e3da32583b5dc'),
+        'f21349cee7bcc4275310850ba19ed7f8b2cb29cb4fbee66c594e3da32583b5dc',
+        'a015b45586e6bdda52824b3be744a8c155f6a7cfddece785334de1fd0c4dbd17'),
+    'vendor/llava/llava/model/language_model/clse.py': (
+        'b2d7c3f1234d81cce77cc054361b2ea903381c37f1a15778ae449b5dd9967427',
+        '5ca7f53877577c220f2a73ba2617c343404e110b7bc042b0ebf694f72a2a97a9'),
     'llava_pruning/pool_lean.py': (
         '419dda1e61e2981e718699da52a0ad8c946d86e5e2c8c34d8703e27472dc06e9',
         '114136631883422d28a826bc0b58e7471146cdcad5d06890df44516398358452'),
@@ -84,14 +88,14 @@ def entry_tree(data):
     return ast.Module(body=nodes,type_ignores=[])
 
 
-def scope_identity(files):
+def scope_identity(files, *, extra_roots=()):
     """Follow static local imports, including imports INSIDE functions/classes.
 
     All native/vendor and third-party Python files are conservative roots for
     runtime model dispatch. Entry parsing/setup/source-validation code is not
     model inference; actual scheduling, generation and metric functions are.
     """
-    pending=[ENTRY]+[p for p in files if p.startswith(('vendor/llava/llava/','third_party/'))]
+    pending=[ENTRY,*extra_roots]+[p for p in files if p.startswith(('vendor/llava/llava/','third_party/'))]
     seen={}
     def add_module(module):
         parts=module.split('.')

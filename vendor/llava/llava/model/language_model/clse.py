@@ -224,6 +224,8 @@ class CLSEMixin:
                                            or not attention_mask.bool().all()):
             raise ValueError("CLSE requires an unpadded prompt")
         prefill = cache.get_seq_length() == 0
+        fastv = getattr(self, "_pool_fastv_adapter", None)
+        boundary = fastv.student_layer if fastv is not None else self._clse_boundary()
         reference = None
         if prefill:
             if len(self._clse_spans) != 1 or len(self._clse_spans[0]) != 1 or self._clse_layout is None:
@@ -241,14 +243,18 @@ class CLSEMixin:
             original = current = end - start
             self._clse_next_position = hidden.shape[1]
             self._clse_stats = dict(mode="physical_drop", original_image_tokens=original,
-                                    original_prompt_tokens=hidden.shape[1], layers=[], pruning_layer=self._clse_boundary(),
+                                    original_prompt_tokens=hidden.shape[1], layers=[], pruning_layer=boundary,
                                     position_policy="preserve_original", attention_source="none_pure_spectral",
                                     score="clse", budget_scope="joint Base + AnyRes; structural newlines protected",
                                     rounding="floor packed target, reserve newlines", min_spatial_tokens=1)
             self._clse_stats.update(self._clse_extra_stats())
             self._clse_stage = None
             with measure_pruning(self, hidden.device):
-                reference, spatial_indices = self._clse_reference(hidden, start, end)
+                if fastv is None:
+                    reference, spatial_indices = self._clse_reference(hidden, start, end)
+                else:
+                    self._clse_stats.update(score="fastv_last_prompt_attention", attention_source="backbone_qk")
+                    reference, spatial_indices = fastv.reference(hidden, start, end)
                 # Check feasibility BEFORE running the decoder, not by silently clamping.
                 target = max(1, math.floor(original * self.clse_keep_ratio + 1e-10))
                 protected = original - len(spatial_indices)
@@ -262,7 +268,7 @@ class CLSEMixin:
             self._clse_next_position += 1
         all_hidden = () if (self.config.output_hidden_states if output_hidden_states is None else output_hidden_states) else None
         tail_layers = getattr(self, "_pool_tail_drop_layers", 0)
-        if tail_layers and not 0 < tail_layers <= len(self.layers)-self._clse_boundary():
+        if tail_layers and not 0 < tail_layers <= len(self.layers)-boundary:
             raise ValueError("Tail image drop must follow the main pruning boundary")
         for index, layer in enumerate(self.layers):
             if prefill and tail_layers and index == len(self.layers)-tail_layers:
@@ -284,17 +290,24 @@ class CLSEMixin:
             physical_positions = torch.arange(physical_past, physical_past + hidden.shape[1], device=hidden.device)
             rotary = self.rotary_emb(hidden, ids)
             causal = self._pyramiddrop_causal_mask(hidden, physical_past, self.config._attn_implementation)
+            if prefill and fastv is not None and index + 1 == boundary:
+                from .fastv_attention import last_prompt_attention
+                with measure_pruning(self, hidden.device):
+                    ranking = last_prompt_attention(layer, hidden, rotary)[0, start:end][spatial_indices]
             hidden = layer(hidden, attention_mask=causal, position_ids=ids, past_key_value=cache,
                            output_attentions=False, use_cache=True, cache_position=physical_positions,
                            position_embeddings=rotary)[0]
             if not prefill:
                 continue
             before, seq_before = current, hidden.shape[1]
-            if index + 1 == self._clse_boundary():
+            if index + 1 == boundary:
                 with measure_pruning(self, hidden.device):
-                    ranking = self._clse_rank(hidden, start, end, ids, reference)
+                    if fastv is None:
+                        ranking = self._clse_rank(hidden, start, end, ids, reference)
+                        selected, retained, protected = self._clse_select(ranking, spatial_indices, original)
+                    else:
+                        selected, retained, protected = fastv.select(ranking, spatial_indices, original)
                     reference = None
-                    selected, retained, protected = self._clse_select(ranking, spatial_indices, original)
                     selection = torch.cat((torch.arange(start, device=hidden.device), selected + start,
                                            torch.arange(end, hidden.shape[1], device=hidden.device)))
                     hidden = hidden.index_select(1, selection).contiguous()
