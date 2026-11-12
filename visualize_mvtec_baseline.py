@@ -74,7 +74,7 @@ def parser():
     p.add_argument('--prompt-version',choices=('v0','v1','v2','v3'),default='v0')
     p.add_argument('--seed',type=int,default=42)
     p.add_argument('--panel-height',type=int,default=768)
-    p.add_argument('--output-dir',type=Path,default=Path('output/mvtec_baseline_compact_50_70_gpu56_01'))
+    p.add_argument('--output-dir',type=Path,help='Override the output directory, including for a source-run subset')
     p.add_argument('--source-run',type=Path,help='Existing full MVTec visualization run for a baseline lambda subset')
     p.add_argument('--sample-indices',type=int,nargs='+',help='Zero-based numbers in the source sample PNG filenames')
     p.add_argument('--distill-share',type=float,help='Lambda for the selected-sample baseline run')
@@ -200,15 +200,15 @@ def subset_spec(args, source_dir, output):
 
 def setup(args):
     source_dir=args.source_run.expanduser().resolve() if args.source_run else None
+    default_output=Path('output/mvtec_baseline_compact_50_70_gpu56_01')
     if source_dir is None and (args.sample_indices is not None or args.distill_share is not None):
         raise ValueError('--sample-indices and --distill-share require --source-run')
     if source_dir is not None:
         if (not args.sample_indices or args.distill_share is None or not 0<args.distill_share<1
                 or args.selection_modes!=['baseline'] or args.add_joint_self):
             raise ValueError('--source-run requires sample indices, 0 < lambda < 1 and baseline mode')
-        output=source_dir/f'lambda_{args.distill_share:g}'
-    else:
-        output=args.output_dir.expanduser().resolve()
+        default_output=source_dir/f'lambda_{args.distill_share:g}'
+    output=(args.output_dir or default_output).expanduser().resolve()
     if args.resume:
         spec=json.loads((output/'run.json').read_text(encoding='utf-8'));verify(spec)
         if source_dir is not None and (str(source_dir)!=spec.get('source_run') or

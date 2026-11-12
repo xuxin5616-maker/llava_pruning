@@ -171,6 +171,14 @@ class CompactTests(unittest.TestCase):
                     self.assertAlmostEqual(method.adapter.plan['target_pre_contribution'], rate * .7)
             self.assertEqual(len(list(subset.rglob('*.png'))), 2)
             self.assertEqual(entry.setup(entry.parser().parse_args([*cli, '--resume'])), (subset, spec))
+            another = original / 'lambda_0.3_samples_0'
+            other_cli = [*cli, '--sample-indices', '0', '--output-dir', str(another)]
+            new_output, new_spec = entry.setup(entry.parser().parse_args(other_cli))
+            self.assertEqual(new_output, another)
+            self.assertEqual(new_spec['sample_indices'], [0])
+            self.assertEqual(entry.setup(entry.parser().parse_args([*other_cli, '--resume'])),
+                             (another, new_spec))
+            self.assertEqual(entry.setup(entry.parser().parse_args([*cli, '--resume'])), (subset, spec))
 
     def test_two_gpu_launcher_full_input_and_completed_resume(self):
         with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
