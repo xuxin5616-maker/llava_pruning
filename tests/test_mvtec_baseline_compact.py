@@ -164,6 +164,7 @@ class CompactTests(unittest.TestCase):
             backend.processor = SigLipImageProcessor()
             backend.tokenizer = type('Tokenizer', (), {'batch_decode': lambda *a, **k: ['B']})()
             native = model.generate
+            saved_pictures = []
             with patch.object(model, 'generate', side_effect=lambda **kw: native(**dict(kw, max_new_tokens=2))), \
                     patch.object(torch.cuda, 'synchronize'), \
                     patch.object(mm_utils, 'tokenizer_image_token', return_value=options['inputs'][0]):
@@ -174,14 +175,36 @@ class CompactTests(unittest.TestCase):
                     self.assertEqual((method.predictor_input, method.base_policy),
                                      (config['predictor_input'], config['base_policy']))
                     folder = entry.job_folder(subset, job)
-                    entry.render_samples(backend, method, samples, spec, job, folder)
+                    report = entry.render_samples(backend, method, samples, spec, job, folder)
+                    self.assertEqual(report['pngs'], 3)
                     rows = entry.restored(folder, samples, mode, sample_indices=[1])
                     self.assertEqual(rows[0]['question_id'], '000000001')
                     self.assertEqual(rows[0]['output'], 'visualizations/sample_000000001.png')
                     self.assertEqual(rows[0]['sample_seed'], spec['seed'] + 1)
                     self.assertEqual(method.adapter.plan['distill_share'], .3)
                     self.assertAlmostEqual(method.adapter.plan['target_pre_contribution'], rate * .7)
-            self.assertEqual(len(list(subset.rglob('*.png'))), 2)
+                    name = 'sample_000000001.png'
+                    composite = folder / rows[0]['output']
+                    original_png = folder / 'originals' / name
+                    pair = folder / 'base_anyres' / name
+                    with Image.open(original_png) as actual, Image.open(samples[0].image) as expected:
+                        self.assertEqual(actual.tobytes(), expected.tobytes())
+                    _, base, anyres = rows[0]['panels']
+                    with Image.open(pair) as actual, Image.open(composite) as three:
+                        with three.crop((base[0], base[1], anyres[2], anyres[3])) as expected:
+                            self.assertEqual(actual.tobytes(), expected.tobytes())
+                    saved_pictures.append((composite, composite.read_bytes(), original_png, pair))
+                    entry.common.save_json(folder / 'status.json', dict(
+                        report, status='success', job_id=job['job_id'], input_sha256=spec['input_sha256']))
+            self.assertEqual(len(list(subset.rglob('*.png'))), 6)
+            for _, _, original_png, pair in saved_pictures:
+                original_png.unlink()
+                pair.unlink()
+            with patch.object(entry.subprocess, 'Popen', side_effect=AssertionError('completed PNGs should be reused')):
+                self.assertEqual(entry.run(entry.parser().parse_args([*cli, '--resume'])), 0)
+            for composite, pixels, original_png, pair in saved_pictures:
+                self.assertEqual(composite.read_bytes(), pixels)
+                self.assertTrue(original_png.is_file() and pair.is_file())
             self.assertEqual(entry.setup(entry.parser().parse_args([*cli, '--resume'])), (subset, spec))
             another = original / 'lambda_0.3_samples_0'
             other_cli = [*cli, '--sample-indices', '0', '--output-dir', str(another)]

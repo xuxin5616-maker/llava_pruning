@@ -199,7 +199,8 @@ def subset_spec(args, source_dir, output):
         'joint_self':'Base+AnyRes+Text side input, predicted self-attention, joint Base/AnyRes Top-k.',
     }
     selection=' '.join(descriptions[mode] for mode in args.selection_modes)
-    spec['definitions']=dict(source['definitions'],selection=f'{selection} lambda={share:g}, tail9.')
+    spec['definitions']=dict(source['definitions'],selection=f'{selection} lambda={share:g}, tail9.',
+                             images='Original, Base/AnyRes pair and three-panel comparison per sample/rate.')
     common.save_json(output/'run.json',spec)
     return output,spec
 
@@ -297,6 +298,37 @@ def restored(folder,samples,selection_mode='baseline',*,sample_indices=None):
     return rows
 
 
+def save_png(picture, target):
+    temporary=target.with_suffix('.png.tmp')
+    try:
+        picture.save(temporary,format='PNG',compress_level=2)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def export_split_views(folder,samples,rows):
+    from PIL import Image
+
+    originals, pairs=folder/'originals', folder/'base_anyres'
+    originals.mkdir(exist_ok=True)
+    pairs.mkdir(exist_ok=True)
+    for sample,row in zip(samples,rows):
+        composite=folder/row['output']
+        original_path, pair_path=originals/composite.name, pairs/composite.name
+        if not original_path.is_file():
+            with Image.open(sample.image) as source, source.convert('RGB') as original:
+                save_png(original,original_path)
+        if not pair_path.is_file():
+            _,base,anyres=row['panels']
+            with Image.open(composite) as picture:
+                if not (0<=base[0]<base[2]<=anyres[0]<anyres[2]<=picture.width and
+                        0<=base[1]==anyres[1]<base[3]==anyres[3]<=picture.height):
+                    raise ValueError(f'Invalid Base/AnyRes panel bounds: {composite}')
+                with picture.crop((base[0],base[1],anyres[2],anyres[3])) as pair:
+                    save_png(pair,pair_path)
+
+
 def render_samples(backend,method,samples,spec,job,folder):
     import torch
     from llava_pruning.pool_distill_visualization import capture_baseline_views
@@ -314,9 +346,9 @@ def render_samples(backend,method,samples,spec,job,folder):
                     capture_visualization=False,capture_attention=False,random_seed=spec['seed']+source_index,
                     do_sample=False,include_pruning_time=True,benchmark_metrics=False)
             picture,details=render_compact(method,trace,backend.processor,result,sample,job['prune_rate'],spec['panel_height'])
-            name=f'visualizations/sample_{source_index:09d}.png';target=folder/name;temporary=target.with_suffix('.png.tmp')
-            try: picture.save(temporary,format='PNG',compress_level=2);temporary.replace(target)
-            finally: picture.close()
+            name=f'visualizations/sample_{source_index:09d}.png'
+            with picture:
+                save_png(picture,folder/name)
             row=dict(index=index,question_id=sample.sample_id,gt=sample.gt,answer=result['answer'],output=name,selection_mode=mode,
                 sample_seed=spec['seed']+source_index,**details)
             stream.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+'\n');stream.flush();rows.append(row)
@@ -326,9 +358,12 @@ def render_samples(backend,method,samples,spec,job,folder):
                 eta=elapsed*(len(samples)-index-1)/(index+1-resumed)
                 print(f"VIS GPU{job['gpu']} {mode} prune={job['prune_rate']} {index+1}/{len(samples)} elapsed={elapsed:.1f}s ETA={eta:.1f}s",flush=True)
                 last=time.perf_counter()
+    if indices is not None:
+        export_split_views(folder,samples,rows)
     common.save_csv(folder/'image_index.csv',rows,('index','question_id','gt','answer','selection_mode','output','base_kept','anyres_kept',
         'baseline_packed_tokens','pre_llm_tokens','post_distill_tokens','protected_newlines'))
-    return dict(complete=True,samples=len(rows),resumed_samples=resumed,fresh_samples=len(rows)-resumed,pngs=len(rows),lat_mem_benchmark=False)
+    return dict(complete=True,samples=len(rows),resumed_samples=resumed,fresh_samples=len(rows)-resumed,
+                pngs=len(rows)*(3 if indices is not None else 1),lat_mem_benchmark=False)
 
 
 def worker(manifest,job_id):
@@ -361,7 +396,9 @@ def run(args):
     if args.check_data: freeze(args);return 0
     output,spec=setup(args);queues={j['gpu']:deque() for j in spec['jobs']};active={};failures=[]
     for job in spec['jobs']: queues[job['gpu']].append(job)
-    print(f"MVTec: {spec['sample_count']} samples/rate; {spec['jobs']}; one PNG each; stage=before tail9",flush=True)
+    indices=spec.get('sample_indices')
+    views=3 if indices is not None else 1
+    print(f"MVTec: {spec['sample_count']} samples/rate; {spec['jobs']}; {views} PNG(s) each; stage=before tail9",flush=True)
     last=time.perf_counter()
     try:
         while active or any(queues.values()):
@@ -372,9 +409,12 @@ def run(args):
                     if old.get('complete') and old.get('status')=='success':
                         if old.get('input_sha256')!=spec['input_sha256'] or old.get('job_id')!=job['job_id']:
                             raise ValueError('Saved completed images belong to another input/job')
-                        if len(restored(folder,samples_for(spec),job.get('selection_mode','baseline'),
-                                        sample_indices=spec.get('sample_indices')))!=spec['sample_count']:
+                        samples=samples_for(spec)
+                        rows=restored(folder,samples,job.get('selection_mode','baseline'),sample_indices=indices)
+                        if len(rows)!=spec['sample_count']:
                             raise ValueError('Incomplete completed PNG set')
+                        if indices is not None:
+                            export_split_views(folder,samples,rows)
                         print(f"Reuse complete {job['job_id']}",flush=True);continue
                     logpath=output/(job['job_id']+'.log');log=logpath.open('a',encoding='utf-8')
                     command=[sys.executable,'-u',str(PROJECT/'visualize_mvtec_baseline.py'),'--worker',job['job_id'],'--manifest',str(output/'run.json')]
