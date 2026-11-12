@@ -1,4 +1,4 @@
-"""Full MVTec baseline or joint self-score Top-k: one compact PNG per sample.
+"""MVTec baseline or joint self-score Top-k: one compact PNG per sample.
 
 Default GPU5=50%, GPU6=70%. Snapshot after MyPool+distillation, BEFORE tail9.
 Diagnostic generation only: no clean Lat/Mem benchmark, no additional PNGs.
@@ -28,9 +28,9 @@ LEGACY_VERSION='1.0-mvtec-baseline-compact'
 MODES=('baseline','joint_self')
 
 
-def mode_configuration(mode):
+def mode_configuration(mode, share=BASELINE['distill_share']):
     if mode not in MODES: raise ValueError('Unknown visualization selection mode')
-    config=dict(BASELINE)
+    config=dict(BASELINE, distill_share=share)
     if mode=='joint_self':
         config.update(selection_mode='anyres_self',predictor_input='full',base_mapping='reference',base_policy='joint')
     return config
@@ -51,11 +51,11 @@ def schedule(rates,gpus,modes):
     return jobs
 
 
-def make_method(core,checkpoint,rate,mode):
+def make_method(core,checkpoint,rate,mode,*,share=BASELINE['distill_share']):
     from llava_pruning.pool_distill import PoolDistillMethod
     from runMyPruningPoolSpatial import MethodSettings
-    config=mode_configuration(mode)
-    return PoolDistillMethod(core,checkpoint,rate=rate,share=.7,mode=config['selection_mode'],
+    config=mode_configuration(mode,share)
+    return PoolDistillMethod(core,checkpoint,rate=rate,share=share,mode=config['selection_mode'],
         settings=MethodSettings(prune_rate=0,redundancy_layers=(26,),visionzip_layers=(26,),allocation_temperature=.05,spatial_strength=0.),
         pruning_audit='lean',tail_drop_layers=9,predictor_input=config['predictor_input'],base_mapping=config['base_mapping'],base_policy=config['base_policy'])
 
@@ -75,6 +75,9 @@ def parser():
     p.add_argument('--seed',type=int,default=42)
     p.add_argument('--panel-height',type=int,default=768)
     p.add_argument('--output-dir',type=Path,default=Path('output/mvtec_baseline_compact_50_70_gpu56_01'))
+    p.add_argument('--source-run',type=Path,help='Existing full MVTec visualization run for a baseline lambda subset')
+    p.add_argument('--sample-indices',type=int,nargs='+',help='Zero-based numbers in the source sample PNG filenames')
+    p.add_argument('--distill-share',type=float,help='Lambda for the selected-sample baseline run')
     p.add_argument('--resume',action='store_true',help='Restore saved settings, skip completed PNGs, continue missing samples')
     p.add_argument('--check-data',action='store_true',help='Validate/count the FULL input; no model, GPU or output files')
     p.add_argument('--find-existing',action='store_true',help='Read-only search of output/outputs for MVTec visualization records')
@@ -142,11 +145,14 @@ def freeze(args):
 
 def verify(spec):
     modes=spec.get('selection_modes',['baseline'])
+    share=spec.get('distill_share',BASELINE['distill_share'])
+    if not 0 < share < 1:
+        raise ValueError('Lambda must be strictly between 0 and 1')
     if (spec.get('version') not in {VERSION,LEGACY_VERSION} or not modes or len(set(modes))!=len(modes) or
-            any(mode not in MODES for mode in modes) or spec['configuration']!=mode_configuration(modes[0])):
+            any(mode not in MODES for mode in modes) or spec['configuration']!=mode_configuration(modes[0],share)):
         raise ValueError('Saved visualization version or baseline settings changed')
     configurations=spec.get('mode_configurations',{'baseline':dict(BASELINE)})
-    if configurations!={mode:mode_configuration(mode) for mode in modes}:
+    if configurations!={mode:mode_configuration(mode,share) for mode in modes}:
         raise ValueError('Saved per-mode visualization settings changed')
     for job in spec['jobs']:
         mode=job.get('selection_mode','baseline')
@@ -160,10 +166,55 @@ def verify(spec):
         if common.digest(path)!=expected: raise ValueError(f'Saved input/model config changed: {path}')
 
 
+def subset_spec(args, source_dir, output):
+    source=json.loads((source_dir/'run.json').read_text(encoding='utf-8'))
+    verify(source)
+    if 'sample_indices' in source or 'baseline' not in source.get('selection_modes',['baseline']):
+        raise ValueError('Select samples from the original full baseline run')
+    rows,_=common.read_prefix(Path(source['input_json']))
+    indices=args.sample_indices
+    if (len(rows)!=source['sample_count'] or len(set(indices))!=len(indices) or
+            min(indices)<0 or max(indices)>=len(rows)):
+        raise ValueError('Use distinct sample indices within the original frozen sample list')
+    rates={job['prune_rate'] for job in source['jobs'] if job.get('selection_mode','baseline')=='baseline'}
+    if not set(args.prune_rates).issubset(rates):
+        raise ValueError('Requested rates are absent from the original baseline run')
+    if student_identity(source['checkpoint']['path'],'visa')!=source['checkpoint']:
+        raise ValueError('Original student or training manifest changed')
+
+    share=args.distill_share
+    config=mode_configuration('baseline',share)
+    selected=[rows[index] for index in indices]
+    output.mkdir(parents=True,exist_ok=True)
+    frozen=output/'input_frozen.jsonl'
+    frozen.write_text(''.join(json.dumps(row,ensure_ascii=False)+'\n' for row in selected),encoding='utf-8')
+    spec=dict(source,version=VERSION,created_utc=datetime.now(timezone.utc).isoformat(),
+              source_run=str(source_dir),sample_indices=indices,sample_count=len(selected),distill_share=share,
+              input_json=str(frozen),input_sha256=common.digest(frozen),configuration=config,
+              selection_modes=['baseline'],mode_configurations={'baseline':config},
+              jobs=schedule(args.prune_rates,args.gpus,['baseline']),source_identity=common.source_identity())
+    spec['definitions']=dict(source['definitions'],selection=f'Base-mapped AnyRes ranking, Base+Text side input, anyres_first, lambda={share:g}, tail9.')
+    common.save_json(output/'run.json',spec)
+    return output,spec
+
+
 def setup(args):
-    output=args.output_dir.expanduser().resolve()
+    source_dir=args.source_run.expanduser().resolve() if args.source_run else None
+    if source_dir is None and (args.sample_indices is not None or args.distill_share is not None):
+        raise ValueError('--sample-indices and --distill-share require --source-run')
+    if source_dir is not None:
+        if (not args.sample_indices or args.distill_share is None or not 0<args.distill_share<1
+                or args.selection_modes!=['baseline'] or args.add_joint_self):
+            raise ValueError('--source-run requires sample indices, 0 < lambda < 1 and baseline mode')
+        output=source_dir/f'lambda_{args.distill_share:g}'
+    else:
+        output=args.output_dir.expanduser().resolve()
     if args.resume:
         spec=json.loads((output/'run.json').read_text(encoding='utf-8'));verify(spec)
+        if source_dir is not None and (str(source_dir)!=spec.get('source_run') or
+                args.sample_indices!=spec.get('sample_indices') or args.distill_share!=spec.get('distill_share') or
+                set(args.prune_rates)!={job['prune_rate'] for job in spec['jobs']}):
+            raise ValueError('Source run, sample indices, lambda or rates differ from the saved subset')
         if student_identity(spec['checkpoint']['path'],'visa')!=spec['checkpoint']:
             raise ValueError('Saved student or training manifest changed')
         if args.add_joint_self and 'joint_self' not in spec.get('selection_modes',['baseline']):
@@ -184,6 +235,8 @@ def setup(args):
             not args.selection_modes or len(set(args.selection_modes))!=len(args.selection_modes)):
         raise ValueError('Use distinct nonnegative GPUs, distinct rates and positive panel-height')
     if output.exists() and any(output.iterdir()): raise FileExistsError(f'Use a new/empty directory or --resume: {output}')
+    if source_dir is not None:
+        return subset_spec(args,source_dir,output)
     rows=freeze(args);model=Path(args.model_path).expanduser().resolve()
     if json.loads((model/'config.json').read_text(encoding='utf-8')).get('num_hidden_layers')!=28:
         raise ValueError('Expected the existing 28-layer OneVision/Qwen2 model')
@@ -242,20 +295,22 @@ def render_samples(backend,method,samples,spec,job,folder):
     from llava_pruning.pool_compact_visualization import render_compact
     folder.mkdir(parents=True,exist_ok=True);pictures=folder/'visualizations';pictures.mkdir(exist_ok=True)
     mode=job.get('selection_mode','baseline')
-    rows=restored(folder,samples,mode);resumed=len(rows);started=time.perf_counter();last=started
+    indices=spec.get('sample_indices')
+    rows=restored(folder,samples,mode,sample_indices=indices);resumed=len(rows);started=time.perf_counter();last=started
     with torch.inference_mode(),method.generation_context(backend.model),(folder/'predictions.jsonl').open('a',encoding='utf-8') as stream:
         for index in range(resumed,len(samples)):
             sample=samples[index]
+            source_index=index if indices is None else indices[index]
             with capture_baseline_views(method) as trace:
                 result=backend.generate(sample,sample.source['prompt'],method,job['prune_rate'],'anyres_max_9',
-                    capture_visualization=False,capture_attention=False,random_seed=spec['seed']+index,
+                    capture_visualization=False,capture_attention=False,random_seed=spec['seed']+source_index,
                     do_sample=False,include_pruning_time=True,benchmark_metrics=False)
             picture,details=render_compact(method,trace,backend.processor,result,sample,job['prune_rate'],spec['panel_height'])
-            name=f'visualizations/sample_{index:09d}.png';target=folder/name;temporary=target.with_suffix('.png.tmp')
+            name=f'visualizations/sample_{source_index:09d}.png';target=folder/name;temporary=target.with_suffix('.png.tmp')
             try: picture.save(temporary,format='PNG',compress_level=2);temporary.replace(target)
             finally: picture.close()
             row=dict(index=index,question_id=sample.sample_id,gt=sample.gt,answer=result['answer'],output=name,selection_mode=mode,
-                sample_seed=spec['seed']+index,**details)
+                sample_seed=spec['seed']+source_index,**details)
             stream.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+'\n');stream.flush();rows.append(row)
             del trace,result,picture
             elapsed=time.perf_counter()-started
@@ -284,7 +339,8 @@ def worker(manifest,job_id):
         if len(core.layers)!=28: raise ValueError('Expected 28 LLM layers')
         device=torch.cuda.get_device_properties(0)
         common.verify_runtime(folder,backend.inference_config,device.name,device.total_memory)
-        method=make_method(core,spec['checkpoint']['path'],job['prune_rate'],job.get('selection_mode','baseline'))
+        method=make_method(core,spec['checkpoint']['path'],job['prune_rate'],job.get('selection_mode','baseline'),
+                           share=spec.get('distill_share',BASELINE['distill_share']))
         report.update(inference=backend.inference_config,source_identity=common.source_identity(),
             **render_samples(backend,method,samples,spec,job,folder));report['status']='success'
     except Exception as error: report['error']=f'{type(error).__name__}: {error}';traceback.print_exc()
@@ -297,7 +353,7 @@ def run(args):
     if args.check_data: freeze(args);return 0
     output,spec=setup(args);queues={j['gpu']:deque() for j in spec['jobs']};active={};failures=[]
     for job in spec['jobs']: queues[job['gpu']].append(job)
-    print(f"Full MVTec: {spec['sample_count']} samples/rate; {spec['jobs']}; one PNG each; stage=before tail9",flush=True)
+    print(f"MVTec: {spec['sample_count']} samples/rate; {spec['jobs']}; one PNG each; stage=before tail9",flush=True)
     last=time.perf_counter()
     try:
         while active or any(queues.values()):
@@ -308,7 +364,9 @@ def run(args):
                     if old.get('complete') and old.get('status')=='success':
                         if old.get('input_sha256')!=spec['input_sha256'] or old.get('job_id')!=job['job_id']:
                             raise ValueError('Saved completed images belong to another input/job')
-                        if len(restored(folder,samples_for(spec),job.get('selection_mode','baseline')))!=spec['sample_count']: raise ValueError('Incomplete completed PNG set')
+                        if len(restored(folder,samples_for(spec),job.get('selection_mode','baseline'),
+                                        sample_indices=spec.get('sample_indices')))!=spec['sample_count']:
+                            raise ValueError('Incomplete completed PNG set')
                         print(f"Reuse complete {job['job_id']}",flush=True);continue
                     logpath=output/(job['job_id']+'.log');log=logpath.open('a',encoding='utf-8')
                     command=[sys.executable,'-u',str(PROJECT/'visualize_mvtec_baseline.py'),'--worker',job['job_id'],'--manifest',str(output/'run.json')]
@@ -331,7 +389,7 @@ def run(args):
                 last=time.perf_counter()
             if active: time.sleep(.25)
     except KeyboardInterrupt:
-        print(f'Interrupted; resume with --resume --output-dir {output}',flush=True);return 130
+        print(f'Interrupted; rerun the same command with --resume | {output}',flush=True);return 130
     finally:
         for process,_,_,_ in active.values():
             if process.poll() is None:

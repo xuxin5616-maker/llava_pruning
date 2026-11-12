@@ -131,6 +131,47 @@ class CompactTests(unittest.TestCase):
             self.assertEqual(len(list(output.rglob('*.png'))),8)
             self.assertNotIn('select',method.adapter.__dict__)
 
+    def test_lambda_subset_uses_original_filenames_and_runs_the_new_budget(self):
+        with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
+            args = fixture(Path(temporary))
+            model, options = model_and_options(28)
+            core = model.get_model()
+            model.config.max_position_embeddings = 4096
+            make_checkpoint(args.checkpoint, core)
+            original, old = entry.setup(args)
+            old_manifest = (original / 'run.json').read_bytes()
+            cli = ['--source-run', str(original), '--sample-indices', '1',
+                   '--distill-share', '0.3', '--gpus', '0', '1']
+            subset, spec = entry.setup(entry.parser().parse_args(cli))
+            entry.verify(spec)
+            self.assertEqual(subset, original / 'lambda_0.3')
+            self.assertEqual(spec['configuration'], dict(old['configuration'], distill_share=.3))
+            self.assertEqual([job['gpu'] for job in spec['jobs']], ['0', '1'])
+            self.assertEqual((original / 'run.json').read_bytes(), old_manifest)
+            samples = entry.samples_for(spec)
+            backend = LlavaBackend.__new__(LlavaBackend)
+            backend.model, backend.vision_tower = model, core.get_vision_tower()
+            backend.processor = SigLipImageProcessor()
+            backend.tokenizer = type('Tokenizer', (), {'batch_decode': lambda *a, **k: ['B']})()
+            native = model.generate
+            with patch.object(model, 'generate', side_effect=lambda **kw: native(**dict(kw, max_new_tokens=2))), \
+                    patch.object(torch.cuda, 'synchronize'), \
+                    patch.object(mm_utils, 'tokenizer_image_token', return_value=options['inputs'][0]):
+                for job in spec['jobs']:
+                    rate = job['prune_rate']
+                    method = entry.make_method(core, spec['checkpoint']['path'], rate, 'baseline',
+                                               share=spec['distill_share'])
+                    folder = entry.job_folder(subset, job)
+                    entry.render_samples(backend, method, samples, spec, job, folder)
+                    rows = entry.restored(folder, samples, sample_indices=[1])
+                    self.assertEqual(rows[0]['question_id'], '000000001')
+                    self.assertEqual(rows[0]['output'], 'visualizations/sample_000000001.png')
+                    self.assertEqual(rows[0]['sample_seed'], spec['seed'] + 1)
+                    self.assertEqual(method.adapter.plan['distill_share'], .3)
+                    self.assertAlmostEqual(method.adapter.plan['target_pre_contribution'], rate * .7)
+            self.assertEqual(len(list(subset.rglob('*.png'))), 2)
+            self.assertEqual(entry.setup(entry.parser().parse_args([*cli, '--resume'])), (subset, spec))
+
     def test_two_gpu_launcher_full_input_and_completed_resume(self):
         with tempfile.TemporaryDirectory() as temporary,redirect_stdout(io.StringIO()):
             args=fixture(Path(temporary));busy=set();peak=[0];calls=[]

@@ -59,7 +59,8 @@ def render_compact(method,trace,processor,result,sample,rate,panel_height=768,*,
         canvas=Image.new('RGB',(2*margin+sum(p.width for p in scaled)+2*gap,header+panel_height+footer),'white')
         draw=ImageDraw.Draw(canvas)
         title='Joint self-attention Top-k' if getattr(method,'base_policy','anyres_first')=='joint' else 'Baseline'
-        heading = (f'{title} | Avg pruning {rate:g}% | lambda=0.7' if pre_llm_label is None
+        share = getattr(method,'share',.7)
+        heading = (f'{title} | Avg pruning {rate:g}% | lambda={share:g}' if pre_llm_label is None
                    else f'{pre_llm_label} | Target pruning {rate:g}%')
         stage = 'After MyPool + distillation, BEFORE tail9' if pre_llm_label is None else 'After MyPool, before LLM'
         draw.text((margin,10),f'{heading} | ID: {sample.sample_id}',fill='black',font=font(20))
