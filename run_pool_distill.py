@@ -293,18 +293,40 @@ def rebuild_reports(directory, baseline_acc=91.18):
     return root
 
 
-def run_sweep(args, *, run_process=None, process_factory=None):
+def freeze_sampled_input(args, output, count, seed):
+    from llava_pruning.data import load_samples
+    from llava_pruning.image_sampling import sample_images
+
+    original = args.input_json
+    records = load_samples(original, args.data_root)
+    selected, available = sample_images(records, count, seed, lambda sample: sample.image)
+    path = output / "sampled_input.jsonl"
+    output.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as stream:
+        for sample in selected:
+            stream.write(json.dumps(sample.source, ensure_ascii=False) + "\n")
+    args.input_json = path
+    print(f"Selected {count}/{available} distinct MVTec images (seed={seed}): {path}", flush=True)
+    return dict(seed=seed, images=count, eligible_images=available, source=str(original),
+                source_sha256=file_hash(original), input_sha256=file_hash(path))
+
+
+def run_sweep(args, *, run_process=None, process_factory=None, sample_count=None, sample_seed=42):
     if args.gpus is not None and len(args.gpus) > 1:
         if run_process is not None:
             raise ValueError("Parallel trials use a nonblocking process_factory")
         from llava_pruning.pool_distill_parallel import run_parallel_sweep
         return run_parallel_sweep(args, api=sys.modules[__name__], process_factory=process_factory)
     output = validate(args)
+    sampling = freeze_sampled_input(args, output, sample_count, sample_seed) if sample_count is not None else None
     output.mkdir(parents=True, exist_ok=True)
     manifest_path = output / "comparison.json"
     saved_manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if args.resume else None
     if saved_manifest is not None:
         require_current_prompt_format(saved_manifest)
+        saved_sampling = saved_manifest.get("sampling")
+        if saved_sampling is not None and file_hash(args.input_json) != saved_sampling["input_sha256"]:
+            raise ValueError("Frozen MVTec sample list changed")
     manifest = saved_manifest or dict(created_utc=datetime.now(timezone.utc).isoformat(), complete=False,
                     prune_rates=args.prune_rates, lambdas=args.lambdas, selection_modes=args.selection_modes,
                     isolated_sequential_processes=True,
@@ -314,6 +336,8 @@ def run_sweep(args, *, run_process=None, process_factory=None):
                     sparse_distribution_shift="side predictor now receives MyPool-compressed/merged inputs; performance requires empirical verification",
                     visualization=False, baseline_accuracy_reference=baseline_reference(args.baseline_acc),
                     metric_definitions=METRIC_DEFINITIONS, prompt_format=PROMPT_FORMAT, trials=[])
+    if sampling is not None:
+        manifest["sampling"] = sampling
     manifest.update(complete=False, baseline_accuracy_reference=baseline_reference(args.baseline_acc),
                     pruning_auxiliary_profile=auxiliary_profile(args.pruning_audit),
                     gpus=[args.gpu], isolated_sequential_processes=True,

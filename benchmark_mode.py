@@ -21,6 +21,9 @@ def parse_args(argv=None):
         mode.add_argument("--model-path", type=Path)
         mode.add_argument("--data-root", type=Path)
         mode.add_argument("--checkpoint", type=Path, help="VisA-trained student checkpoint")
+        mode.add_argument("--samples", type=int, help="Uniform random sample of this many distinct query images")
+        mode.add_argument("--sample-seed", type=int, default=42, help="Random image sampling seed (default 42)")
+        mode.add_argument("--resume", action="store_true", help="Resume the saved run and its frozen image list")
     mvtec.add_argument("--input-json", type=Path)
     mvtec.add_argument("--prune-rates", type=float, nargs="+", default=[50, 70, 90],
                        help="LLM layer-average pruning percentages (default 50 70 90)")
@@ -30,6 +33,10 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.gpu < 0:
         parser.error("--gpu must be a nonnegative physical GPU ID")
+    if args.samples is not None and args.samples < 1:
+        parser.error("--samples must be positive")
+    if not 0 <= args.sample_seed < 2**32:
+        parser.error("--sample-seed must be an integer in [0, 2**32)")
     return args
 
 
@@ -46,6 +53,8 @@ def command_for(args):
         script = "benchmark_mmad_binary.py"
         options = ["--experiment-group", "joint_self", "--prune-rates", "50",
                    "--joint-self-tails", "8", "--resize-mode", "stretch"]
+        if args.samples is not None:
+            options.extend(("--samples", str(args.samples), "--sample-seed", str(args.sample_seed)))
         paths = ("annotations", "image_root", "mvtec_root")
     options.extend(("--gpu", str(args.gpu), "--output-dir", str(args.output_dir)))
     for name in ("model_path", "data_root", "checkpoint", *paths):
@@ -56,11 +65,23 @@ def command_for(args):
 
 
 def main():
-    command = command_for(parse_args())
+    args = parse_args()
+    command = command_for(args)
+    if args.resume:
+        command = [*command[:2], "--resume", "--output-dir", str(args.output_dir)]
+    elif args.mode == "mvtecmode" and args.samples is not None:
+        from run_pool_distill import build_parser, run_sweep
+        run_sweep(build_parser().parse_args(command[2:]), sample_count=args.samples, sample_seed=args.sample_seed)
+        return 0
     if os.name == "posix":
         os.execv(command[0], command)
     return subprocess.run(command, check=False).returncode
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (OSError, ValueError) as error:
+        sys.exit(f"Error: {error}")
+    except KeyboardInterrupt:
+        sys.exit(130)

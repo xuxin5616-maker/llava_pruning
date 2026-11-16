@@ -59,6 +59,8 @@ def parser():
     p.add_argument("--joint-self-tails", type=int, nargs="+", choices=range(27), default=[0], metavar="0..26",
                    help="Extra image-free final-layer counts for joint_self; default0, e.g. 0 1 2 ... 10")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--samples", type=int, help="Uniform random sample of distinct query images, one question per image")
+    p.add_argument("--sample-seed", type=int, default=42)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--output-dir", type=Path, default=Path("output/mmad_no_visa_two_hybrids_gpu567_01"))
     p.add_argument("--check-data", action="store_true", help="Validate/count local questions and images; no model/GPU/output files")
@@ -82,14 +84,38 @@ def describe(info):
           "no normal-reference images or masks are used.",flush=True)
 
 
+def load_evaluation_data(args):
+    records, info = load_binary(args.data_root,args.annotations,args.image_root,args.seed,
+        exclude_sources=() if args.include_visa else EXCLUDED_SOURCES,mvtec_root=args.mvtec_root)
+    if args.samples is not None:
+        from collections import Counter
+        from llava_pruning.image_sampling import sample_images
+
+        records, available = sample_images(records, args.samples, args.sample_seed, lambda row: row["resolved_image"])
+        info.update(sampling=dict(seed=args.sample_seed, images=args.samples, eligible_images=available),
+                    selected_query_images=len(records), binary_questions=len(records),
+                    source_counts=dict(Counter(row["dataset"] for row in records)),
+                    binary_questions_with_distractors=sum(len(row["options"]) > 2 for row in records))
+        print(f"Selected {len(records)}/{available} distinct MMAD images (seed={args.sample_seed})", flush=True)
+    return records, info
+
+
+def reuse_manifest(args):
+    manifest = args.reuse_dir.expanduser() / "run.json"
+    previous = json.loads(manifest.read_text(encoding="utf-8"))
+    if args.samples is not None or previous["dataset_info"].get("sampling"):
+        raise ValueError("--reuse-dir extends full MMAD runs only; use --resume for a sampled run")
+    return previous
+
+
 def check_data(args):
     if args.reuse_dir:
+        reuse_manifest(args)
         from llava_pruning.mmad_extension import prepare_reuse
         _, info, _, _, _ = prepare_reuse(args, sys.modules[__name__], fingerprint_student=False)
         describe(info)
         return 0
-    _,info = load_binary(args.data_root,args.annotations,args.image_root,args.seed,
-        exclude_sources=() if args.include_visa else EXCLUDED_SOURCES,mvtec_root=args.mvtec_root)
+    _,info = load_evaluation_data(args)
     describe(info)
     return 0
 
@@ -278,7 +304,7 @@ def setup(args):
         # All options, including per-trial GPU assignments, are restored.
         return output,spec
     if args.reuse_dir:
-        previous = json.loads((args.reuse_dir.expanduser() / "run.json").read_text(encoding="utf-8"))
+        previous = reuse_manifest(args)
         if (args.experiment_group in {"baselines", "baselines_joint90"}
                 or args.resize_mode != "native" or previous.get("resize_mode", "native") != "native"):
             raise ValueError("Use a fresh directory for the selected resize or experiment group, or --resume that run")
@@ -311,8 +337,7 @@ def setup(args):
     if output.exists() and any(output.iterdir()): raise FileExistsError(f"Use a new/empty directory or --resume: {output}")
     # Validate the complete query image set before model/config/weight loading
     # or fingerprinting; path failures should be quick to diagnose and retry.
-    records,info = load_binary(args.data_root,args.annotations,args.image_root,args.seed,
-        exclude_sources=() if args.include_visa else EXCLUDED_SOURCES,mvtec_root=args.mvtec_root)
+    records,info = load_evaluation_data(args)
     model = Path(args.model_path).expanduser().resolve()
     model_config = json.loads((model / "config.json").read_text(encoding="utf-8"))
     if model_config.get("num_hidden_layers") != 28:
