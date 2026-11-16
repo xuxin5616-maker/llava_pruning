@@ -1,7 +1,7 @@
 """Compare pruning methods with the post-prefill K/V footprint on MVTec or MMAD."""
 
 import argparse
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import nullcontext
 import json
 import os
@@ -18,6 +18,7 @@ from benchmark_fastv import DEFAULT_DATA_ROOTS, DEFAULT_MVTEC_JSON
 from compare_distilled_visa100 import student_identity
 from llava_pruning.extended_metrics import extended_metrics
 from llava_pruning.mmad_source import scope_identity, working_files
+from llava_pruning.pool_distill_parallel import stop_active
 from llava_pruning.prefill_kv import KV_BYTES, KV_MIB, observe_post_prefill_kv
 from visualize_mvtec_baseline import freeze, samples_for
 
@@ -31,12 +32,15 @@ SOURCE_FIELDS = ("source", "questions", "normal", "abnormal", *FIELDS)
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("mode", choices=("mvtecmode", "mmadmode"))
+    p.add_argument("mode", choices=("mvtecmode", "mmadmode", "both"))
     p.add_argument("--output-dir", type=Path, required=True)
-    p.add_argument("--gpu", type=int, help="Physical GPU. Defaults to 2 for MVTec and 3 for MMAD.")
+    devices = p.add_mutually_exclusive_group()
+    devices.add_argument("--gpu", type=int, help="Physical GPU. Defaults to 2 for MVTec and 3 for MMAD.")
+    devices.add_argument("--gpus", type=int, nargs="+", help="Physical GPUs, one trial per GPU. In both mode, split the list in half.")
     p.add_argument("--model-path", type=Path, default=Path("/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov"))
     p.add_argument("--checkpoint", type=Path, default=PROJECT / "output/attention_predictor_twig_train_01/best.pt")
     p.add_argument("--data-root", type=Path)
+    p.add_argument("--mmad-data-root", type=Path, help="Override the MMAD root in both mode")
     p.add_argument("--input-json", type=Path, default=Path(DEFAULT_MVTEC_JSON), help="MVTec question list")
     p.add_argument("--annotations", type=Path, help="MMAD annotation JSON")
     p.add_argument("--image-root", type=Path, help="MMAD image container")
@@ -46,18 +50,21 @@ def parser():
     return p
 
 
-def schedule(mode, gpu):
+def schedule(mode, gpus):
     is_mmad = mode == "mmadmode"
     if is_mmad:
-        jobs = mm.schedule(RATES, [gpu], base_guided_tail=8, joint_self_tails=(8,))
+        jobs = mm.schedule(RATES, [gpus[0]], base_guided_tail=8, joint_self_tails=(8,))
         jobs = [job for job in jobs if job.get("variant") != "base_guided"]
+        for job in jobs:
+            if job.pop("gpu", None) is not None:
+                job["config"] = job["config"].rsplit(";gpu=", 1)[0]
         prefix = "dataset=MMAD;exclude=VisA;shot=0;"
         suffix = ";resize=stretch;canvas=1152;grid=3x3"
     else:
         jobs = common.schedule(RATES)
         prefix, suffix = "dataset=MVTec-AD;prompt=v0;", ""
         for job in jobs:
-            job["config"] = prefix + job["config"].replace("tail=9(extra)", "tail=8(extra)") + f";gpu={gpu}"
+            job["config"] = prefix + job["config"].replace("tail=9(extra)", "tail=8(extra)")
     for job in jobs:
         if job["method"] == "hybrid_baseline":
             job["config"] += f";mode={mode}"
@@ -67,7 +74,10 @@ def schedule(mode, gpu):
         stages = "/".join(map(str, blocks))
         jobs.append(dict(job_id=f"sparsevlm_{rate:02d}", method="sparsevlm", prune_rate=rate,
                          after_blocks=blocks, status="pending", reason="",
-                         config=f"{prefix}method=sparsevlm;prune={rate}%;rate=layer_average;layers={stages};gpu={gpu}{suffix}"))
+                         config=f"{prefix}method=sparsevlm;prune={rate}%;rate=layer_average;layers={stages}{suffix}"))
+    for index, job in enumerate(job for job in jobs if job["status"] == "pending"):
+        job["gpu"] = gpus[index % len(gpus)]
+        job["config"] += f";gpu={job['gpu']}"
     return jobs
 
 
@@ -79,7 +89,7 @@ def setup(args, output):
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Use a new/empty output directory or --resume: {output}")
     is_mmad = args.mode == "mmadmode"
-    gpu = args.gpu if args.gpu is not None else (3 if is_mmad else 2)
+    gpus = args.gpus or [args.gpu if args.gpu is not None else (3 if is_mmad else 2)]
     root = Path(args.data_root or (DATA / "MMAD" if is_mmad else DEFAULT_DATA_ROOTS["mvtec"])).expanduser().resolve()
     model = args.model_path.expanduser().resolve()
     config_path = model / "config.json"
@@ -100,9 +110,9 @@ def setup(args, output):
     output.mkdir(parents=True, exist_ok=True)
     frozen = output / ("mmad_binary.jsonl" if is_mmad else "mvtec_frozen.jsonl")
     frozen.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
-    spec = dict(mode=args.mode, gpu=gpu, model_path=str(model), checkpoint=checkpoint, data_root=str(root),
+    spec = dict(mode=args.mode, gpus=gpus, model_path=str(model), checkpoint=checkpoint, data_root=str(root),
                 model_config_sha256=common.digest(config_path), input_json=str(frozen), input_sha256=common.digest(frozen),
-                sample_count=len(rows), dataset_info=info, source_identity=source_identity(), jobs=schedule(args.mode, gpu),
+                sample_count=len(rows), dataset_info=info, source_identity=source_identity(), jobs=schedule(args.mode, gpus),
                 seed=42, warmup=10, calibration_samples=12,
                 definitions=dict(common.DEFINITIONS, post_prefill_kv=(
                     "Mean over measured samples of sum of actual decoder K/V elements times element size, divided by 2^20. "
@@ -116,10 +126,30 @@ def setup(args, output):
 
 def load_run(output, mode):
     spec = json.loads((output / "run.json").read_text(encoding="utf-8"))
-    if spec["mode"] != mode or spec["jobs"] != schedule(mode, spec["gpu"]):
-        raise ValueError("Saved benchmark mode or trial configuration differs")
-    if spec["source_identity"] != source_identity():
+    current = source_identity()
+    saved = spec["source_identity"]
+    if "gpus" not in spec:
+        # 8c08406 used a single GPU. Accept its exact inference dependencies
+        # while adding GPU assignments to the in-memory manifest.
+        old_files = dict(current["files"])
+        old_files.pop("llava_pruning/pool_distill_parallel.py", None)
+        old_files[Path(__file__).name] = "d296d3c3ceccff0f053cbb793fb786d24ceb8e0a87ab1b10390a20b6b673d813"
+        if saved["policy"] != current["policy"] or saved["files"] != old_files:
+            raise ValueError("An inference dependency changed; resume with the original source")
+        spec["gpus"] = [spec["gpu"]]
+        expected = schedule(mode, spec["gpus"])
+
+        def without_gpu(job):
+            config = ";".join(part for part in job["config"].split(";") if not part.startswith("gpu="))
+            return {**{k: v for k, v in job.items() if k != "gpu"}, "config": config}
+
+        if list(map(without_gpu, spec["jobs"])) != list(map(without_gpu, expected)):
+            raise ValueError("Saved benchmark trial configuration differs")
+        spec["jobs"] = expected
+    elif saved != current:
         raise ValueError("An inference dependency changed; resume with the original source")
+    if spec["mode"] != mode or spec["jobs"] != schedule(mode, spec["gpus"]):
+        raise ValueError("Saved benchmark mode or trial configuration differs")
     for path, digest in ((spec["input_json"], spec["input_sha256"]),
                          (Path(spec["model_path"]) / "config.json", spec["model_config_sha256"])):
         if common.digest(path) != digest:
@@ -236,7 +266,7 @@ def evaluate(backend, method, samples, spec, job, output, total_memory):
 def worker(spec, job, output):
     report = dict(job_id=job["job_id"], input_sha256=spec["input_sha256"], status="failed", complete=False)
     try:
-        if os.environ.get("CUDA_VISIBLE_DEVICES") != str(spec["gpu"]):
+        if os.environ.get("CUDA_VISIBLE_DEVICES") != str(job["gpu"]):
             raise ValueError("Expose only the worker's assigned GPU")
         import torch
         from llava_pruning.backend import LlavaBackend
@@ -304,34 +334,94 @@ def write_reports(output, spec):
     return results
 
 
+def run_trials(runs, *, process_factory=subprocess.Popen, poll_interval=.25):
+    queues = defaultdict(deque)
+    for output, spec in runs:
+        results = write_reports(output, spec)
+        for job in spec["jobs"]:
+            old = results[job["job_id"]]
+            if job["status"] == "pending" and not (old.get("complete") and old.get("status") == "success"):
+                queues[job["gpu"]].append((output, spec, job))
+    active, failures = {}, []
+    try:
+        while active or any(queues.values()):
+            for gpu, queue in queues.items():
+                if gpu in active or not queue:
+                    continue
+                output, spec, job = queue.popleft()
+                job_id = job["job_id"]
+                folder = output / job_id
+                folder.mkdir(exist_ok=True)
+                log_path = folder / "worker.log"
+                command = [sys.executable, "-u", str(Path(__file__).resolve()), spec["mode"],
+                           "--output-dir", str(output), "--worker", job_id]
+                stream = log_path.open("a", encoding="utf-8")
+                try:
+                    process = process_factory(command, cwd=PROJECT, env=dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu)),
+                                              stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT,
+                                              start_new_session=os.name == "posix")
+                except BaseException:
+                    stream.close()
+                    raise
+                active[gpu] = dict(process=process, stream=stream, output=output, spec=spec, job_id=job_id, log=log_path)
+                print(f"Start GPU {gpu} | {spec['mode']}/{job_id} | {log_path}", flush=True)
+            for gpu, trial in list(active.items()):
+                process = trial["process"]
+                code = process.poll()
+                if code is None:
+                    continue
+                process.wait()
+                trial["stream"].close()
+                del active[gpu]
+                if code in (-2, 130):
+                    raise KeyboardInterrupt
+                output, spec, job_id = trial["output"], trial["spec"], trial["job_id"]
+                report_path = output / job_id / "metrics.json"
+                result = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
+                if code or not (result.get("status") == "success" and result.get("complete")):
+                    reason = result.get("error") or f"Worker exit={code}; see {trial['log']}"
+                    common.save_json(report_path, dict(result, job_id=job_id, input_sha256=spec["input_sha256"],
+                                                       status="failed", complete=False, error=reason))
+                    failures.append(f"{spec['mode']}/{job_id}")
+                write_reports(output, spec)
+                print(f"Finish GPU {gpu} | {spec['mode']}/{job_id} | exit={code}", flush=True)
+            if active:
+                time.sleep(poll_interval)
+    finally:
+        stop_active(active)
+    for output, _ in runs:
+        print(f"Summary | {output / 'summary.csv'}", flush=True)
+    if failures:
+        print("Failed trials (see worker.log): " + ", ".join(failures), flush=True)
+    return int(bool(failures))
+
+
 def run(args):
     output = args.output_dir.expanduser().resolve()
     if args.worker:
         spec = load_run(output, args.mode)
         job = next(item for item in spec["jobs"] if item["job_id"] == args.worker and item["status"] == "pending")
         return worker(spec, job, output / job["job_id"])
-    if args.gpu is not None and args.gpu < 0:
-        raise ValueError("--gpu must be a nonnegative physical GPU ID")
-    spec = load_run(output, args.mode) if args.resume else setup(args, output)
-    if args.resume and args.gpu is not None and args.gpu != spec["gpu"]:
-        raise ValueError("Resume uses the originally assigned GPU")
-    results = write_reports(output, spec)
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(spec["gpu"]))
-    failed = False
-    for job in spec["jobs"]:
-        job_id = job["job_id"]
-        if job["status"] != "pending" or results[job_id].get("complete"):
-            continue
-        (output / job_id).mkdir(exist_ok=True)
-        print(f"Starting {job_id} on GPU {spec['gpu']}", flush=True)
-        command = [sys.executable, str(Path(__file__).resolve()), args.mode, "--output-dir", str(output), "--worker", job_id]
-        completed = subprocess.run(command, env=env, check=False)
-        if completed.returncode in (130, -2):
-            raise KeyboardInterrupt
-        results = write_reports(output, spec)
-        failed |= bool(completed.returncode or results[job_id].get("status") != "success")
-    print(f"Summary | {output / 'summary.csv'}", flush=True)
-    return int(failed)
+    gpus = args.gpus or ([args.gpu] if args.gpu is not None else [])
+    if len(set(gpus)) != len(gpus) or any(gpu < 0 for gpu in gpus):
+        raise ValueError("GPU IDs must be distinct and nonnegative")
+    if args.mode == "both":
+        if not args.resume and len(gpus) < 2:
+            raise ValueError("Both datasets require at least two --gpus")
+        split = len(gpus) // 2
+        requests = [("mvtecmode", gpus[:split], output / "mvtecmode", args.data_root),
+                    ("mmadmode", gpus[split:], output / "mmadmode", args.mmad_data_root)]
+    else:
+        requests = [(args.mode, gpus, output, args.data_root)]
+    runs = []
+    for mode, devices, folder, data_root in requests:
+        child = argparse.Namespace(**vars(args))
+        child.mode, child.gpu, child.gpus, child.data_root = mode, None, devices, data_root
+        spec = load_run(folder, mode) if args.resume else setup(child, folder)
+        if args.resume and devices and devices != spec["gpus"]:
+            raise ValueError("Resume uses the originally assigned GPUs")
+        runs.append((folder, spec))
+    return run_trials(runs)
 
 
 if __name__ == "__main__":

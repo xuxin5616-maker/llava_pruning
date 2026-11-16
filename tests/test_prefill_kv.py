@@ -1,5 +1,6 @@
 """Check prefill-only measurement against the decoder's actual retained K/V."""
 
+from collections import Counter
 from contextlib import nullcontext
 import csv
 from pathlib import Path
@@ -68,7 +69,7 @@ class PrefillKVTests(unittest.TestCase):
                     else:
                         mode = "mmadmode" if name == "mmadmode" else "mvtecmode"
                         method_name = "hybrid_baseline" if name == "mmadmode" else name
-                        job = next(j for j in entry.schedule(mode, 2) if j["method"] == method_name and j["prune_rate"] == rate)
+                        job = next(j for j in entry.schedule(mode, [2]) if j["method"] == method_name and j["prune_rate"] == rate)
                         if method_name == "hybrid_baseline":
                             make_checkpoint(checkpoint, core)
                         student = {"path": str(checkpoint)}
@@ -103,7 +104,7 @@ class PrefillKVTests(unittest.TestCase):
     def test_schedules_and_reports_leave_unreachable_metrics_blank(self):
         for mode in ("mvtecmode", "mmadmode"):
             with self.subTest(mode=mode), TemporaryDirectory() as tmp:
-                jobs = entry.schedule(mode, 3)
+                jobs = entry.schedule(mode, [3])
                 self.assertEqual(len(jobs), 25)
                 self.assertEqual([j["job_id"] for j in jobs if j["status"] == "unreachable"], ["pyramiddrop_90"])
                 self.assertEqual(jobs[-1]["after_blocks"], [2, 7, 16])
@@ -126,3 +127,43 @@ class PrefillKVTests(unittest.TestCase):
                     rows = list(table)
                 self.assertEqual(rows[0][KV_MIB], "78.5")
                 self.assertEqual(next(row[KV_MIB] for row in rows if row["status"] == "unreachable"), "")
+
+    def test_combined_launcher_uses_each_gpu_once_at_a_time_and_keeps_separate_outputs(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            args = entry.parser().parse_args(["both", "--gpus", "0", "1", "2", "3", "4", "5", "--output-dir", str(root)])
+            active, launched = set(), Counter()
+            peak = 0
+
+            def fake_setup(child, folder):
+                folder.mkdir()
+                return dict(mode=child.mode, gpus=child.gpus, jobs=entry.schedule(child.mode, child.gpus), input_sha256="sha")
+
+            def fake_reports(output, spec):
+                return {job["job_id"]: {} for job in spec["jobs"]}
+
+            def start(command, *, env, **kwargs):
+                nonlocal peak
+                gpu = int(env["CUDA_VISIBLE_DEVICES"])
+                self.assertNotIn(gpu, active)
+                mode, output, job_id = command[3], Path(command[5]), command[-1]
+                self.assertEqual(output, root / mode)
+                self.assertEqual(gpu < 3, mode == "mvtecmode")
+                self.assertNotEqual(job_id, "pyramiddrop_90")
+                active.add(gpu)
+                peak = max(peak, len(active))
+                launched[gpu] += 1
+
+                def finish():
+                    active.remove(gpu)
+                    entry.common.save_json(output / job_id / "metrics.json", dict(status="success", complete=True))
+
+                return SimpleNamespace(poll=lambda: 0, wait=finish)
+
+            real_run_trials = entry.run_trials
+            with patch.object(entry, "setup", side_effect=fake_setup), patch.object(entry, "write_reports", side_effect=fake_reports), \
+                    patch.object(entry, "run_trials", side_effect=lambda runs: real_run_trials(runs, process_factory=start)):
+                self.assertEqual(entry.run(args), 0)
+            self.assertEqual(peak, 6)
+            self.assertEqual(launched, Counter({gpu: 8 for gpu in range(6)}))
+            self.assertFalse(active)
