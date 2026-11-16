@@ -1,6 +1,8 @@
 """Random image subsets keep native preset options and persist across resume."""
 
 from collections import Counter
+from contextlib import redirect_stderr
+import io
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,6 +15,17 @@ from test_mmad_binary import fixture
 
 
 class BenchmarkModeSamplingTests(unittest.TestCase):
+    def test_mmad_requires_rates_for_new_runs_and_restores_them_on_resume(self):
+        options = ["mmadmode", "--output-dir", "output/mmad_test"]
+        with redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit) as exit_info:
+            mode.parse_args(options)
+        self.assertEqual(exit_info.exception.code, 2)
+        self.assertIn("--prune-rates is required", error.getvalue())
+        args = mode.parse_args([*options, "--prune-rates", "50", "90"])
+        self.assertEqual(mm.parser().parse_args(mode.command_for(args)[2:]).prune_rates, [50, 90])
+        resume = mode.parse_args([*options, "--resume"])
+        self.assertEqual(mode.command_for(resume)[2:], ["--resume", "--output-dir", str(resume.output_dir)])
+
     def test_mvtec_freezes_100_distinct_images_for_the_sweep(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -61,7 +74,7 @@ class BenchmarkModeSamplingTests(unittest.TestCase):
             model = Path(paths.model_path)
             mm.common.save_json(model / "config.json", dict(num_hidden_layers=28, image_grid_pinpoints=[[1152, 1152]]))
             output = paths.output_dir.resolve()
-            preset = mode.parse_args(["mmadmode", "--samples", "5", "--sample-seed", "8", "--output-dir", str(output),
+            preset = mode.parse_args(["mmadmode", "--prune-rates", "90", "--samples", "5", "--sample-seed", "8", "--output-dir", str(output),
                 "--data-root", paths.data_root, "--model-path", paths.model_path, "--checkpoint", paths.checkpoint,
                 "--mvtec-root", str(Path(paths.data_root) / "MVTec-AD")])
             args = mm.parser().parse_args(mode.command_for(preset)[2:])
@@ -73,7 +86,7 @@ class BenchmarkModeSamplingTests(unittest.TestCase):
             self.assertNotIn("VisA", info["source_counts"])
             _, spec = mm.setup(args)
             self.assertEqual(spec["sample_count"], 5)
-            self.assertEqual([j["prune_rate"] for j in spec["jobs"]], [0, 50])
+            self.assertEqual([j["prune_rate"] for j in spec["jobs"]], [0, 90])
             self.assertEqual(len(list((output / "prepared_images").glob("*.png"))), 5)
             frozen, _ = mm.common.read_prefix(spec["input_json"])
             self.assertEqual([r["question_id"] for r in frozen], [r["question_id"] for r in a])
