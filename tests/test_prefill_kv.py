@@ -16,13 +16,81 @@ from llava.model.multimodal_encoder.siglip_encoder import SigLipAttention, SigLi
 import benchmark_prefill_kv as entry
 from llava_pruning.prefill_kv import KV_MIB, observe_post_prefill_kv
 from llava_pruning.sparsevlm import SparseVLMMethod
-from llava_pruning.visa_comparison_methods import observe_prefill
+from llava_pruning.visa_comparison_methods import observed_budget, observe_prefill
 from test_attention_predictor import make_checkpoint
+from test_fastv_attention import tiny_config
 from test_mmad_binary import fixture
 from test_pool_ablations import model_and_options
+from test_pool_spatial import _Tower
 
 
 class PrefillKVTests(unittest.TestCase):
+    @torch.inference_mode()
+    def test_next_32_block_fixed_grid_and_high_rate_hybrid(self):
+        from llava_pruning.next_interleave import INPUT_SIZE, NATIVE_PINPOINTS
+
+        def config(implementation):
+            result = tiny_config(implementation)
+            result.num_key_value_heads = result.num_attention_heads
+            result.max_position_embeddings = 32768
+            return result
+
+        with TemporaryDirectory() as tmp, patch("test_pool_ablations.tiny_config", side_effect=config):
+            folder = Path(tmp)
+            trials = [("mvtecmode", "llava_unpruned", 0)]
+            trials.extend(("mvtecmode", name, 50)
+                          for name in ("fastv", "visionzip", "anchorprune", "clse", "priortr", "sparsevlm"))
+            trials.extend((("mvtecmode", "pyramiddrop", 70),
+                           ("mvtecmode", "hybrid_baseline", 90),
+                           ("mmadmode", "hybrid_baseline", 90)))
+            for mode, name, rate in trials:
+                with self.subTest(mode=mode, method=name):
+                    model, options = model_and_options(32)
+                    core = model.get_model()
+                    core.config.image_grid_pinpoints = sorted(NATIVE_PINPOINTS)
+                    core.vision_tower = _Tower()
+                    core.vision_tower.features = core.vision_tower.features[:5]
+                    if name == "anchorprune":
+                        core.vision_tower.blocks[-1].self_attn = SigLipAttention(
+                            SigLipVisionConfig(hidden_size=8, num_attention_heads=2))
+                    options.update(images=[torch.zeros(5, 3, 384, 384)], image_sizes=[INPUT_SIZE])
+                    checkpoint = folder / "best.pt"
+                    if name == "hybrid_baseline":
+                        make_checkpoint(checkpoint, core)
+                    job = next(job for job in entry.schedule(mode, [1], next_model=True)
+                               if job["method"] == name and job["prune_rate"] == rate)
+                    student = {"path": str(checkpoint)}
+                    if name == "sparsevlm":
+                        method = SparseVLMMethod(core, .7, job["after_blocks"])
+                    else:
+                        with patch.object(entry, "student_identity", return_value=student):
+                            method = entry.build_method(SimpleNamespace(model=model), [],
+                                                        dict(mode=mode, checkpoint=student), job, folder)
+                    method.configure(core, rate, capture_visualization=False, capture_attention=False)
+                    if hasattr(method, "prepare_inputs"):
+                        method.prepare_inputs(INPUT_SIZE, options["inputs"])
+                    if name == "anchorprune":
+                        method.query_ids = torch.tensor([[1, 2]])
+                    outer = method.generation_context(model) if hasattr(method, "generation_context") else nullcontext()
+                    inner = method.inference_context(model) if hasattr(method, "inference_context") else nullcontext()
+                    with outer, inner, observe_prefill(core) as lengths, observe_post_prefill_kv(core) as size:
+                        model.generate(**options)
+                    budget = observed_budget(name, rate, method.stats(core, rate), lengths, 3699, 32)
+                    self.assertGreater(size[0], 0)
+                    if name == "llava_unpruned":
+                        self.assertEqual(lengths[0], options["inputs"].shape[-1] - 1 + 3699)
+                        self.assertEqual(budget["physical_average_prune_rate"], 0)
+                    elif name == "pyramiddrop":
+                        self.assertEqual(tuple(core.pyramiddrop_layers), (8, 16, 24))
+                        self.assertAlmostEqual(budget["actual_average_prune_rate"], 70, delta=.05)
+                    elif name == "hybrid_baseline":
+                        self.assertAlmostEqual(budget["two_stage_average_prune_rate"], 90, delta=.05)
+                        self.assertEqual(budget["final_layer_visual_tokens"], 0)
+                    elif name == "sparsevlm":
+                        self.assertGreater(budget["actual_average_prune_rate"], 0)
+                    else:
+                        self.assertAlmostEqual(budget["actual_average_prune_rate"], 50, delta=.05)
+
     def test_full_data_setup_freezes_mmad_stretch_and_mvtec_native_size(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()

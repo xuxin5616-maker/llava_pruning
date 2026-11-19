@@ -38,6 +38,14 @@ def parser():
     devices.add_argument("--gpu", type=int, help="Physical GPU. Defaults to 2 for MVTec and 3 for MMAD.")
     devices.add_argument("--gpus", type=int, nargs="+", help="Physical GPUs, one trial per GPU. In both mode, split the list in half.")
     p.add_argument("--model-path", type=Path, default=Path("/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov"))
+    p.add_argument("--next-interleave", action="store_true",
+                   help="Use NeXT-Interleave Qwen 7B with 1152px stretch and native 1+4 input")
+    p.add_argument("--vision-tower-path", type=Path, help="Local SigLIP weights for --next-interleave")
+    student = p.add_mutually_exclusive_group()
+    student.add_argument("--without-student", action="store_true",
+                         help="For NeXT, run the independent methods and defer the hybrid")
+    student.add_argument("--attach-student", action="store_true",
+                         help="With NeXT --resume, add the trained checkpoint and run unfinished trials")
     p.add_argument("--checkpoint", type=Path, default=PROJECT / "output/attention_predictor_twig_train_01/best.pt")
     p.add_argument("--data-root", type=Path)
     p.add_argument("--mmad-data-root", type=Path, help="Override the MMAD root in both mode")
@@ -50,7 +58,7 @@ def parser():
     return p
 
 
-def schedule(mode, gpus):
+def schedule(mode, gpus, *, next_model=False):
     is_mmad = mode == "mmadmode"
     if is_mmad:
         jobs = mm.schedule(RATES, [gpus[0]], base_guided_tail=8, joint_self_tails=(8,))
@@ -75,6 +83,16 @@ def schedule(mode, gpus):
         jobs.append(dict(job_id=f"sparsevlm_{rate:02d}", method="sparsevlm", prune_rate=rate,
                          after_blocks=blocks, status="pending", reason="",
                          config=f"{prefix}method=sparsevlm;prune={rate}%;rate=layer_average;layers={stages}{suffix}"))
+    if next_model:
+        from llava_pruning.next_interleave import MODEL_NAME, PYRAMID_BLOCKS
+        stages = "/".join(map(str, PYRAMID_BLOCKS))
+        for job in jobs:
+            config = job["config"].removesuffix(suffix) if suffix else job["config"]
+            if job["method"] == "pyramiddrop":
+                config = config.replace("layers=7/14/21", f"layers={stages}")
+                if job["status"] == "unreachable":
+                    job["reason"] = "Unreachable: first 8/32 layers keep all tokens, so average pruning must be below 75%."
+            job["config"] = f"{config};model={MODEL_NAME};resize=stretch;canvas=1152;grid=2x2"
     for index, job in enumerate(job for job in jobs if job["status"] == "pending"):
         job["gpu"] = gpus[index % len(gpus)]
         job["config"] += f";gpu={job['gpu']}"
@@ -94,17 +112,34 @@ def setup(args, output):
     model = args.model_path.expanduser().resolve()
     config_path = model / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    if config.get("num_hidden_layers") != 28:
+    next_model = args.next_interleave
+    if next_model:
+        from llava_pruning import next_interleave
+
+        next_interleave.validate_config(config)
+        vision_path = next_interleave.vision_tower_path(model, args.vision_tower_path)
+    elif config.get("num_hidden_layers") != 28:
         raise ValueError("Use the existing 28-block OneVision checkpoint for the matched schedules")
-    checkpoint = student_identity(args.checkpoint, "visa")
+    elif args.vision_tower_path is not None:
+        raise ValueError("--vision-tower-path requires --next-interleave")
+    checkpoint = {"path": None} if args.without_student else student_identity(args.checkpoint, "visa")
+    if next_model and checkpoint["path"] is not None:
+        next_interleave.verify_student(checkpoint, model, vision_path)
     if is_mmad:
         rows, info = mm.load_binary(root, args.annotations, args.image_root, 42,
                                     exclude_sources=mm.EXCLUDED_SOURCES, mvtec_root=args.mvtec_root)
-        mm.prepare_stretched_images(rows, output, config)
+        if not next_model:
+            mm.prepare_stretched_images(rows, output, config)
         mm.describe(info)
     else:
         args.data_root, args.seed, args.prompt_version = root, 42, "v0"
         rows, info = freeze(args), {}
+    if next_model:
+        for row in rows:
+            path = Path(row["resolved_image"])
+            stat = path.stat()
+            row.update(image_size=list(next_interleave.INPUT_SIZE),
+                       image_bytes=stat.st_size, image_mtime_ns=stat.st_mtime_ns)
     if any(row["gt"] not in (0, 1) for row in rows):
         raise ValueError("The comparison requires a binary label for each sample")
     output.mkdir(parents=True, exist_ok=True)
@@ -112,7 +147,8 @@ def setup(args, output):
     frozen.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
     spec = dict(mode=args.mode, gpus=gpus, model_path=str(model), checkpoint=checkpoint, data_root=str(root),
                 model_config_sha256=common.digest(config_path), input_json=str(frozen), input_sha256=common.digest(frozen),
-                sample_count=len(rows), dataset_info=info, source_identity=source_identity(), jobs=schedule(args.mode, gpus),
+                sample_count=len(rows), dataset_info=info, source_identity=source_identity(),
+                jobs=schedule(args.mode, gpus, next_model=next_model),
                 seed=42, warmup=10, calibration_samples=12,
                 definitions=dict(common.DEFINITIONS, post_prefill_kv=(
                     "Mean over measured samples of sum of actual decoder K/V elements times element size, divided by 2^20. "
@@ -120,6 +156,9 @@ def setup(args, output):
                     "Includes text and visual K/V, excludes allocator overhead, weights and temporary tensors."),
                     rate="Target LLM layer-average visual pruning. Hybrid tails are extra. FastV measures effective visibility.",
                     relative_accuracy="100 * ACC / the same dataset's measured unpruned ACC."))
+    if next_model:
+        spec.update(next_interleave=True, vision_tower_path=vision_path,
+                    image_resize=list(next_interleave.INPUT_SIZE), native_anyres_grid=list(next_interleave.VISUAL_GRID))
     common.save_json(output / "run.json", spec)
     return spec
 
@@ -148,7 +187,7 @@ def load_run(output, mode):
         spec["jobs"] = expected
     elif saved != current:
         raise ValueError("An inference dependency changed; resume with the original source")
-    if spec["mode"] != mode or spec["jobs"] != schedule(mode, spec["gpus"]):
+    if spec["mode"] != mode or spec["jobs"] != schedule(mode, spec["gpus"], next_model=spec.get("next_interleave", False)):
         raise ValueError("Saved benchmark mode or trial configuration differs")
     for path, digest in ((spec["input_json"], spec["input_sha256"]),
                          (Path(spec["model_path"]) / "config.json", spec["model_config_sha256"])):
@@ -268,6 +307,8 @@ def worker(spec, job, output):
     try:
         if os.environ.get("CUDA_VISIBLE_DEVICES") != str(job["gpu"]):
             raise ValueError("Expose only the worker's assigned GPU")
+        if awaiting_student(spec, job):
+            raise ValueError("Attach the completed NeXT VisA checkpoint before running a hybrid trial")
         import torch
         from llava_pruning.backend import LlavaBackend
         if spec["mode"] == "mmadmode":
@@ -281,7 +322,12 @@ def worker(spec, job, output):
         if len(samples) != spec["sample_count"]:
             raise ValueError("Frozen sample count changed")
         torch.manual_seed(spec["seed"])
-        backend = LlavaBackend(spec["model_path"], "anyres_max_9", image_token_order="base_first")
+        if spec.get("next_interleave"):
+            from llava_pruning.next_interleave import make_backend
+
+            backend = make_backend(spec["model_path"], spec["vision_tower_path"])
+        else:
+            backend = LlavaBackend(spec["model_path"], "anyres_max_9", image_token_order="base_first")
         common.validate_single_gpu(backend.model, torch)
         device = torch.cuda.get_device_properties(0)
         common.verify_runtime(output, backend.inference_config, device.name, device.total_memory)
@@ -293,6 +339,12 @@ def worker(spec, job, output):
     finally:
         common.save_json(output / "metrics.json", report)
     return int(report["status"] != "success")
+
+
+def awaiting_student(spec, job):
+    return (spec.get("next_interleave", False)
+            and job["method"] == "hybrid_baseline"
+            and spec["checkpoint"]["path"] is None)
 
 
 def write_reports(output, spec):
@@ -312,6 +364,8 @@ def write_reports(output, spec):
         config = job["config"]
         result = results[job["job_id"]]
         status, reason = result.get("status", job["status"]), result.get("error", job["reason"])
+        if not result and awaiting_student(spec, job):
+            status, reason = "waiting_for_student", "Attach the NeXT VisA checkpoint after distillation."
         complete = result.get("complete") and status == "success"
         row = mm.metric_row(result, config, baseline.get("accuracy")) if complete else dict(config=config)
         if complete:
@@ -340,7 +394,8 @@ def run_trials(runs, *, process_factory=subprocess.Popen, poll_interval=.25):
         results = write_reports(output, spec)
         for job in spec["jobs"]:
             old = results[job["job_id"]]
-            if job["status"] == "pending" and not (old.get("complete") and old.get("status") == "success"):
+            if (job["status"] == "pending" and not awaiting_student(spec, job)
+                    and not (old.get("complete") and old.get("status") == "success")):
                 queues[job["gpu"]].append((output, spec, job))
     active, failures = {}, []
     try:
@@ -402,14 +457,18 @@ def run(args):
         spec = load_run(output, args.mode)
         job = next(item for item in spec["jobs"] if item["job_id"] == args.worker and item["status"] == "pending")
         return worker(spec, job, output / job["job_id"])
+    if (args.without_student or args.attach_student) and not args.next_interleave:
+        raise ValueError("Staged student attachment requires --next-interleave")
+    if args.attach_student and not args.resume:
+        raise ValueError("--attach-student requires --resume")
     gpus = args.gpus or ([args.gpu] if args.gpu is not None else [])
     if len(set(gpus)) != len(gpus) or any(gpu < 0 for gpu in gpus):
         raise ValueError("GPU IDs must be distinct and nonnegative")
     if args.mode == "both":
-        if not args.resume and len(gpus) < 2:
+        if not args.resume and len(gpus) < (1 if args.next_interleave else 2):
             raise ValueError("Both datasets require at least two --gpus")
         split = len(gpus) // 2
-        requests = [("mvtecmode", gpus[:split], output / "mvtecmode", args.data_root),
+        requests = [("mvtecmode", gpus[:split] or gpus, output / "mvtecmode", args.data_root),
                     ("mmadmode", gpus[split:], output / "mmadmode", args.mmad_data_root)]
     else:
         requests = [(args.mode, gpus, output, args.data_root)]
@@ -417,10 +476,26 @@ def run(args):
     for mode, devices, folder, data_root in requests:
         child = argparse.Namespace(**vars(args))
         child.mode, child.gpu, child.gpus, child.data_root = mode, None, devices, data_root
-        spec = load_run(folder, mode) if args.resume else setup(child, folder)
+        resuming = args.resume and ((folder / "run.json").is_file() or not args.without_student)
+        spec = load_run(folder, mode) if resuming else setup(child, folder)
         if args.resume and devices and devices != spec["gpus"]:
             raise ValueError("Resume uses the originally assigned GPUs")
         runs.append((folder, spec))
+    if args.without_student and any(spec["checkpoint"]["path"] is not None for _, spec in runs):
+        raise ValueError("Use --attach-student or the usual --resume after a student has been attached")
+    if args.attach_student:
+        from llava_pruning.next_interleave import verify_student
+
+        checkpoint = student_identity(args.checkpoint, "visa")
+        for folder, spec in runs:
+            if not spec.get("next_interleave"):
+                raise ValueError("Student attachment requires a frozen NeXT experiment")
+            if spec["checkpoint"]["path"] is not None and spec["checkpoint"] != checkpoint:
+                raise ValueError(f"A different student is already attached to {folder}")
+            verify_student(checkpoint, spec["model_path"], spec["vision_tower_path"])
+        for folder, spec in runs:
+            spec["checkpoint"] = checkpoint
+            common.save_json(folder / "run.json", spec)
     return run_trials(runs)
 
 

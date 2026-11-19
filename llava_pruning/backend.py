@@ -1,4 +1,4 @@
-"""Fixed LLaVA OneVision/Qwen2 backend; no model-family selection in the CLI."""
+"""LLaVA Qwen inference with the project's pruning implementations."""
 
 from __future__ import annotations
 
@@ -17,6 +17,14 @@ from .roi import choose_roi, load_mask
 
 
 VENDOR = Path(__file__).resolve().parents[1] / "vendor" / "llava"
+
+
+def open_image(path, resize=None):
+    with Image.open(path) as opened:
+        image = opened.convert("RGB")
+    if resize is not None and image.size != resize:
+        image = image.resize(resize, Image.Resampling.BICUBIC)
+    return image
 
 
 def validate_image_token_order(order, roi_mode, merge_type=None):
@@ -102,7 +110,8 @@ def _generate_with_timing(model, generation_options, *, include_pruning_time=Tru
 
 class LlavaBackend:
     def __init__(self, model_path: str | Path, roi_mode: str = "randomroi",
-                 image_token_order: str = "base_first"):
+                 image_token_order: str = "base_first", *, vision_tower_path=None,
+                 image_resize=None, model_dtype=None):
         validate_image_token_order(image_token_order, roi_mode)
         # Delay heavy imports so JSON/configuration checks run without a GPU stack.
         if str(VENDOR) not in sys.path:
@@ -121,13 +130,17 @@ class LlavaBackend:
         if not path.is_dir():
             raise NotADirectoryError(f"Model checkpoint not found: {path}")
         config = LlavaQwenConfig.from_pretrained(path)
+        if vision_tower_path is not None:
+            config.mm_vision_tower = str(vision_tower_path)
+        self.image_resize = image_resize
         configure_image_mode(config, roi_mode, image_token_order)
         # Like reference LLaVA's --overwrite_image_aspect_ratio, anyres leaves the
         # checkpoint's merge type intact (normally spatial_unpad).
         self.tokenizer = AutoTokenizer.from_pretrained(path)
         self.model = LlavaQwenForCausalLM.from_pretrained(
             path, config=config, low_cpu_mem_usage=True,
-            attn_implementation="flash_attention_2", torch_dtype=torch.float16,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.float16 if model_dtype is None else model_dtype,
             device_map="auto",
         )
         if getattr(config, "mm_use_im_patch_token", True):
@@ -173,6 +186,10 @@ class LlavaBackend:
             "transformers": version("transformers"),
             "flash_attn": version("flash-attn"),
         })
+        if image_resize is not None:
+            self.inference_config.update(image_resize=list(image_resize),
+                                         image_resize_method="bicubic_stretch",
+                                         vision_tower=config.mm_vision_tower)
         print(
             f"Inference config: dtype={self.model.dtype}, "
             f"vision_dtype={self.vision_tower.dtype}, "
@@ -214,8 +231,7 @@ class LlavaBackend:
         torch.manual_seed(random_seed)
         torch.cuda.manual_seed_all(random_seed)
 
-        with Image.open(sample.image) as opened:
-            image = opened.convert("RGB")
+        image = open_image(sample.image, getattr(self, "image_resize", None))
         roi_source, mask_path, bbox = choose_roi(sample, roi_mode)
         mask = None
         if mask_path is not None:

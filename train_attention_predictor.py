@@ -20,6 +20,9 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Distill side attention from frozen LLaVA hidden states")
     parser.add_argument("--dataset", choices=("visa","mvtec"), default="visa")
     parser.add_argument("--model-path", default="/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov/")
+    parser.add_argument("--next-interleave", action="store_true",
+                        help="Use NeXT-Interleave Qwen 7B with 1152px stretch and native 1+4 input")
+    parser.add_argument("--vision-tower-path", type=Path, help="Local SigLIP weights for --next-interleave")
     parser.add_argument("--data-root", default="/home/yz/xxy/data/datasets/VisA")
     parser.add_argument("--visa-split-csv", default=None, help="FULL CSV, not test-only list; defaults to data-root/split_csv/1cls.csv")
     parser.add_argument("--output-dir", type=Path, default=Path("output/attention_predictor_copied_train_01"))
@@ -40,7 +43,7 @@ def build_parser():
     parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false",
                         help="Disable training recomputation of the full copied blocks (uses more VRAM)")
     parser.add_argument("--student-precision", choices=("bfloat16", "float32"), default="bfloat16",
-                        help="Affects ONLY student autocast; copied FlashAttention2 blocks require bfloat16. Backbone stays FP16")
+                        help="Affects only student autocast; copied FlashAttention2 blocks require bfloat16")
     parser.add_argument("--teacher-layer", type=int, default=22, help="1-based teacher attention block; default22")
     parser.add_argument("--student-layer", type=int, default=2,
                         help="Take the output of this completed backbone block")
@@ -99,7 +102,14 @@ def main(argv=None, *, defaults=None, reference=None):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    backend = LlavaBackend(args.model_path, roi_mode="anyres_max_9", image_token_order="base_first")
+    if args.next_interleave:
+        from llava_pruning import next_interleave
+        vision_path = next_interleave.vision_tower_path(args.model_path, args.vision_tower_path)
+        backend = next_interleave.make_backend(args.model_path, vision_path)
+    else:
+        if args.vision_tower_path is not None:
+            raise ValueError("--vision-tower-path requires --next-interleave")
+        backend = LlavaBackend(args.model_path, roi_mode="anyres_max_9", image_token_order="base_first")
     backend.model.requires_grad_(False).eval()
     validate_single_gpu(backend.model, torch)
     core = backend.model.get_model()
@@ -109,7 +119,7 @@ def main(argv=None, *, defaults=None, reference=None):
     device = core.embed_tokens.weight.device
     from llava.model.language_model.attention_predictor import CopiedAttentionPredictor, student_autocast
     if core.config._attn_implementation == "flash_attention_2" and args.student_precision != "bfloat16":
-        raise ValueError("Copied FlashAttention2 blocks need --student-precision bfloat16; main model stays FP16")
+        raise ValueError("Copied FlashAttention2 blocks need --student-precision bfloat16")
     with student_autocast(device, args.student_precision):
         pass
     student = CopiedAttentionPredictor.from_backbone(core, gradient_checkpointing=args.gradient_checkpointing,

@@ -11,7 +11,7 @@ import tempfile
 import torch
 from torch.nn import functional as F
 
-from .backend import VENDOR
+from .backend import VENDOR, open_image
 from .prompts import GENERIC_PROMPT_V0
 
 
@@ -85,13 +85,11 @@ def extract_teacher(core, packed, span, layout, *, teacher_layer=22, student_lay
 
 @torch.no_grad()
 def prepare_teacher_example(backend, sample, teacher_layer=22, *, student_layer=2):
-    from PIL import Image
     from llava.constants import (DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_TOKEN_INDEX)
     from llava.mm_utils import process_images, tokenizer_image_token
     core = backend.model.get_model()
     core.configure_clse(enabled=False, keep_ratio=1.)
-    with Image.open(sample.image) as opened:
-        image = opened.convert("RGB")
+    image = open_image(sample.image, getattr(backend, "image_resize", None))
     pixels, _ = process_images([image], backend.processor, backend.model.config, return_pro_data=True)
     if isinstance(pixels, list):
         pixels = [item.to(backend.model.device, dtype=backend.model.dtype) for item in pixels]

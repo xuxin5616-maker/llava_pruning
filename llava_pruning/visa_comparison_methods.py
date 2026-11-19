@@ -205,7 +205,8 @@ def make_method(name, core, rate, checkpoint):
     if name=="pyramiddrop":
         from runPyramidDrop import build_parser,resolve_plan,PyramidDropMethod,check_source
         check_source()
-        args = build_parser().parse_args(["--average-prune-rates",str(rate),"--layers","7","14","21"])
+        # The method's default is three boundaries at model-depth quarters.
+        args = build_parser().parse_args(["--average-prune-rates", str(rate)])
         return PyramidDropMethod(resolve_plan(args,depth)[0])
     if name=="hybrid_baseline":
         from .pool_distill import PoolDistillMethod
