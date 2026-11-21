@@ -4,6 +4,7 @@ from collections import Counter
 from contextlib import nullcontext
 import csv
 from pathlib import Path
+from statistics import pstdev
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -25,6 +26,78 @@ from test_pool_spatial import _Tower
 
 
 class PrefillKVTests(unittest.TestCase):
+    def test_tau_sweep_changes_only_crop_quota_distribution(self):
+        for mode in ("mvtecmode", "mmadmode"):
+            model, _ = model_and_options(28)
+            core = model.get_model()
+            core.config.image_grid_pinpoints = [[1152, 1152]]
+            size = (1152, 1152)
+            scores = torch.linspace(.9, 1.2, 9).numpy()
+            spec = dict(mode=mode, checkpoint={"path": "best.pt"})
+            jobs = entry.schedule(mode, [0, 1], tau_sweep=True)
+            controls = entry.schedule(mode, [0, 1])
+            self.assertEqual(len(jobs), 15)
+            for rate in entry.RATES:
+                group = [job for job in jobs if job["prune_rate"] == rate]
+                original = next(job for job in controls if job["method"] == "hybrid_baseline" and job["prune_rate"] == rate)
+                self.assertEqual(tuple(job["tau"] for job in group), entry.TAU_VALUES)
+                values = []
+                for job in (original, *group):
+                    with self.subTest(mode=mode, rate=rate, tau=job.get("tau")), \
+                            patch.object(entry, "student_identity", return_value=spec["checkpoint"]):
+                        method = entry.build_method(SimpleNamespace(model=model), [], spec, job, Path("."))
+                        adapter = method.adapter
+                        adapter.set_image_context(size)
+                        allocation, _, dominant, contextual = adapter.allocate_view_budgets(
+                            scores, adapter.prepared, dict(spatial_prior=None))
+                        quotas = [crop["keep"] for crop in allocation["crops"]]
+                        self.assertGreaterEqual(min(quotas), 4)
+                        self.assertEqual(adapter.settings.allocation_temperature, job.get("tau", .05))
+                        values.append((dominant + contextual, sum(quotas), adapter.plan["final_llm_tokens"], quotas))
+                self.assertEqual(len({value[:3] for value in values}), 1)
+                self.assertEqual(values[0], values[3])  # tau=.05
+                self.assertGreater(pstdev(values[1][3]), pstdev(values[-1][3]))
+
+    def test_all_ablations_share_dataset_manifests_and_keep_separate_tables(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            paths = fixture(root)
+            model = Path(paths.model_path)
+            entry.common.save_json(model / "config.json", dict(num_hidden_layers=28, image_grid_pinpoints=[[1152, 1152]]))
+            mvtec = root / "input.jsonl"
+            Image.new("RGB", (128, 384)).save(root / "01.png")
+            mvtec.write_text('{"question_id":"1","image":"01.png","category":"bottle","gt":0}\n', encoding="utf-8")
+            output = root / "all"
+            command = ["both", "--all-ablations", "--gpus", *map(str, range(6)), "--output-dir", str(output),
+                       "--model-path", str(model), "--checkpoint", paths.checkpoint, "--data-root", str(root),
+                       "--mmad-data-root", paths.data_root, "--input-json", str(mvtec),
+                       "--mvtec-root", str(Path(paths.data_root) / "MVTec-AD")]
+
+            def inspect(runs):
+                self.assertEqual(len(runs), 2)
+                for folder, spec in runs:
+                    self.assertEqual(spec["gpus"], list(range(6)))
+                    self.assertEqual({job["gpu"] for job in spec["jobs"]}, set(range(6)))
+                    self.assertEqual(len({job["job_id"] for job in spec["jobs"]}), 81)
+                    entry.write_reports(folder, spec)
+                    for index, count, key in ((1, 21, "raba_strategy"), (2, 9, "adtp_score"),
+                                              (3, 21, "distill_share"), (4, 15, "kmin"), (5, 15, "tau")):
+                        task = f"task{index}"
+                        with (folder / task / "summary.csv").open(encoding="utf-8-sig") as stream:
+                            rows = list(csv.DictReader(stream))
+                        self.assertEqual(len(rows), count)
+                        self.assertTrue(all(row[key] for row in rows))
+                        for rate in entry.RATES:
+                            self.assertEqual(len({job["gpu"] for job in spec["jobs"]
+                                                  if job["task"] == task and job["prune_rate"] == rate}), 1)
+                    self.assertTrue((folder / "task1" / "raba_summary.csv").is_file())
+                return 0
+
+            with patch.object(entry, "run_trials", side_effect=inspect):
+                self.assertEqual(entry.run(entry.parser().parse_args(command)), 0)
+                self.assertEqual(entry.run(entry.parser().parse_args([*command, "--resume"])), 0)
+            self.assertEqual(list(output.rglob("prepared_images")), [output / "mmadmode" / "prepared_images"])
+
     @torch.inference_mode()
     def test_kmin_sweep_respects_each_crop_floor_with_fixed_hybrid_budgets(self):
         threads = torch.get_num_threads()

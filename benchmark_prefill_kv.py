@@ -3,10 +3,11 @@
 import argparse
 from collections import defaultdict, deque
 from contextlib import nullcontext
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
-from statistics import mean
+from statistics import mean, pstdev
 import subprocess
 import sys
 import time
@@ -34,6 +35,9 @@ LAMBDA_SHARES = (0., .1, .3, .5, .7, .9, 1.)
 LAMBDA_BUDGET_FIELDS = ("actual_pre_contribution", "actual_distill_contribution", "stage2_llm_visual_tokens")
 KMIN_VALUES = (0, 2, 4, 8, 16)
 KMIN_BUDGET_FIELDS = ("observed_min_crop_keep", "empty_crop_count", "crop_count")
+TAU_VALUES = (.01, .02, .05, .10, .20)
+TASK_FLAGS = ("raba_ablation", "adtp_ablation", "lambda_sweep", "kmin_sweep", "tau_sweep")
+ABLATION_FLAGS = (*TASK_FLAGS, "all_ablations")
 
 
 def parser():
@@ -68,6 +72,10 @@ def parser():
                           help="Run hybrid lambda 0/0.1/0.3/0.5/0.7/0.9/1 at 50/70/90 percent")
     ablation.add_argument("--kmin-sweep", action="store_true",
                           help="Sweep the LLM-before AnyRes crop minimum (0/2/4/8/16) at 50/70/90 percent")
+    ablation.add_argument("--tau-sweep", action="store_true",
+                          help="Sweep the RABA allocation temperature (0.01/0.02/0.05/0.10/0.20)")
+    ablation.add_argument("--all-ablations", action="store_true",
+                          help="Run Tasks 1–5 with a shared frozen evaluation list for each dataset")
     p.add_argument("--resume", action="store_true", help="Resume with the saved samples, methods and GPU")
     p.add_argument("--worker", help=argparse.SUPPRESS)
     return p
@@ -98,17 +106,36 @@ def lambda_jobs(jobs, gpus):
             yield dict(job, job_id=f"{job['job_id']}_lambda{share:g}", config=config, gpu=gpu, distill_share=share)
 
 
-def kmin_jobs(jobs, gpus):
+def quota_sweep_jobs(jobs, gpus, name, values):
     hybrid_jobs = [job for job in jobs if job["method"] == "hybrid_baseline"]
     for index, job in enumerate(hybrid_jobs):
         gpu = gpus[index % len(gpus)]
-        for kmin in KMIN_VALUES:
-            config = f"{job['config']};kmin={kmin};gpu={gpu}"
-            yield dict(job, job_id=f"{job['job_id']}_kmin{kmin}", config=config, gpu=gpu, kmin=kmin)
+        for value in values:
+            config = f"{job['config']};{name}={value:g};gpu={gpu}"
+            yield dict(job, job_id=f"{job['job_id']}_{name}{value:g}", config=config, gpu=gpu, **{name: value})
+
+
+def all_ablation_jobs(mode, gpus, next_model):
+    # A task/rate group stays on one GPU for comparable latency. Both dataset
+    # manifests use the same GPU pool, with distinct first choices on ties.
+    offset = len(gpus) // 2 if mode == "mmadmode" else 0
+    devices = gpus[offset:] + gpus[:offset]
+    load = dict.fromkeys(devices, 0)
+    for index, flag in enumerate(TASK_FLAGS, start=1):
+        trials = schedule(mode, gpus, next_model=next_model, **{flag: True})
+        for rate in RATES:
+            group = [job for job in trials if job["prune_rate"] == rate]
+            gpu = min(devices, key=load.__getitem__)
+            load[gpu] += len(group)
+            for job in group:
+                config = job["config"].rsplit(";gpu=", 1)[0] + f";gpu={gpu}"
+                yield dict(job, task=f"task{index}", gpu=gpu, config=config)
 
 
 def schedule(mode, gpus, *, next_model=False, raba_ablation=False, adtp_ablation=False, lambda_sweep=False,
-             kmin_sweep=False):
+             kmin_sweep=False, tau_sweep=False, all_ablations=False):
+    if all_ablations:
+        return list(all_ablation_jobs(mode, gpus, next_model))
     is_mmad = mode == "mmadmode"
     if is_mmad:
         jobs = mm.schedule(RATES, [gpus[0]], base_guided_tail=8, joint_self_tails=(8,))
@@ -150,7 +177,9 @@ def schedule(mode, gpus, *, next_model=False, raba_ablation=False, adtp_ablation
     if lambda_sweep:
         return list(lambda_jobs(jobs, gpus))
     if kmin_sweep:
-        return list(kmin_jobs(jobs, gpus))
+        return list(quota_sweep_jobs(jobs, gpus, "kmin", KMIN_VALUES))
+    if tau_sweep:
+        return list(quota_sweep_jobs(jobs, gpus, "tau", TAU_VALUES))
     for index, job in enumerate(job for job in jobs if job["status"] == "pending"):
         job["gpu"] = gpus[index % len(gpus)]
         job["config"] += f";gpu={job['gpu']}"
@@ -192,7 +221,7 @@ def setup(args, output):
     else:
         args.data_root, args.seed, args.prompt_version = root, 42, "v0"
         rows, info = freeze(args), {}
-    if args.raba_ablation:
+    if args.raba_ablation or args.all_ablations:
         raba.freeze_masks(rows, args.mvtec_root)
     if next_model:
         for row in rows:
@@ -205,45 +234,44 @@ def setup(args, output):
     output.mkdir(parents=True, exist_ok=True)
     frozen = output / ("mmad_binary.jsonl" if is_mmad else "mvtec_frozen.jsonl")
     frozen.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+    ablations = {flag: True for flag in ABLATION_FLAGS if getattr(args, flag)}
     spec = dict(mode=args.mode, gpus=gpus, model_path=str(model), checkpoint=checkpoint, data_root=str(root),
                 model_config_sha256=common.digest(config_path), input_json=str(frozen), input_sha256=common.digest(frozen),
                 sample_count=len(rows), dataset_info=info, source_identity=source_identity(),
-                jobs=schedule(args.mode, gpus, next_model=next_model, raba_ablation=args.raba_ablation,
-                              adtp_ablation=args.adtp_ablation, lambda_sweep=args.lambda_sweep,
-                              kmin_sweep=args.kmin_sweep),
+                jobs=schedule(args.mode, gpus, next_model=next_model, **ablations),
                 seed=42, warmup=10, calibration_samples=12,
                 definitions=dict(common.DEFINITIONS, post_prefill_kv=(
                     "Mean over measured samples of sum of actual decoder K/V elements times element size, divided by 2^20. "
                     "Snapshot after the first decoder forward finishes pruning, before processing any generated token. "
                     "Includes text and visual K/V, excludes allocator overhead, weights and temporary tensors."),
                     rate="Target LLM layer-average visual pruning. Hybrid tails are extra. FastV measures effective visibility.",
-                    relative_accuracy="100 * ACC / the same dataset's measured unpruned ACC."))
-    if args.raba_ablation:
-        spec["raba_ablation"] = True
+                    relative_accuracy="100 * ACC / the same dataset's measured unpruned ACC."), **ablations)
+    if args.raba_ablation or args.all_ablations:
         spec["definitions"].update(
             defect_token_retention_pct="Mean of per-question retained independent AnyRes defect-overlapping patch fractions, "
                 "immediately after pre-LLM pruning. Native ground truth masks only; padding, missing or invalid masks, "
                 "merged-away anchors and structural newlines do not count.",
             crop_keep_rate_std_pct="Mean of the within-image population standard deviation of crop keep percentages.",
             shuffle_unchanged_pct="Percentage of images with the same integer quota vector after within-image shuffling.")
-    if args.adtp_ablation:
-        spec["adtp_ablation"] = True
+    if args.adtp_ablation or args.all_ablations:
         spec["definitions"].update(
             ttft_ms="Same as Lat. Synchronized resident inputs to first selected token, including online pruning work.",
             adtp_score="Native block 2 Q/K on the full compressed prompt; copied initial weights from the same backbone; "
                        "or distilled weights with the same copied branch structure. Selection policy and budget are fixed.")
-    if args.lambda_sweep:
-        spec["lambda_sweep"] = True
+    if args.lambda_sweep or args.all_ablations:
         spec["definitions"]["lambda"] = (
             "Target layer-average pruning contribution of ADTP divided by the requested two-stage rate. "
             "Lambda zero uses MyPool only before the tail. Lambda one uses native image packing and ADTP before the tail. "
             "The extra eight-layer tail is excluded from both stage contributions.")
-    if args.kmin_sweep:
-        spec["kmin_sweep"] = True
+    if args.kmin_sweep or args.all_ablations:
         spec["definitions"].update(
             kmin="Minimum pre-LLM spatial tokens allocated to each AnyRes crop. The Base and total AnyRes budgets stay fixed.",
             observed_min_crop_keep="Mean over samples of the smallest assigned AnyRes crop quota per sample.",
             empty_crop_count="Mean number of AnyRes crops per sample with zero spatial tokens after pre-LLM pruning.")
+    if args.tau_sweep or args.all_ablations:
+        spec["definitions"].update(
+            tau="Temperature in the softmax of negative RABA redundancy. Base, AnyRes and ADTP token totals stay fixed.",
+            crop_keep_rate_std_pct="Mean of the within-image population standard deviation of crop keep percentages.")
     if next_model:
         spec.update(next_interleave=True, vision_tower_path=vision_path,
                     image_resize=list(next_interleave.INPUT_SIZE), native_anyres_grid=list(next_interleave.VISUAL_GRID))
@@ -275,11 +303,9 @@ def load_run(output, mode):
         spec["jobs"] = expected
     elif saved != current:
         raise ValueError("An inference dependency changed; resume with the original source")
+    ablations = {flag: True for flag in ABLATION_FLAGS if spec.get(flag)}
     if spec["mode"] != mode or spec["jobs"] != schedule(mode, spec["gpus"], next_model=spec.get("next_interleave", False),
-                                                       raba_ablation=spec.get("raba_ablation", False),
-                                                       adtp_ablation=spec.get("adtp_ablation", False),
-                                                       lambda_sweep=spec.get("lambda_sweep", False),
-                                                       kmin_sweep=spec.get("kmin_sweep", False)):
+                                                       **ablations):
         raise ValueError("Saved benchmark mode or trial configuration differs")
     for path, digest in ((spec["input_json"], spec["input_sha256"]),
                          (Path(spec["model_path"]) / "config.json", spec["model_config_sha256"])):
@@ -318,6 +344,8 @@ def build_method(backend, samples, spec, job, output):
             method.stage2_score_source = job["adtp_score"]
         if "kmin" in job:
             method.adapter.minimum_crop_keep = job["kmin"]
+        if "tau" in job:
+            method.adapter.settings = replace(method.adapter.settings, allocation_temperature=job["tau"])
         return method
     if name != "sparsevlm":
         from llava_pruning.visa_comparison_methods import make_method
@@ -371,11 +399,14 @@ def evaluate(backend, method, samples, spec, job, output, total_memory):
             result = generate(backend, method, sample, rate, spec["seed"] + index, measured=True)
         original = sum(native_counts(core, sample.source["image_size"])[1])
         budget = observed_budget(job["method"], rate, result["stats"], lengths, original, len(core.layers))
-        if spec.get("lambda_sweep"):
+        if "distill_share" in job:
             budget.update({key: result["stats"][key] for key in LAMBDA_BUDGET_FIELDS})
-        if spec.get("kmin_sweep"):
+        if "kmin" in job:
             keeps = [crop["keep"] for crop in method.adapter.allocation["crops"]]
             budget.update(observed_min_crop_keep=min(keeps), empty_crop_count=keeps.count(0), crop_count=len(keeps))
+        if "tau" in job:
+            keeps = [crop["keep"] for crop in method.adapter.allocation["crops"]]
+            budget["crop_keep_rate_std_pct"] = pstdev(keeps) * 100 / method.adapter.geometry.token_side ** 2
         row = dict(question_id=sample.sample_id, gt=sample.gt, answer=result["answer"], budget=budget,
                    **{key: result[key] for key in common.TIMING})
         row[KV_BYTES] = kv[0]
@@ -473,6 +504,19 @@ def write_reports(output, spec):
         if result and (result["job_id"] != job["job_id"] or result["input_sha256"] != spec["input_sha256"]):
             raise ValueError("Mismatched saved comparison report")
         results[job["job_id"]] = result
+    if spec.get("all_ablations"):
+        for index, flag in enumerate(TASK_FLAGS, start=1):
+            task = f"task{index}"
+            folder = output / task
+            folder.mkdir(exist_ok=True)
+            jobs = [job for job in spec["jobs"] if job["task"] == task]
+            write_tables(folder, dict(spec, jobs=jobs, **{flag: True}), results)
+    else:
+        write_tables(output, spec, results)
+    return results
+
+
+def write_tables(output, spec, results):
     baseline = results.get("llava_unpruned_00", {})
     if not baseline.get("complete"):
         baseline = {}
@@ -483,6 +527,7 @@ def write_reports(output, spec):
         adtp = {key: job[key] for key in ("prune_rate", "adtp_score")} if spec.get("adtp_ablation") else {}
         share = {key: job[key] for key in ("prune_rate", "distill_share")} if spec.get("lambda_sweep") else {}
         kmin = {key: job[key] for key in ("prune_rate", "kmin")} if spec.get("kmin_sweep") else {}
+        tau = {key: job[key] for key in ("prune_rate", "tau")} if spec.get("tau_sweep") else {}
         result = results[job["job_id"]]
         status, reason = result.get("status", job["status"]), result.get("error", job["reason"])
         if not result and awaiting_student(spec, job):
@@ -491,7 +536,7 @@ def write_reports(output, spec):
         row = mm.metric_row(result, config, baseline.get("accuracy")) if complete else dict(config=config)
         if complete:
             row[KV_MIB] = result[KV_MIB]
-        rows.append(dict(row, **ablation, **adtp, **share, **kmin, ttft_ms=row.get("Lat"),
+        rows.append(dict(row, **ablation, **adtp, **share, **kmin, **tau, ttft_ms=row.get("Lat"),
                          **{field: result.get(field) for field in raba.FIELDS if ablation},
                          status=status, reason=reason))
         for source, questions in sorted(spec["dataset_info"].get("source_counts", {}).items()):
@@ -500,17 +545,18 @@ def write_reports(output, spec):
             row = mm.metric_row(value, config, reference) if value else dict(config=config)
             if value:
                 row.update(normal=value["normal"], abnormal=value["abnormal"], **{KV_MIB: value[KV_MIB]})
-            sources.append(dict(row, **ablation, **adtp, **share, **kmin, ttft_ms=row.get("Lat"),
+            sources.append(dict(row, **ablation, **adtp, **share, **kmin, **tau, ttft_ms=row.get("Lat"),
                                 **{field: (value or {}).get(field) for field in raba.FIELDS if ablation},
                                 source=source, questions=questions, status=status, reason=reason))
-        budgets.append(dict(result.get("budget", {}), **share, **kmin, config=config, status=status, reason=reason,
+        budgets.append(dict(result.get("budget", {}), **share, **kmin, **tau, config=config, status=status, reason=reason,
                             target_average_prune_rate=job["prune_rate"]))
     fields = FIELDS if spec["mode"] == "mmadmode" else tuple(key for key in FIELDS if key not in {"mmad_score", "nonbinary"})
     extra_fields = ("prune_rate", "raba_strategy", "raba_seed", *raba.FIELDS) if spec.get("raba_ablation") else ()
     adtp_fields = ("prune_rate", "adtp_score", "ttft_ms") if spec.get("adtp_ablation") else ()
     lambda_fields = ("prune_rate", "distill_share") if spec.get("lambda_sweep") else ()
     kmin_fields = ("prune_rate", "kmin") if spec.get("kmin_sweep") else ()
-    trial_fields = (*extra_fields, *adtp_fields, *lambda_fields, *kmin_fields)
+    tau_fields = ("prune_rate", "tau") if spec.get("tau_sweep") else ()
+    trial_fields = (*extra_fields, *adtp_fields, *lambda_fields, *kmin_fields, *tau_fields)
     common.save_csv(output / "summary.csv", rows, (*fields, *trial_fields))
     if sources:
         common.save_csv(output / "summary_by_source.csv", sources, (*SOURCE_FIELDS, *trial_fields))
@@ -519,8 +565,9 @@ def write_reports(output, spec):
     budget_fields = (*mm.BUDGET_FIELDS, *lambda_fields, *LAMBDA_BUDGET_FIELDS) if lambda_fields else mm.BUDGET_FIELDS
     if kmin_fields:
         budget_fields = (*budget_fields, *kmin_fields, *KMIN_BUDGET_FIELDS)
+    if tau_fields:
+        budget_fields = (*budget_fields, *tau_fields, "crop_keep_rate_std_pct")
     common.save_csv(output / "budget_summary.csv", budgets, budget_fields)
-    return results
 
 
 def run_trials(runs, *, process_factory=subprocess.Popen, poll_interval=.25):
@@ -579,8 +626,10 @@ def run_trials(runs, *, process_factory=subprocess.Popen, poll_interval=.25):
                 time.sleep(poll_interval)
     finally:
         stop_active(active)
-    for output, _ in runs:
-        print(f"Summary | {output / 'summary.csv'}", flush=True)
+    for output, spec in runs:
+        folders = [output / f"task{index}" for index in range(1, len(TASK_FLAGS) + 1)] if spec.get("all_ablations") else [output]
+        for folder in folders:
+            print(f"Summary | {folder / 'summary.csv'}", flush=True)
     if failures:
         print("Failed trials (see worker.log): " + ", ".join(failures), flush=True)
     return int(bool(failures))
@@ -596,14 +645,9 @@ def run(args):
         raise ValueError("Staged student attachment requires --next-interleave")
     if args.attach_student and not args.resume:
         raise ValueError("--attach-student requires --resume")
-    if args.raba_ablation and (args.without_student or args.attach_student):
-        raise ValueError("RABA requires a completed student checkpoint")
-    if args.adtp_ablation and (args.without_student or args.attach_student):
-        raise ValueError("ADTP requires a completed student checkpoint")
-    if args.lambda_sweep and (args.without_student or args.attach_student):
-        raise ValueError("The lambda sweep requires a completed student checkpoint")
-    if args.kmin_sweep and (args.without_student or args.attach_student):
-        raise ValueError("The kmin sweep requires a completed student checkpoint")
+    ablation = next((flag for flag in ABLATION_FLAGS if getattr(args, flag)), None)
+    if ablation and (args.without_student or args.attach_student):
+        raise ValueError("Hybrid ablations require a completed student checkpoint")
     gpus = args.gpus or ([args.gpu] if args.gpu is not None else [])
     if len(set(gpus)) != len(gpus) or any(gpu < 0 for gpu in gpus):
         raise ValueError("GPU IDs must be distinct and nonnegative")
@@ -611,24 +655,19 @@ def run(args):
         if not args.resume and len(gpus) < (1 if args.next_interleave else 2):
             raise ValueError("Both datasets require at least two --gpus")
         split = len(gpus) // 2
-        requests = [("mvtecmode", gpus[:split] or gpus, output / "mvtecmode", args.data_root),
-                    ("mmadmode", gpus[split:], output / "mmadmode", args.mmad_data_root)]
+        mvtec_gpus, mmad_gpus = (gpus, gpus) if args.all_ablations else (gpus[:split] or gpus, gpus[split:])
+        requests = [("mvtecmode", mvtec_gpus, output / "mvtecmode", args.data_root),
+                    ("mmadmode", mmad_gpus, output / "mmadmode", args.mmad_data_root)]
     else:
         requests = [(args.mode, gpus, output, args.data_root)]
     runs = []
     for mode, devices, folder, data_root in requests:
         child = argparse.Namespace(**vars(args))
         child.mode, child.gpu, child.gpus, child.data_root = mode, None, devices, data_root
-        resuming = args.resume and ((folder / "run.json").is_file() or not args.without_student)
+        resuming = args.resume and ((folder / "run.json").is_file() or not (args.without_student or args.all_ablations))
         spec = load_run(folder, mode) if resuming else setup(child, folder)
-        if args.raba_ablation and not spec.get("raba_ablation"):
-            raise ValueError("Use a new output directory for RABA ablation")
-        if args.adtp_ablation and not spec.get("adtp_ablation"):
-            raise ValueError("Use a new output directory for ADTP ablation")
-        if args.lambda_sweep and not spec.get("lambda_sweep"):
-            raise ValueError("Use a new output directory for the lambda sweep")
-        if args.kmin_sweep and not spec.get("kmin_sweep"):
-            raise ValueError("Use a new output directory for the kmin sweep")
+        if ablation and not spec.get(ablation):
+            raise ValueError("The requested ablation differs from the saved run; use a new output directory")
         if args.resume and devices and devices != spec["gpus"]:
             raise ValueError("Resume uses the originally assigned GPUs")
         runs.append((folder, spec))
