@@ -289,13 +289,15 @@ def student_autocast(device, precision):
     return torch.autocast("cuda", dtype=torch.bfloat16)
 
 
-def load_predictor(path, device, input_size, *, student_layer=2):
+def load_predictor(path, device, input_size, *, student_layer=2, initialize_from=None):
     # weights_only avoids executing arbitrary pickle objects; all payload fields
     # are tensors or primitive containers, including the training provenance.
     saved = torch.load(path, map_location="cpu", weights_only=True)
     if type(saved.get("student_layer")) is not int or saved["student_layer"] != student_layer:
         raise ValueError("Predictor checkpoint source-layer mismatch")
     if saved.get("version") == LEGACY_CHECKPOINT_VERSION:
+        if initialize_from is not None:
+            raise ValueError("The copied-initial control requires a copied Qwen2 predictor checkpoint")
         if student_layer != 2:
             raise ValueError("Legacy predictor checkpoints require student layer 2")
         config = PredictorConfig(**saved["architecture"])
@@ -304,12 +306,20 @@ def load_predictor(path, device, input_size, *, student_layer=2):
         config = CopiedPredictorConfig(**saved["architecture"])
         if config.source_layers[0] != student_layer + 1:
             raise ValueError("Copied source blocks do not match the checkpoint student layer")
-        model = CopiedAttentionPredictor(config)
+        if initialize_from is None:
+            model = CopiedAttentionPredictor(config)
+        else:
+            model = CopiedAttentionPredictor.from_backbone(
+                initialize_from, student_layer=student_layer, full_blocks=len(config.source_layers) - 1,
+                gradient_checkpointing=config.gradient_checkpointing)
+            if model.config != config:
+                raise ValueError("Initial predictor structure differs from the distilled checkpoint")
     else:
         raise ValueError("Unsupported attention predictor checkpoint version")
     if config.input_size != input_size:
         raise ValueError("Predictor backbone dimension mismatch")
-    model.load_state_dict(saved["state_dict"], strict=True)
+    if initialize_from is None:
+        model.load_state_dict(saved["state_dict"], strict=True)
     model.to(device=device).eval().requires_grad_(False)
     precision = saved.get("student_precision", "float32")
     if (isinstance(model, CopiedAttentionPredictor) and config.attention_implementation == "flash_attention_2"
@@ -351,7 +361,7 @@ class AttentionPredictorMixin:
 
     def configure_attention_predictor(self, *, enabled, keep_ratio, checkpoint=None,
                                       capture_attention=False, capture_visualization=False, selection_mode="base_full",
-                                      crop_temperature=0.05, crop_min_keep=0, student_layer=2):
+                                      crop_temperature=0.05, crop_min_keep=0, student_layer=2, initial_weights=False):
         # Old training method.json files explicitly used base_guided. Upgrade
         # that alias to the current policy; explicit old modes remain available.
         selection_mode = "base_full" if selection_mode == "base_guided" else selection_mode
@@ -376,10 +386,11 @@ class AttentionPredictorMixin:
             return
         from pathlib import Path
         path = Path(checkpoint).resolve()
-        identity = (str(path), path.stat().st_size, path.stat().st_mtime_ns, student_layer)
+        identity = (str(path), path.stat().st_size, path.stat().st_mtime_ns, student_layer, initial_weights)
         if identity != self._predictor_checkpoint:
             model, precision, saved = load_predictor(path, self.embed_tokens.weight.device, self.config.hidden_size,
-                                                     student_layer=student_layer)
+                                                     student_layer=student_layer,
+                                                     initialize_from=self if initial_weights else None)
             if saved.get("backbone_depth") != len(self.layers):
                 raise ValueError("Predictor was trained for a different backbone depth")
             if type(saved.get("teacher_layer")) is not int or not student_layer < saved["teacher_layer"] <= len(self.layers):

@@ -257,6 +257,9 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
             hidden, ids, indices = base_text_predictor_inputs(hidden, ids, start, start+len(self.records), self.base)
         with student_autocast(hidden.device, self.core._predictor_precision):
             scores = self.core.attention_predictor(hidden, ids, indices)
+        return self.map_ranking(scores)
+
+    def map_ranking(self, scores):
         if self.mode == "base_full":
             if self.base_mapping=="fast":
                 from .pool_mapping import mapped_scores_fast
@@ -305,9 +308,29 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         return selected, self.plan["final_llm_tokens"], len(self.protected)
 
 
+class NativeShallowRanking:
+    """Use the existing physical FastV score hook with the hybrid selection policy."""
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+        self.student_layer = adapter.student_layer
+
+    def reference(self, hidden, start, end):
+        return self.adapter.reference(hidden, start, end)
+
+    def select(self, ranking, spatial, original):
+        if self.adapter.mode == "base_full":
+            base = self.adapter.base
+            if spatial[:len(base)] != base:
+                raise RuntimeError("Base-guided native ranking requires Base-first spatial order")
+            ranking = ranking[:len(base)].log()
+        return self.adapter.select(self.adapter.map_ranking(ranking), spatial, original)
+
+
 class PoolDistillMethod:
     name = "pool_distill"
     adapter_class = PoolDistillAdapter
+    stage2_score_source = "distilled"
 
     def __init__(self, core, checkpoint, *, rate, share, mode, settings, pruning_audit="lean",
                  tail_drop_layers=0, predictor_input="full", base_mapping="reference", base_policy="protect",
@@ -364,14 +387,20 @@ class PoolDistillMethod:
             # Dense configuration treats keep_ratio=1 as disabled, including
             # skipping checkpoint loading. Actual ratio is assigned after the
             # pre-LLM adapter knows this image's original and sparse lengths.
-            core.configure_attention_predictor(enabled=self.share > 0, keep_ratio=.5 if self.share > 0 else 1.,
-                checkpoint=self.native.checkpoint, selection_mode=self.mode, student_layer=self.student_layer)
+            if self.stage2_score_source == "native_shallow":
+                core.configure_clse(enabled=True, keep_ratio=.5)
+            else:
+                core.configure_attention_predictor(enabled=self.share > 0, keep_ratio=.5 if self.share > 0 else 1.,
+                    checkpoint=self.native.checkpoint, selection_mode=self.mode, student_layer=self.student_layer,
+                    initial_weights=self.stage2_score_source == "copied_initial")
             self.adapter.configure(self.adapter.settings.prune_rate, capture_visualization=False)
 
     @contextmanager
     def generation_context(self, model):
         core = model.get_model()
         options = {"_pool_tail_drop_layers":self.tail_drop_layers, "_pool_predictor_input":self.predictor_input}
+        if self.stage2_score_source == "native_shallow":
+            options["_pool_fastv_adapter"] = NativeShallowRanking(self.adapter)
         previous = {name:getattr(core,name,None) for name in options}
         present = {name:hasattr(core,name) for name in options}
         try:

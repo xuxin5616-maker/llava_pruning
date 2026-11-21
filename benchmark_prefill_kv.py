@@ -29,6 +29,7 @@ RATES = (50, 70, 90)
 DATA = Path("/home/yz/xxy/data/datasets")
 FIELDS = (*mm.FIELDS[:8], KV_MIB, *mm.FIELDS[8:], "status", "reason")
 SOURCE_FIELDS = ("source", "questions", "normal", "abnormal", *FIELDS)
+ADTP_SOURCES = ("native_shallow", "copied_initial", "distilled")
 
 
 def parser():
@@ -54,14 +55,30 @@ def parser():
     p.add_argument("--annotations", type=Path, help="MMAD annotation JSON")
     p.add_argument("--image-root", type=Path, help="MMAD image container")
     p.add_argument("--mvtec-root", type=Path, default=DATA / "MVTec-AD", help="External MVTec-AD images for MMAD")
-    p.add_argument("--raba-ablation", action="store_true",
-                   help="Run only the hybrid baseline with five crop quota strategies, at 50/70/90 percent")
+    ablation = p.add_mutually_exclusive_group()
+    ablation.add_argument("--raba-ablation", action="store_true",
+                          help="Run only the hybrid baseline with five crop quota strategies, at 50/70/90 percent")
+    ablation.add_argument("--adtp-ablation", action="store_true",
+                          help="Compare native shallow, copied initial and distilled attention at 50/70/90 percent")
     p.add_argument("--resume", action="store_true", help="Resume with the saved samples, methods and GPU")
     p.add_argument("--worker", help=argparse.SUPPRESS)
     return p
 
 
-def schedule(mode, gpus, *, next_model=False, raba_ablation=False):
+def adtp_jobs(jobs, gpus):
+    hybrid_jobs = [job for job in jobs if job["method"] == "hybrid_baseline"]
+    for index, job in enumerate(hybrid_jobs):
+        gpu = gpus[index % len(gpus)]
+        for source in ADTP_SOURCES:
+            parts = [part for part in job["config"].split(";") if not part.startswith("student=")]
+            if source == "native_shallow":
+                parts = ["input=backbone_full" if part.startswith("input=") else part for part in parts]
+            student = {"native_shallow": "none", "copied_initial": "pretrained_init", "distilled": "VisA"}[source]
+            config = ";".join([*parts, f"student={student}", f"adtp_score={source}", f"gpu={gpu}"])
+            yield dict(job, job_id=f"{job['job_id']}_{source}", config=config, gpu=gpu, adtp_score=source)
+
+
+def schedule(mode, gpus, *, next_model=False, raba_ablation=False, adtp_ablation=False):
     is_mmad = mode == "mmadmode"
     if is_mmad:
         jobs = mm.schedule(RATES, [gpus[0]], base_guided_tail=8, joint_self_tails=(8,))
@@ -98,6 +115,8 @@ def schedule(mode, gpus, *, next_model=False, raba_ablation=False):
             job["config"] = f"{config};model={MODEL_NAME};resize=stretch;canvas=1152;grid=2x2"
     if raba_ablation:
         jobs = list(raba.schedule(jobs))
+    if adtp_ablation:
+        return list(adtp_jobs(jobs, gpus))
     for index, job in enumerate(job for job in jobs if job["status"] == "pending"):
         job["gpu"] = gpus[index % len(gpus)]
         job["config"] += f";gpu={job['gpu']}"
@@ -155,7 +174,8 @@ def setup(args, output):
     spec = dict(mode=args.mode, gpus=gpus, model_path=str(model), checkpoint=checkpoint, data_root=str(root),
                 model_config_sha256=common.digest(config_path), input_json=str(frozen), input_sha256=common.digest(frozen),
                 sample_count=len(rows), dataset_info=info, source_identity=source_identity(),
-                jobs=schedule(args.mode, gpus, next_model=next_model, raba_ablation=args.raba_ablation),
+                jobs=schedule(args.mode, gpus, next_model=next_model, raba_ablation=args.raba_ablation,
+                              adtp_ablation=args.adtp_ablation),
                 seed=42, warmup=10, calibration_samples=12,
                 definitions=dict(common.DEFINITIONS, post_prefill_kv=(
                     "Mean over measured samples of sum of actual decoder K/V elements times element size, divided by 2^20. "
@@ -171,6 +191,12 @@ def setup(args, output):
                 "merged-away anchors and structural newlines do not count.",
             crop_keep_rate_std_pct="Mean of the within-image population standard deviation of crop keep percentages.",
             shuffle_unchanged_pct="Percentage of images with the same integer quota vector after within-image shuffling.")
+    if args.adtp_ablation:
+        spec["adtp_ablation"] = True
+        spec["definitions"].update(
+            ttft_ms="Same as Lat. Synchronized resident inputs to first selected token, including online pruning work.",
+            adtp_score="Native block 2 Q/K on the full compressed prompt; copied initial weights from the same backbone; "
+                       "or distilled weights with the same copied branch structure. Selection policy and budget are fixed.")
     if next_model:
         spec.update(next_interleave=True, vision_tower_path=vision_path,
                     image_resize=list(next_interleave.INPUT_SIZE), native_anyres_grid=list(next_interleave.VISUAL_GRID))
@@ -203,7 +229,8 @@ def load_run(output, mode):
     elif saved != current:
         raise ValueError("An inference dependency changed; resume with the original source")
     if spec["mode"] != mode or spec["jobs"] != schedule(mode, spec["gpus"], next_model=spec.get("next_interleave", False),
-                                                       raba_ablation=spec.get("raba_ablation", False)):
+                                                       raba_ablation=spec.get("raba_ablation", False),
+                                                       adtp_ablation=spec.get("adtp_ablation", False)):
         raise ValueError("Saved benchmark mode or trial configuration differs")
     for path, digest in ((spec["input_json"], spec["input_sha256"]),
                          (Path(spec["model_path"]) / "config.json", spec["model_config_sha256"])):
@@ -237,6 +264,8 @@ def build_method(backend, samples, spec, job, output):
                                        predictor_input="base_text", base_mapping="fast", base_policy="anyres_first")
         if "raba_strategy" in job:
             method.quota_ablation = raba.QuotaAblation(method.adapter, job["raba_strategy"], job["raba_seed"])
+        if "adtp_score" in job:
+            method.stage2_score_source = job["adtp_score"]
         return method
     if name != "sparsevlm":
         from llava_pruning.visa_comparison_methods import make_method
@@ -394,6 +423,7 @@ def write_reports(output, spec):
     for job in spec["jobs"]:
         config = job["config"]
         ablation = {key: job[key] for key in ("prune_rate", "raba_strategy", "raba_seed")} if spec.get("raba_ablation") else {}
+        adtp = {key: job[key] for key in ("prune_rate", "adtp_score")} if spec.get("adtp_ablation") else {}
         result = results[job["job_id"]]
         status, reason = result.get("status", job["status"]), result.get("error", job["reason"])
         if not result and awaiting_student(spec, job):
@@ -402,7 +432,8 @@ def write_reports(output, spec):
         row = mm.metric_row(result, config, baseline.get("accuracy")) if complete else dict(config=config)
         if complete:
             row[KV_MIB] = result[KV_MIB]
-        rows.append(dict(row, **ablation, **{field: result.get(field) for field in raba.FIELDS if ablation},
+        rows.append(dict(row, **ablation, **adtp, ttft_ms=row.get("Lat"),
+                         **{field: result.get(field) for field in raba.FIELDS if ablation},
                          status=status, reason=reason))
         for source, questions in sorted(spec["dataset_info"].get("source_counts", {}).items()):
             value = result.get("sources", {}).get(source) if complete else None
@@ -410,15 +441,17 @@ def write_reports(output, spec):
             row = mm.metric_row(value, config, reference) if value else dict(config=config)
             if value:
                 row.update(normal=value["normal"], abnormal=value["abnormal"], **{KV_MIB: value[KV_MIB]})
-            sources.append(dict(row, **ablation, **{field: (value or {}).get(field) for field in raba.FIELDS if ablation},
+            sources.append(dict(row, **ablation, **adtp, ttft_ms=row.get("Lat"),
+                                **{field: (value or {}).get(field) for field in raba.FIELDS if ablation},
                                 source=source, questions=questions, status=status, reason=reason))
         budgets.append(dict(result.get("budget", {}), config=config, status=status, reason=reason,
                             target_average_prune_rate=job["prune_rate"]))
     fields = FIELDS if spec["mode"] == "mmadmode" else tuple(key for key in FIELDS if key not in {"mmad_score", "nonbinary"})
     extra_fields = ("prune_rate", "raba_strategy", "raba_seed", *raba.FIELDS) if spec.get("raba_ablation") else ()
-    common.save_csv(output / "summary.csv", rows, (*fields, *extra_fields))
+    adtp_fields = ("prune_rate", "adtp_score", "ttft_ms") if spec.get("adtp_ablation") else ()
+    common.save_csv(output / "summary.csv", rows, (*fields, *extra_fields, *adtp_fields))
     if sources:
-        common.save_csv(output / "summary_by_source.csv", sources, (*SOURCE_FIELDS, *extra_fields))
+        common.save_csv(output / "summary_by_source.csv", sources, (*SOURCE_FIELDS, *extra_fields, *adtp_fields))
     if extra_fields:
         common.save_csv(output / "raba_summary.csv", raba.summarize_trials(rows), raba.SUMMARY_FIELDS)
     common.save_csv(output / "budget_summary.csv", budgets, mm.BUDGET_FIELDS)
@@ -500,6 +533,8 @@ def run(args):
         raise ValueError("--attach-student requires --resume")
     if args.raba_ablation and (args.without_student or args.attach_student):
         raise ValueError("RABA requires a completed student checkpoint")
+    if args.adtp_ablation and (args.without_student or args.attach_student):
+        raise ValueError("ADTP requires a completed student checkpoint")
     gpus = args.gpus or ([args.gpu] if args.gpu is not None else [])
     if len(set(gpus)) != len(gpus) or any(gpu < 0 for gpu in gpus):
         raise ValueError("GPU IDs must be distinct and nonnegative")
@@ -519,6 +554,8 @@ def run(args):
         spec = load_run(folder, mode) if resuming else setup(child, folder)
         if args.raba_ablation and not spec.get("raba_ablation"):
             raise ValueError("Use a new output directory for RABA ablation")
+        if args.adtp_ablation and not spec.get("adtp_ablation"):
+            raise ValueError("Use a new output directory for ADTP ablation")
         if args.resume and devices and devices != spec["gpus"]:
             raise ValueError("Resume uses the originally assigned GPUs")
         runs.append((folder, spec))

@@ -26,6 +26,65 @@ from test_pool_spatial import _Tower
 
 class PrefillKVTests(unittest.TestCase):
     @torch.inference_mode()
+    def test_adtp_sources_share_the_hybrid_budget_and_match_copied_initialization(self):
+        from llava.model.language_model.attention_predictor import CopiedAttentionPredictor, backbone_signature
+        from llava.model.language_model.fastv_attention import last_prompt_attention
+        from llava_pruning.predictor_training import save_student
+
+        threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        self.addCleanup(torch.set_num_threads, threads)
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            checkpoint = folder / "best.pt"
+            for mode in ("mvtecmode", "mmadmode"):
+                model, options = model_and_options(28)
+                core = model.get_model()
+                student = CopiedAttentionPredictor.from_backbone(core)
+                student.layers[-1].self_attn.q_proj.weight.add_(1.)
+                distilled = student.layers[-1].self_attn.q_proj.weight.clone()
+                save_student(checkpoint, student, student_precision="float32", backbone_depth=28,
+                             teacher_layer=22, signature=backbone_signature(core.config))
+                spec = dict(mode=mode, checkpoint={"path": str(checkpoint)})
+                jobs = entry.schedule(mode, [1, 2], adtp_ablation=True)
+                self.assertEqual(len(jobs), 9)
+                for rate in (50, 70, 90):
+                    selected = [job for job in jobs if job["prune_rate"] == rate]
+                    self.assertEqual(tuple(job["adtp_score"] for job in selected), entry.ADTP_SOURCES)
+                    self.assertEqual(len({job["gpu"] for job in selected}), 1)
+                budgets = []
+                for job in jobs[-3:]:
+                    source = job["adtp_score"]
+                    with self.subTest(mode=mode, source=source), patch.object(entry, "student_identity", return_value=spec["checkpoint"]):
+                        method = entry.build_method(SimpleNamespace(model=model), [], spec, job, folder)
+                        method.configure(core, 90)
+                        if source == "native_shallow":
+                            self.assertIsNone(core.attention_predictor)
+                        else:
+                            branch = core.attention_predictor
+                            expected = (core.layers[4].self_attn.q_proj.weight if source == "copied_initial" else distilled)
+                            torch.testing.assert_close(branch.layers[-1].self_attn.q_proj.weight, expected, atol=0, rtol=0)
+                            if source == "copied_initial":
+                                method.configure(core, 90)
+                                self.assertIs(core.attention_predictor, branch)
+                        method.prepare_inputs((384, 384), options["inputs"])
+                        with method.generation_context(model), patch(
+                                "llava.model.language_model.fastv_attention.last_prompt_attention", wraps=last_prompt_attention) as native, \
+                                patch.object(method.adapter, "map_ranking", wraps=method.adapter.map_ranking) as mapping:
+                            model.generate(**options)
+                        app = method.adapter
+                        mapped_input = mapping.call_args.args[0]
+                        self.assertEqual(len(mapped_input), len(app.base if mode == "mvtecmode" else app.spatial))
+                        if source == "native_shallow":
+                            native.assert_called_once()
+                            self.assertIs(native.call_args.args[0], core.layers[1])
+                        else:
+                            native.assert_not_called()
+                        stats = method.stats(core, 90)
+                        budgets.append(tuple(stats[key] for key in ("pre_base_tokens", "pre_llm_tokens", "stage2_llm_visual_tokens")))
+                self.assertEqual(len(set(budgets)), 1)
+
+    @torch.inference_mode()
     def test_next_32_block_fixed_grid_and_high_rate_hybrid(self):
         from llava_pruning.next_interleave import INPUT_SIZE, NATIVE_PINPOINTS
 
