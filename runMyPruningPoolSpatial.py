@@ -1388,7 +1388,8 @@ def _redundancy_unit_vectors(values, description, *, compact_checks=False):
     return values / norms
 
 
-def pooled_crop_redundancy(features, grid, reduction="mean", *, audit=True, prepared=None):
+def pooled_crop_redundancy(features, grid, reduction="mean", *, audit=True, prepared=None,
+                           component="redundancy"):
     """Score each AnyRes crop by two internal pooled-token cosine groups.
 
     ``features`` is [1 + width * height, N, D], ordered Base first, then
@@ -1485,7 +1486,9 @@ def pooled_crop_redundancy(features, grid, reduction="mean", *, audit=True, prep
     if not bool(torch.isfinite(redundancy).all().item()):
         raise ValueError("pooled-cosine redundancy produced non-finite scores")
     if not audit:
-        return dict(redundancy=redundancy, base_token_counts=base_token_counts,
+        selected = {"redundancy": redundancy, "base_redundancy": base_redundancy,
+                    "anyres_redundancy": anyres_redundancy}[component]
+        return dict(redundancy=selected, base_token_counts=base_token_counts,
                     base_token_indices=base_token_indices)
     return {
         "redundancy": redundancy,

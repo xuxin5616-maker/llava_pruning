@@ -20,6 +20,7 @@ from llava_pruning.extended_metrics import extended_metrics
 from llava_pruning.mmad_source import scope_identity, working_files
 from llava_pruning.pool_distill_parallel import stop_active
 from llava_pruning.prefill_kv import KV_BYTES, KV_MIB, observe_post_prefill_kv
+from llava_pruning import raba_ablation as raba
 from visualize_mvtec_baseline import freeze, samples_for
 
 
@@ -53,12 +54,14 @@ def parser():
     p.add_argument("--annotations", type=Path, help="MMAD annotation JSON")
     p.add_argument("--image-root", type=Path, help="MMAD image container")
     p.add_argument("--mvtec-root", type=Path, default=DATA / "MVTec-AD", help="External MVTec-AD images for MMAD")
+    p.add_argument("--raba-ablation", action="store_true",
+                   help="Run only the hybrid baseline with five crop quota strategies, at 50/70/90 percent")
     p.add_argument("--resume", action="store_true", help="Resume with the saved samples, methods and GPU")
     p.add_argument("--worker", help=argparse.SUPPRESS)
     return p
 
 
-def schedule(mode, gpus, *, next_model=False):
+def schedule(mode, gpus, *, next_model=False, raba_ablation=False):
     is_mmad = mode == "mmadmode"
     if is_mmad:
         jobs = mm.schedule(RATES, [gpus[0]], base_guided_tail=8, joint_self_tails=(8,))
@@ -93,6 +96,8 @@ def schedule(mode, gpus, *, next_model=False):
                 if job["status"] == "unreachable":
                     job["reason"] = "Unreachable: first 8/32 layers keep all tokens, so average pruning must be below 75%."
             job["config"] = f"{config};model={MODEL_NAME};resize=stretch;canvas=1152;grid=2x2"
+    if raba_ablation:
+        jobs = list(raba.schedule(jobs))
     for index, job in enumerate(job for job in jobs if job["status"] == "pending"):
         job["gpu"] = gpus[index % len(gpus)]
         job["config"] += f";gpu={job['gpu']}"
@@ -134,6 +139,8 @@ def setup(args, output):
     else:
         args.data_root, args.seed, args.prompt_version = root, 42, "v0"
         rows, info = freeze(args), {}
+    if args.raba_ablation:
+        raba.freeze_masks(rows, args.mvtec_root)
     if next_model:
         for row in rows:
             path = Path(row["resolved_image"])
@@ -148,7 +155,7 @@ def setup(args, output):
     spec = dict(mode=args.mode, gpus=gpus, model_path=str(model), checkpoint=checkpoint, data_root=str(root),
                 model_config_sha256=common.digest(config_path), input_json=str(frozen), input_sha256=common.digest(frozen),
                 sample_count=len(rows), dataset_info=info, source_identity=source_identity(),
-                jobs=schedule(args.mode, gpus, next_model=next_model),
+                jobs=schedule(args.mode, gpus, next_model=next_model, raba_ablation=args.raba_ablation),
                 seed=42, warmup=10, calibration_samples=12,
                 definitions=dict(common.DEFINITIONS, post_prefill_kv=(
                     "Mean over measured samples of sum of actual decoder K/V elements times element size, divided by 2^20. "
@@ -156,6 +163,14 @@ def setup(args, output):
                     "Includes text and visual K/V, excludes allocator overhead, weights and temporary tensors."),
                     rate="Target LLM layer-average visual pruning. Hybrid tails are extra. FastV measures effective visibility.",
                     relative_accuracy="100 * ACC / the same dataset's measured unpruned ACC."))
+    if args.raba_ablation:
+        spec["raba_ablation"] = True
+        spec["definitions"].update(
+            defect_token_retention_pct="Mean of per-question retained independent AnyRes defect-overlapping patch fractions, "
+                "immediately after pre-LLM pruning. Native ground truth masks only; padding, missing or invalid masks, "
+                "merged-away anchors and structural newlines do not count.",
+            crop_keep_rate_std_pct="Mean of the within-image population standard deviation of crop keep percentages.",
+            shuffle_unchanged_pct="Percentage of images with the same integer quota vector after within-image shuffling.")
     if next_model:
         spec.update(next_interleave=True, vision_tower_path=vision_path,
                     image_resize=list(next_interleave.INPUT_SIZE), native_anyres_grid=list(next_interleave.VISUAL_GRID))
@@ -187,7 +202,8 @@ def load_run(output, mode):
         spec["jobs"] = expected
     elif saved != current:
         raise ValueError("An inference dependency changed; resume with the original source")
-    if spec["mode"] != mode or spec["jobs"] != schedule(mode, spec["gpus"], next_model=spec.get("next_interleave", False)):
+    if spec["mode"] != mode or spec["jobs"] != schedule(mode, spec["gpus"], next_model=spec.get("next_interleave", False),
+                                                       raba_ablation=spec.get("raba_ablation", False)):
         raise ValueError("Saved benchmark mode or trial configuration differs")
     for path, digest in ((spec["input_json"], spec["input_sha256"]),
                          (Path(spec["model_path"]) / "config.json", spec["model_config_sha256"])):
@@ -212,12 +228,16 @@ def build_method(backend, samples, spec, job, output):
             raise ValueError("VisA student checkpoint changed")
         path = Path(saved["path"])
         if spec["mode"] == "mmadmode":
-            return mm.make_trial_method(job, core, path)
-        from llava_pruning.pool_distill import PoolDistillMethod
-        from runMyPruningPoolSpatial import MethodSettings
-        return PoolDistillMethod(core, path, rate=rate, share=.7, mode="base_full",
-                                 settings=MethodSettings(prune_rate=0), pruning_audit="lean", tail_drop_layers=8,
-                                 predictor_input="base_text", base_mapping="fast", base_policy="anyres_first")
+            method = mm.make_trial_method(job, core, path)
+        else:
+            from llava_pruning.pool_distill import PoolDistillMethod
+            from runMyPruningPoolSpatial import MethodSettings
+            method = PoolDistillMethod(core, path, rate=rate, share=.7, mode="base_full",
+                                       settings=MethodSettings(prune_rate=0), pruning_audit="lean", tail_drop_layers=8,
+                                       predictor_input="base_text", base_mapping="fast", base_policy="anyres_first")
+        if "raba_strategy" in job:
+            method.quota_ablation = raba.QuotaAblation(method.adapter, job["raba_strategy"], job["raba_seed"])
+        return method
     if name != "sparsevlm":
         from llava_pruning.visa_comparison_methods import make_method
         return make_method(name, core, rate, None)
@@ -258,9 +278,14 @@ def evaluate(backend, method, samples, spec, job, output, total_memory):
                 stream.write(b"\n")
     start = len(records)
     rate = job["prune_rate"]
+    quota = getattr(method, "quota_ablation", None)
+    if quota is not None and any("raba" not in row for row in records):
+        raise ValueError("Saved predictions do not contain the RABA observations")
 
-    def run_image(index):
+    def run_image(index, *, audit=True):
         sample = samples[index]
+        if quota is not None:
+            quota.image_key = sample.source["image"]
         with observe_prefill(core) as lengths, observe_post_prefill_kv(core) as kv:
             result = generate(backend, method, sample, rate, spec["seed"] + index, measured=True)
         original = sum(native_counts(core, sample.source["image_size"])[1])
@@ -270,13 +295,15 @@ def evaluate(backend, method, samples, spec, job, output, total_memory):
         row[KV_BYTES] = kv[0]
         if is_mmad:
             row["canonical_answer"], row["selected_option"] = mm.canonical_answer(sample.source, result["answer"])
+        if quota is not None and audit:
+            row["raba"] = quota.observe(sample)
         return row
 
     context = method.generation_context(backend.model) if hasattr(method, "generation_context") else nullcontext()
     with context:
         if start < len(samples):
             for index in common.warmup_indices(len(samples), spec["warmup"]):
-                run_image(index)
+                run_image(index, audit=False)
         started = time.perf_counter()
         with path.open("a", encoding="utf-8") as stream:
             for index in range(start, len(samples)):
@@ -292,13 +319,17 @@ def evaluate(backend, method, samples, spec, job, output, total_memory):
         result = mm.summarize_records(records, samples, job, total_memory)
         groups = defaultdict(list)
         for row, sample in zip(records, samples):
-            groups[sample.source["dataset"]].append(row[KV_BYTES])
+            groups[sample.source["dataset"]].append(row)
         for source, values in groups.items():
-            result["sources"][source][KV_MIB] = mean(values) / 2**20
+            result["sources"][source][KV_MIB] = mean(row[KV_BYTES] for row in values) / 2**20
+            if quota is not None:
+                result["sources"][source].update(raba.summarize(values))
     else:
         result = common.summarize_records(records, len(samples), job, total_memory)
         result = extended_metrics(dict(result, nonbinary=0, mmad_score=None), 1.)
     result[KV_MIB] = mean(row[KV_BYTES] for row in records) / 2**20
+    if quota is not None:
+        result.update(raba.summarize(records))
     return result
 
 
@@ -356,12 +387,13 @@ def write_reports(output, spec):
         if result and (result["job_id"] != job["job_id"] or result["input_sha256"] != spec["input_sha256"]):
             raise ValueError("Mismatched saved comparison report")
         results[job["job_id"]] = result
-    baseline = results["llava_unpruned_00"]
+    baseline = results.get("llava_unpruned_00", {})
     if not baseline.get("complete"):
         baseline = {}
     rows, sources, budgets = [], [], []
     for job in spec["jobs"]:
         config = job["config"]
+        ablation = {key: job[key] for key in ("prune_rate", "raba_strategy", "raba_seed")} if spec.get("raba_ablation") else {}
         result = results[job["job_id"]]
         status, reason = result.get("status", job["status"]), result.get("error", job["reason"])
         if not result and awaiting_student(spec, job):
@@ -370,20 +402,25 @@ def write_reports(output, spec):
         row = mm.metric_row(result, config, baseline.get("accuracy")) if complete else dict(config=config)
         if complete:
             row[KV_MIB] = result[KV_MIB]
-        rows.append(dict(row, status=status, reason=reason))
+        rows.append(dict(row, **ablation, **{field: result.get(field) for field in raba.FIELDS if ablation},
+                         status=status, reason=reason))
         for source, questions in sorted(spec["dataset_info"].get("source_counts", {}).items()):
             value = result.get("sources", {}).get(source) if complete else None
             reference = baseline.get("sources", {}).get(source, {}).get("accuracy")
             row = mm.metric_row(value, config, reference) if value else dict(config=config)
             if value:
                 row.update(normal=value["normal"], abnormal=value["abnormal"], **{KV_MIB: value[KV_MIB]})
-            sources.append(dict(row, source=source, questions=questions, status=status, reason=reason))
+            sources.append(dict(row, **ablation, **{field: (value or {}).get(field) for field in raba.FIELDS if ablation},
+                                source=source, questions=questions, status=status, reason=reason))
         budgets.append(dict(result.get("budget", {}), config=config, status=status, reason=reason,
                             target_average_prune_rate=job["prune_rate"]))
     fields = FIELDS if spec["mode"] == "mmadmode" else tuple(key for key in FIELDS if key not in {"mmad_score", "nonbinary"})
-    common.save_csv(output / "summary.csv", rows, fields)
+    extra_fields = ("prune_rate", "raba_strategy", "raba_seed", *raba.FIELDS) if spec.get("raba_ablation") else ()
+    common.save_csv(output / "summary.csv", rows, (*fields, *extra_fields))
     if sources:
-        common.save_csv(output / "summary_by_source.csv", sources, SOURCE_FIELDS)
+        common.save_csv(output / "summary_by_source.csv", sources, (*SOURCE_FIELDS, *extra_fields))
+    if extra_fields:
+        common.save_csv(output / "raba_summary.csv", raba.summarize_trials(rows), raba.SUMMARY_FIELDS)
     common.save_csv(output / "budget_summary.csv", budgets, mm.BUDGET_FIELDS)
     return results
 
@@ -461,6 +498,8 @@ def run(args):
         raise ValueError("Staged student attachment requires --next-interleave")
     if args.attach_student and not args.resume:
         raise ValueError("--attach-student requires --resume")
+    if args.raba_ablation and (args.without_student or args.attach_student):
+        raise ValueError("RABA requires a completed student checkpoint")
     gpus = args.gpus or ([args.gpu] if args.gpu is not None else [])
     if len(set(gpus)) != len(gpus) or any(gpu < 0 for gpu in gpus):
         raise ValueError("GPU IDs must be distinct and nonnegative")
@@ -478,6 +517,8 @@ def run(args):
         child.mode, child.gpu, child.gpus, child.data_root = mode, None, devices, data_root
         resuming = args.resume and ((folder / "run.json").is_file() or not args.without_student)
         spec = load_run(folder, mode) if resuming else setup(child, folder)
+        if args.raba_ablation and not spec.get("raba_ablation"):
+            raise ValueError("Use a new output directory for RABA ablation")
         if args.resume and devices and devices != spec["gpus"]:
             raise ValueError("Resume uses the originally assigned GPUs")
         runs.append((folder, spec))

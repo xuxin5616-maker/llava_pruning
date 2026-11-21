@@ -106,6 +106,7 @@ def encode(adapter, images, *, compress_global=None):
     blocks = adapter.tower.vision_tower.vision_model.encoder.layers
     attention = blocks[-1].self_attn
     keys, scores, redundancies, handles = {}, {}, {}, []
+    component = getattr(adapter, "crop_redundancy_component", "redundancy")
     def key_hook(module, args, output):
         batch,tokens,_ = output.shape
         keys["metric"] = output.view(batch,tokens,attention.num_heads,attention.head_dim).permute(0,2,1,3).mean(1)
@@ -121,7 +122,7 @@ def encode(adapter, images, *, compress_global=None):
                 raise RuntimeError("Repeated redundancy layer")
             features = output[0] if isinstance(output,(tuple,list)) else output
             redundancies[layer] = pool.pooled_crop_redundancy(features,adapter.geometry.grid,
-                reduction=adapter.settings.redundancy_reduction,audit=False,prepared=adapter.prepared)
+                reduction=adapter.settings.redundancy_reduction,audit=False,prepared=adapter.prepared,component=component)
         return capture
     try:
         handles.append(attention.k_proj.register_forward_hook(key_hook))
@@ -152,6 +153,9 @@ def encode(adapter, images, *, compress_global=None):
     raw = redundancy.detach().to(dtype=torch.float64).cpu().numpy()
     spatial = dict(spatial_prior=adapter.prepared["spatial_prior"])
     allocation,_,base_d,base_c = adapter.allocate_view_budgets(raw,first,spatial)
+    transform = getattr(adapter, "transform_crop_quotas", None)
+    if transform is not None:
+        transform(allocation)
     keeps = [base_d+base_c]+[crop["keep"] for crop in allocation["crops"]]
     packed,decisions,roles = compress_views(features,selected_scores,keys["metric"],keeps,
         adapter.geometry.grid,adapter.core.mm_projector,adapter.core.image_newline,adapter.core.config.mm_patch_merge_type,
