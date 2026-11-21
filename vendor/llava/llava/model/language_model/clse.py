@@ -225,7 +225,10 @@ class CLSEMixin:
             raise ValueError("CLSE requires an unpadded prompt")
         prefill = cache.get_seq_length() == 0
         fastv = getattr(self, "_pool_fastv_adapter", None)
+        tail_only = getattr(self, "_pool_tail_only", False)
         boundary = fastv.student_layer if fastv is not None else self._clse_boundary()
+        if tail_only:
+            boundary = self._pool_distill_adapter.student_layer
         reference = None
         if prefill:
             if len(self._clse_spans) != 1 or len(self._clse_spans[0]) != 1 or self._clse_layout is None:
@@ -249,18 +252,21 @@ class CLSEMixin:
                                     rounding="floor packed target, reserve newlines", min_spatial_tokens=1)
             self._clse_stats.update(self._clse_extra_stats())
             self._clse_stage = None
-            with measure_pruning(self, hidden.device):
-                if fastv is None:
-                    reference, spatial_indices = self._clse_reference(hidden, start, end)
-                else:
-                    self._clse_stats.update(score="fastv_last_prompt_attention", attention_source="backbone_qk")
-                    reference, spatial_indices = fastv.reference(hidden, start, end)
-                # Check feasibility BEFORE running the decoder, not by silently clamping.
-                target = max(1, math.floor(original * self.clse_keep_ratio + 1e-10))
-                protected = original - len(spatial_indices)
-                if target <= protected:
-                    raise ValueError(f"CLSE packed budget keeps {target}/{original} tokens but {protected} structural "
-                                     "newlines plus one spatial token are required; lower the pruning target")
+            if tail_only:
+                self._clse_stats.update(score="none_tail_only", attention_source="none", stage2_llm_visual_tokens=original)
+            else:
+                with measure_pruning(self, hidden.device):
+                    if fastv is None:
+                        reference, spatial_indices = self._clse_reference(hidden, start, end)
+                    else:
+                        self._clse_stats.update(score="fastv_last_prompt_attention", attention_source="backbone_qk")
+                        reference, spatial_indices = fastv.reference(hidden, start, end)
+                    # Check feasibility BEFORE running the decoder, not by silently clamping.
+                    target = max(1, math.floor(original * self.clse_keep_ratio + 1e-10))
+                    protected = original - len(spatial_indices)
+                    if target <= protected:
+                        raise ValueError(f"CLSE packed budget keeps {target}/{original} tokens but {protected} structural "
+                                         "newlines plus one spatial token are required; lower the pruning target")
         else:
             if hidden.shape[1] != 1 or self._clse_next_position is None:
                 raise ValueError("CLSE decode needs one token and matching prefill state")
@@ -290,7 +296,7 @@ class CLSEMixin:
             physical_positions = torch.arange(physical_past, physical_past + hidden.shape[1], device=hidden.device)
             rotary = self.rotary_emb(hidden, ids)
             causal = self._pyramiddrop_causal_mask(hidden, physical_past, self.config._attn_implementation)
-            if prefill and fastv is not None and index + 1 == boundary:
+            if prefill and not tail_only and fastv is not None and index + 1 == boundary:
                 from .fastv_attention import last_prompt_attention
                 with measure_pruning(self, hidden.device):
                     ranking = last_prompt_attention(layer, hidden, rotary)[0, start:end][spatial_indices]
@@ -300,7 +306,7 @@ class CLSEMixin:
             if not prefill:
                 continue
             before, seq_before = current, hidden.shape[1]
-            if index + 1 == boundary:
+            if not tail_only and index + 1 == boundary:
                 with measure_pruning(self, hidden.device):
                     if fastv is None:
                         ranking = self._clse_rank(hidden, start, end, ids, reference)

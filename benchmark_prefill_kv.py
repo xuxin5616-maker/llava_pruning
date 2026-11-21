@@ -30,6 +30,8 @@ DATA = Path("/home/yz/xxy/data/datasets")
 FIELDS = (*mm.FIELDS[:8], KV_MIB, *mm.FIELDS[8:], "status", "reason")
 SOURCE_FIELDS = ("source", "questions", "normal", "abnormal", *FIELDS)
 ADTP_SOURCES = ("native_shallow", "copied_initial", "distilled")
+LAMBDA_SHARES = (0., .1, .3, .5, .7, .9, 1.)
+LAMBDA_BUDGET_FIELDS = ("actual_pre_contribution", "actual_distill_contribution", "stage2_llm_visual_tokens")
 
 
 def parser():
@@ -60,6 +62,8 @@ def parser():
                           help="Run only the hybrid baseline with five crop quota strategies, at 50/70/90 percent")
     ablation.add_argument("--adtp-ablation", action="store_true",
                           help="Compare native shallow, copied initial and distilled attention at 50/70/90 percent")
+    ablation.add_argument("--lambda-sweep", action="store_true",
+                          help="Run hybrid lambda 0/0.1/0.3/0.5/0.7/0.9/1 at 50/70/90 percent")
     p.add_argument("--resume", action="store_true", help="Resume with the saved samples, methods and GPU")
     p.add_argument("--worker", help=argparse.SUPPRESS)
     return p
@@ -78,7 +82,19 @@ def adtp_jobs(jobs, gpus):
             yield dict(job, job_id=f"{job['job_id']}_{source}", config=config, gpu=gpu, adtp_score=source)
 
 
-def schedule(mode, gpus, *, next_model=False, raba_ablation=False, adtp_ablation=False):
+def lambda_jobs(jobs, gpus):
+    hybrid_jobs = [job for job in jobs if job["method"] == "hybrid_baseline"]
+    for index, job in enumerate(hybrid_jobs):
+        gpu = gpus[index % len(gpus)]
+        for share in LAMBDA_SHARES:
+            config = job["config"].replace(";lambda=0.7;", f";lambda={share:g};")
+            if share == 0:
+                config = config.replace(";student=VisA", "") + ";student=none"
+            config += f";gpu={gpu}"
+            yield dict(job, job_id=f"{job['job_id']}_lambda{share:g}", config=config, gpu=gpu, distill_share=share)
+
+
+def schedule(mode, gpus, *, next_model=False, raba_ablation=False, adtp_ablation=False, lambda_sweep=False):
     is_mmad = mode == "mmadmode"
     if is_mmad:
         jobs = mm.schedule(RATES, [gpus[0]], base_guided_tail=8, joint_self_tails=(8,))
@@ -117,6 +133,8 @@ def schedule(mode, gpus, *, next_model=False, raba_ablation=False, adtp_ablation
         jobs = list(raba.schedule(jobs))
     if adtp_ablation:
         return list(adtp_jobs(jobs, gpus))
+    if lambda_sweep:
+        return list(lambda_jobs(jobs, gpus))
     for index, job in enumerate(job for job in jobs if job["status"] == "pending"):
         job["gpu"] = gpus[index % len(gpus)]
         job["config"] += f";gpu={job['gpu']}"
@@ -175,7 +193,7 @@ def setup(args, output):
                 model_config_sha256=common.digest(config_path), input_json=str(frozen), input_sha256=common.digest(frozen),
                 sample_count=len(rows), dataset_info=info, source_identity=source_identity(),
                 jobs=schedule(args.mode, gpus, next_model=next_model, raba_ablation=args.raba_ablation,
-                              adtp_ablation=args.adtp_ablation),
+                              adtp_ablation=args.adtp_ablation, lambda_sweep=args.lambda_sweep),
                 seed=42, warmup=10, calibration_samples=12,
                 definitions=dict(common.DEFINITIONS, post_prefill_kv=(
                     "Mean over measured samples of sum of actual decoder K/V elements times element size, divided by 2^20. "
@@ -197,6 +215,12 @@ def setup(args, output):
             ttft_ms="Same as Lat. Synchronized resident inputs to first selected token, including online pruning work.",
             adtp_score="Native block 2 Q/K on the full compressed prompt; copied initial weights from the same backbone; "
                        "or distilled weights with the same copied branch structure. Selection policy and budget are fixed.")
+    if args.lambda_sweep:
+        spec["lambda_sweep"] = True
+        spec["definitions"]["lambda"] = (
+            "Target layer-average pruning contribution of ADTP divided by the requested two-stage rate. "
+            "Lambda zero uses MyPool only before the tail. Lambda one uses native image packing and ADTP before the tail. "
+            "The extra eight-layer tail is excluded from both stage contributions.")
     if next_model:
         spec.update(next_interleave=True, vision_tower_path=vision_path,
                     image_resize=list(next_interleave.INPUT_SIZE), native_anyres_grid=list(next_interleave.VISUAL_GRID))
@@ -230,7 +254,8 @@ def load_run(output, mode):
         raise ValueError("An inference dependency changed; resume with the original source")
     if spec["mode"] != mode or spec["jobs"] != schedule(mode, spec["gpus"], next_model=spec.get("next_interleave", False),
                                                        raba_ablation=spec.get("raba_ablation", False),
-                                                       adtp_ablation=spec.get("adtp_ablation", False)):
+                                                       adtp_ablation=spec.get("adtp_ablation", False),
+                                                       lambda_sweep=spec.get("lambda_sweep", False)):
         raise ValueError("Saved benchmark mode or trial configuration differs")
     for path, digest in ((spec["input_json"], spec["input_sha256"]),
                          (Path(spec["model_path"]) / "config.json", spec["model_config_sha256"])):
@@ -251,7 +276,8 @@ def build_method(backend, samples, spec, job, output):
     name, rate = job["method"], job["prune_rate"]
     if name == "hybrid_baseline":
         saved = spec["checkpoint"]
-        if student_identity(saved["path"], "visa") != saved:
+        share = job.get("distill_share", .7)
+        if share and student_identity(saved["path"], "visa") != saved:
             raise ValueError("VisA student checkpoint changed")
         path = Path(saved["path"])
         if spec["mode"] == "mmadmode":
@@ -259,7 +285,7 @@ def build_method(backend, samples, spec, job, output):
         else:
             from llava_pruning.pool_distill import PoolDistillMethod
             from runMyPruningPoolSpatial import MethodSettings
-            method = PoolDistillMethod(core, path, rate=rate, share=.7, mode="base_full",
+            method = PoolDistillMethod(core, path, rate=rate, share=share, mode="base_full",
                                        settings=MethodSettings(prune_rate=0), pruning_audit="lean", tail_drop_layers=8,
                                        predictor_input="base_text", base_mapping="fast", base_policy="anyres_first")
         if "raba_strategy" in job:
@@ -319,6 +345,8 @@ def evaluate(backend, method, samples, spec, job, output, total_memory):
             result = generate(backend, method, sample, rate, spec["seed"] + index, measured=True)
         original = sum(native_counts(core, sample.source["image_size"])[1])
         budget = observed_budget(job["method"], rate, result["stats"], lengths, original, len(core.layers))
+        if spec.get("lambda_sweep"):
+            budget.update({key: result["stats"][key] for key in LAMBDA_BUDGET_FIELDS})
         row = dict(question_id=sample.sample_id, gt=sample.gt, answer=result["answer"], budget=budget,
                    **{key: result[key] for key in common.TIMING})
         row[KV_BYTES] = kv[0]
@@ -424,6 +452,7 @@ def write_reports(output, spec):
         config = job["config"]
         ablation = {key: job[key] for key in ("prune_rate", "raba_strategy", "raba_seed")} if spec.get("raba_ablation") else {}
         adtp = {key: job[key] for key in ("prune_rate", "adtp_score")} if spec.get("adtp_ablation") else {}
+        share = {key: job[key] for key in ("prune_rate", "distill_share")} if spec.get("lambda_sweep") else {}
         result = results[job["job_id"]]
         status, reason = result.get("status", job["status"]), result.get("error", job["reason"])
         if not result and awaiting_student(spec, job):
@@ -432,7 +461,7 @@ def write_reports(output, spec):
         row = mm.metric_row(result, config, baseline.get("accuracy")) if complete else dict(config=config)
         if complete:
             row[KV_MIB] = result[KV_MIB]
-        rows.append(dict(row, **ablation, **adtp, ttft_ms=row.get("Lat"),
+        rows.append(dict(row, **ablation, **adtp, **share, ttft_ms=row.get("Lat"),
                          **{field: result.get(field) for field in raba.FIELDS if ablation},
                          status=status, reason=reason))
         for source, questions in sorted(spec["dataset_info"].get("source_counts", {}).items()):
@@ -441,20 +470,22 @@ def write_reports(output, spec):
             row = mm.metric_row(value, config, reference) if value else dict(config=config)
             if value:
                 row.update(normal=value["normal"], abnormal=value["abnormal"], **{KV_MIB: value[KV_MIB]})
-            sources.append(dict(row, **ablation, **adtp, ttft_ms=row.get("Lat"),
+            sources.append(dict(row, **ablation, **adtp, **share, ttft_ms=row.get("Lat"),
                                 **{field: (value or {}).get(field) for field in raba.FIELDS if ablation},
                                 source=source, questions=questions, status=status, reason=reason))
-        budgets.append(dict(result.get("budget", {}), config=config, status=status, reason=reason,
+        budgets.append(dict(result.get("budget", {}), **share, config=config, status=status, reason=reason,
                             target_average_prune_rate=job["prune_rate"]))
     fields = FIELDS if spec["mode"] == "mmadmode" else tuple(key for key in FIELDS if key not in {"mmad_score", "nonbinary"})
     extra_fields = ("prune_rate", "raba_strategy", "raba_seed", *raba.FIELDS) if spec.get("raba_ablation") else ()
     adtp_fields = ("prune_rate", "adtp_score", "ttft_ms") if spec.get("adtp_ablation") else ()
-    common.save_csv(output / "summary.csv", rows, (*fields, *extra_fields, *adtp_fields))
+    lambda_fields = ("prune_rate", "distill_share") if spec.get("lambda_sweep") else ()
+    common.save_csv(output / "summary.csv", rows, (*fields, *extra_fields, *adtp_fields, *lambda_fields))
     if sources:
-        common.save_csv(output / "summary_by_source.csv", sources, (*SOURCE_FIELDS, *extra_fields, *adtp_fields))
+        common.save_csv(output / "summary_by_source.csv", sources, (*SOURCE_FIELDS, *extra_fields, *adtp_fields, *lambda_fields))
     if extra_fields:
         common.save_csv(output / "raba_summary.csv", raba.summarize_trials(rows), raba.SUMMARY_FIELDS)
-    common.save_csv(output / "budget_summary.csv", budgets, mm.BUDGET_FIELDS)
+    budget_fields = (*mm.BUDGET_FIELDS, *lambda_fields, *LAMBDA_BUDGET_FIELDS) if lambda_fields else mm.BUDGET_FIELDS
+    common.save_csv(output / "budget_summary.csv", budgets, budget_fields)
     return results
 
 
@@ -535,6 +566,8 @@ def run(args):
         raise ValueError("RABA requires a completed student checkpoint")
     if args.adtp_ablation and (args.without_student or args.attach_student):
         raise ValueError("ADTP requires a completed student checkpoint")
+    if args.lambda_sweep and (args.without_student or args.attach_student):
+        raise ValueError("The lambda sweep requires a completed student checkpoint")
     gpus = args.gpus or ([args.gpu] if args.gpu is not None else [])
     if len(set(gpus)) != len(gpus) or any(gpu < 0 for gpu in gpus):
         raise ValueError("GPU IDs must be distinct and nonnegative")
@@ -556,6 +589,8 @@ def run(args):
             raise ValueError("Use a new output directory for RABA ablation")
         if args.adtp_ablation and not spec.get("adtp_ablation"):
             raise ValueError("Use a new output directory for ADTP ablation")
+        if args.lambda_sweep and not spec.get("lambda_sweep"):
+            raise ValueError("Use a new output directory for the lambda sweep")
         if args.resume and devices and devices != spec["gpus"]:
             raise ValueError("Resume uses the originally assigned GPUs")
         runs.append((folder, spec))

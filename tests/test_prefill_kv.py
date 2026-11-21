@@ -26,6 +26,51 @@ from test_pool_spatial import _Tower
 
 class PrefillKVTests(unittest.TestCase):
     @torch.inference_mode()
+    def test_lambda_sweep_endpoints_disable_the_correct_stage_and_keep_tail(self):
+        threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        self.addCleanup(torch.set_num_threads, threads)
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            checkpoint = folder / "best.pt"
+            for mode in ("mvtecmode", "mmadmode"):
+                jobs = entry.schedule(mode, [1, 2], lambda_sweep=True)
+                self.assertEqual(len({job["job_id"] for job in jobs}), 21)
+                for rate in (50, 70, 90):
+                    self.assertEqual(tuple(j["distill_share"] for j in jobs if j["prune_rate"] == rate), entry.LAMBDA_SHARES)
+                model, options = model_and_options(28)
+                core = model.get_model()
+                core.config.image_grid_pinpoints = [[768, 384]]
+                core.vision_tower = _Tower()
+                core.vision_tower.features = core.vision_tower.features[:3]
+                size = (700, 300)
+                options.update(images=[torch.zeros(3, 3, 384, 384)], image_sizes=[size])
+                make_checkpoint(checkpoint, core)
+                spec = dict(mode=mode, checkpoint={"path": str(checkpoint)})
+                for job in jobs[-7:]:
+                    share = job["distill_share"]
+                    with self.subTest(mode=mode, share=share), patch.object(entry, "student_identity", return_value=spec["checkpoint"]):
+                        method = entry.build_method(SimpleNamespace(model=model), [], spec, job, folder)
+                        method.configure(core, 90)
+                        self.assertEqual(core.attention_predictor is None, share == 0)
+                        method.prepare_inputs(size, options["inputs"])
+                        with method.generation_context(model), patch.object(
+                                method.adapter, "encode_images", wraps=method.adapter.encode_images) as pre_stage, \
+                                patch.object(method.adapter, "rank", wraps=method.adapter.rank) as post_stage:
+                            model.generate(**options)
+                        self.assertEqual(pre_stage.call_count, int(share != 1))
+                        self.assertEqual(post_stage.call_count, int(share != 0))
+                        stats = method.stats(core, 90)
+                        pre, final = stats["pre_llm_tokens"], stats["stage2_llm_visual_tokens"]
+                        self.assertAlmostEqual(stats["two_stage_average_prune_rate"], 90, delta=.08)
+                        self.assertAlmostEqual(stats["actual_pre_contribution"], (1-share) * 90, delta=.08)
+                        self.assertAlmostEqual(stats["actual_distill_contribution"], share * 90, delta=.08)
+                        rows = core.get_clse_stats()["layers"]
+                        self.assertEqual([row["image_tokens_in"] for row in rows], [pre] * 2 + [final] * 18 + [0] * 8)
+                        if share == 1 and mode == "mvtecmode":
+                            self.assertLess(stats["stage2_base_tokens"], stats["pre_base_tokens"])
+
+    @torch.inference_mode()
     def test_adtp_sources_share_the_hybrid_budget_and_match_copied_initialization(self):
         from llava.model.language_model.attention_predictor import CopiedAttentionPredictor, backbone_signature
         from llava.model.language_model.fastv_attention import last_prompt_attention

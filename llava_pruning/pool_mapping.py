@@ -97,6 +97,13 @@ def prepare_mapping_sources(decisions, grid):
                 base_count=len(parsed[0][2]),anyres_count=len(inverse[1]))
 
 
+def sample_base_scores(dense, geometry):
+    count = geometry["coordinates"].shape[0]
+    maps = F.grid_sample(dense.reshape(1, 1, 27, 27).expand(count, -1, -1, -1), geometry["coordinates"],
+                         mode="bilinear", padding_mode="border", align_corners=False)[:, 0]
+    return maps.masked_fill(geometry["padding"], 0)
+
+
 def mapped_scores_fast(base_log, sources, geometry):
     with torch.autocast(device_type=base_log.device.type,enabled=False):
         probability=F.softmax(base_log.float(),dim=0)
@@ -104,11 +111,25 @@ def mapped_scores_fast(base_log, sources, geometry):
         dense=probability.new_zeros(729).index_add(0,source,probability[owner]*weight)
         if not torch.isclose(dense.sum(),probability.new_tensor(1.),atol=1e-5):
             raise RuntimeError("Base source backprojection lost probability mass")
-        count=geometry["coordinates"].shape[0]
-        maps=F.grid_sample(dense.reshape(1,1,27,27).expand(count,-1,-1,-1),geometry["coordinates"],
-                           mode="bilinear",padding_mode="border",align_corners=False)[:,0]
-        maps=maps.masked_fill(geometry["padding"],0).flatten()
+        maps=sample_base_scores(dense,geometry).flatten()
         owner,source,weight=sources["anyres"]
         scores=probability.new_zeros(sources["anyres_count"]).index_add(0,owner,maps[source]*weight)
         joined=torch.cat((probability,scores)).clamp_min(torch.finfo(torch.float32).tiny).log()
         return joined-torch.logsumexp(joined,dim=0)
+
+
+def mapped_native_scores(base_log, mapping_geometry, geometry, anyres_grid):
+    """Project onto the same raw centers, then apply the native packing geometry."""
+    from llava.model.llava_arch import unpad_image
+
+    width, height = geometry.grid
+    shape = (anyres_grid["rows"], anyres_grid["cols"])
+    with torch.autocast(device_type=base_log.device.type, enabled=False):
+        probability = F.softmax(base_log.float(), dim=0)
+        views = sample_base_scores(probability, mapping_geometry)
+        tiled = views.reshape(height, width, 27, 27).permute(0, 2, 1, 3).reshape(1, height * 27, width * 27)
+        mapped = unpad_image(tiled, geometry.original_size)
+        if mapped.shape[-2:] != shape:
+            mapped = F.interpolate(mapped[None], size=shape, mode="bilinear", align_corners=False)[0]
+        joined = torch.cat((probability, mapped.flatten())).clamp_min(torch.finfo(torch.float32).tiny).log()
+        return joined - torch.logsumexp(joined, dim=0)

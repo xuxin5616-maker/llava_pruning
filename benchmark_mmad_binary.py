@@ -186,7 +186,7 @@ def make_trial_method(job, core, checkpoint):
         if job["method"]!="hybrid_baseline": raise ValueError("Joint-self variant requires hybrid_baseline")
         from llava_pruning.pool_distill import PoolDistillMethod
         from runMyPruningPoolSpatial import MethodSettings
-        return PoolDistillMethod(core,checkpoint,rate=job["prune_rate"],share=.7,mode="anyres_self",
+        return PoolDistillMethod(core,checkpoint,rate=job["prune_rate"],share=job.get("distill_share",.7),mode="anyres_self",
             settings=MethodSettings(prune_rate=0),pruning_audit="lean",tail_drop_layers=job.get("tail_drop_layers",0),
             predictor_input="full",base_mapping="reference",base_policy="joint")
     if job.get("variant") not in {None,"base_guided"}: raise ValueError("Unknown MMAD hybrid variant")

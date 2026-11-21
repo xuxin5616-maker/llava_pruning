@@ -161,13 +161,17 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         self.prepare_mapping_geometry()
 
     def prepare_mapping_geometry(self):
-        if self.base_mapping!="fast" or self.mode!="base_full":
+        if (self.base_mapping != "fast" and self.share != 1) or self.mode != "base_full":
             return
         key=tuple(self.original_size)
         if key not in self._mapping_geometry_cache:
             from .pool_mapping import prepare_mapping_geometry
             self._mapping_geometry_cache[key]=prepare_mapping_geometry(self.geometry,self.core.image_newline.device)
         self.mapping_geometry=self._mapping_geometry_cache[key]
+
+    def prepare_native(self, original_size):
+        super().set_image_context(original_size)
+        self.prepare_mapping_geometry()
 
     def allocate_view_budgets(self, raw_redundancy, first, spatial):
         # Choose an interior point of the ceil interval to avoid FP/Decimal
@@ -244,8 +248,19 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
             sparse=True, pre_pruning_applied=True)
 
     def reference(self, hidden, start, end):
-        if end - start != len(self.records):
-            raise ValueError("Hybrid image span does not match provenance")
+        if self.share == 1:
+            from llava.model.language_model.attention_predictor_selection import named_spatial_grids
+
+            grids = named_spatial_grids(self.core._clse_layout)
+            self.base, self.anyres = grids["base"]["indices"], grids["anyres"]["indices"]
+            self.spatial = sorted(self.base + self.anyres)
+            if self.spatial != self.base + self.anyres:
+                raise ValueError("Hybrid native layout requires Base-first packing")
+            self.protected = sorted(set(range(end - start)) - set(self.spatial))
+            self.plan = hybrid_budget(end - start, self.rate, self.share, len(self.core.layers), self.student_layer)
+            self.core.clse_keep_ratio = self.plan["final_llm_tokens"] / self.plan["pre_llm_tokens"]
+        if end - start != self.plan["pre_llm_tokens"]:
+            raise ValueError("Hybrid image span does not match its packed budget")
         stage2_view_budget(self.plan["final_llm_tokens"], len(self.base), len(self.protected), self.base_policy)
         return None, self.spatial
 
@@ -254,14 +269,18 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         positions = self.base if self.mode == "base_full" else self.spatial
         indices = [start + i for i in positions]
         if self.predictor_input == "base_text":
-            hidden, ids, indices = base_text_predictor_inputs(hidden, ids, start, start+len(self.records), self.base)
+            hidden, ids, indices = base_text_predictor_inputs(hidden, ids, start, start+self.plan["pre_llm_tokens"], self.base)
         with student_autocast(hidden.device, self.core._predictor_precision):
             scores = self.core.attention_predictor(hidden, ids, indices)
         return self.map_ranking(scores)
 
     def map_ranking(self, scores):
         if self.mode == "base_full":
-            if self.base_mapping=="fast":
+            if self.share == 1:
+                from .pool_mapping import mapped_native_scores
+                anyres = next(grid for grid in self.core._clse_layout["grids"] if grid["name"] == "anyres")
+                scores = mapped_native_scores(scores, self.mapping_geometry, self.geometry, anyres)
+            elif self.base_mapping=="fast":
                 from .pool_mapping import mapped_scores_fast
                 scores=mapped_scores_fast(scores,self.mapping_sources,self.mapping_geometry)
             else:
@@ -272,7 +291,7 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         return scores
 
     def select(self, ranking, spatial, original):
-        if spatial != self.spatial or original != len(self.records):
+        if spatial != self.spatial or original != self.plan["pre_llm_tokens"]:
             raise ValueError("Hybrid selection mismatches sparse token order")
         if self.base_policy == "joint":
             budget = stage2_view_budget(self.plan["final_llm_tokens"], len(self.base), len(self.protected), "joint")
@@ -348,15 +367,15 @@ class PoolDistillMethod:
             raise ValueError("Fast Base mapping requires pruning_audit=lean")
         if base_policy not in {"protect", "anyres_first", "joint"}:
             raise ValueError("Unknown stage2 Base policy")
-        if base_policy in {"anyres_first", "joint"} and not (0 < share < 1 and rate > 0):
-            raise ValueError(f"{base_policy} requires an active two-stage hybrid (0 < lambda < 1)")
+        if base_policy in {"anyres_first", "joint"} and not rate > 0:
+            raise ValueError(f"{base_policy} requires a positive hybrid pruning rate")
         self.base_policy = base_policy
         if type(tail_drop_layers) is not int or not 0 <= tail_drop_layers <= len(core.layers)-student_layer:
             raise ValueError("Tail removal must be nonnegative and begin after the student boundary")
         if predictor_input not in {"full","base_text"} or (predictor_input=="base_text" and mode!="base_full"):
             raise ValueError("Base+Text predictor input requires base_full mode")
-        if (tail_drop_layers or predictor_input=="base_text") and (share==0 or rate==0):
-            raise ValueError("Ablations require an active distilled pruning stage")
+        if (tail_drop_layers or predictor_input=="base_text") and rate==0:
+            raise ValueError("Ablations require a positive hybrid pruning rate")
         self.tail_drop_layers, self.predictor_input = tail_drop_layers, predictor_input
         self.adapter = self.adapter_class(core, settings, rate=rate, share=share, mode=mode,
             lean=pruning_audit=="lean", predictor_input=predictor_input, base_mapping=base_mapping,
@@ -365,6 +384,9 @@ class PoolDistillMethod:
 
     def prepare_inputs(self, original_size, tokens):
         """Static geometry/prompt metadata belongs to input preparation, before Lat."""
+        if self.share == 1 and self.base_policy != "protect":
+            self.adapter.prepare_native(original_size)
+            return
         if not self.adapter.lean or self.share == 1 or self.rate == 0:
             return
         from llava.constants import IMAGE_TOKEN_INDEX
@@ -387,7 +409,7 @@ class PoolDistillMethod:
             # Dense configuration treats keep_ratio=1 as disabled, including
             # skipping checkpoint loading. Actual ratio is assigned after the
             # pre-LLM adapter knows this image's original and sparse lengths.
-            if self.stage2_score_source == "native_shallow":
+            if self.stage2_score_source == "native_shallow" or (self.share == 0 and self.tail_drop_layers):
                 core.configure_clse(enabled=True, keep_ratio=.5)
             else:
                 core.configure_attention_predictor(enabled=self.share > 0, keep_ratio=.5 if self.share > 0 else 1.,
@@ -399,6 +421,8 @@ class PoolDistillMethod:
     def generation_context(self, model):
         core = model.get_model()
         options = {"_pool_tail_drop_layers":self.tail_drop_layers, "_pool_predictor_input":self.predictor_input}
+        if self.share == 0 and self.tail_drop_layers:
+            options["_pool_tail_only"] = True
         if self.stage2_score_source == "native_shallow":
             options["_pool_fastv_adapter"] = NativeShallowRanking(self.adapter)
         previous = {name:getattr(core,name,None) for name in options}
@@ -417,13 +441,16 @@ class PoolDistillMethod:
 
     @contextmanager
     def _generation_context(self, model):
-        if self.share == 1 or self.rate == 0:
+        if self.rate == 0 or (self.share == 1 and self.base_policy == "protect"):
             yield
             return
         core = model.get_model()
         previous = getattr(core, "_pool_distill_adapter", None)
         core._pool_distill_adapter = self.adapter
         try:
+            if self.share == 1:
+                yield
+                return
             with pool.visionzip_generation(model, self.adapter):
                 prepare = model.prepare_inputs_labels_for_multimodal
                 def wrapped(this, *args, **kwargs):
@@ -448,7 +475,7 @@ class PoolDistillMethod:
             final = raw.get("stage2_llm_visual_tokens", raw["final_llm_visual_tokens"])
         else:
             plan = self.adapter.plan
-            raw = dict(core.get_clse_stats()) if self.share > 0 else {}
+            raw = dict(core.get_clse_stats()) if self.share > 0 or self.tail_drop_layers else {}
             original, pre = plan["baseline_packed_tokens"], plan["pre_llm_tokens"]
             final = raw.get("stage2_llm_visual_tokens", raw["final_llm_visual_tokens"]) if self.share > 0 else pre
         if final != plan["final_llm_tokens"]:
@@ -467,7 +494,9 @@ class PoolDistillMethod:
             base, protected = self.adapter.view_plan["base_keep"], self.adapter.view_plan["protected_newlines"]
             anyres = pre - base - protected
         tail = self.tail_drop_layers
-        if self.base_policy == "joint":
+        if self.share == 0:
+            stage2 = dict(base_keep=base, anyres_keep=anyres)
+        elif self.base_policy == "joint":
             if self.adapter.stage2_counts is None:
                 raise RuntimeError("Joint Base/AnyRes counts were not observed")
             stage2 = {key:int(value) for key,value in self.adapter.stage2_counts.items()}
@@ -475,9 +504,12 @@ class PoolDistillMethod:
                 raise RuntimeError("Observed joint counts disagree with the image budget")
         else:
             stage2 = stage2_view_budget(final, base, protected, self.base_policy)
-        last_visual = raw["final_llm_visual_tokens"] if self.share > 0 else pre
+        last_visual = raw["final_llm_visual_tokens"] if raw else pre
         if last_visual != (0 if tail else final):
             raise RuntimeError("Tail image-drop result differs from the requested ablation")
+        pre_policy = "Native packing preserves Base" if self.share == 1 else "MyPool compresses Base"
+        position_policy = "Native prefill IDs; stage2 preserves these IDs" if self.share == 1 else (
+            "MyPool consecutive prefill IDs; stage2 preserves these IDs")
         return dict(plan, selection_mode=self.mode, predictor_input=self.predictor_input,
                     tail_drop_layers=tail, tail_drop_first_layer=depth-tail+1 if tail else None,
                     two_stage_average_prune_rate=plan["actual_average_prune_rate"],
@@ -491,11 +523,13 @@ class PoolDistillMethod:
                     final_llm_visual_tokens=last_visual,
                     actual_average_prune_rate=100 * (1 - observed / (depth * original)),
                     stage2_base_policy=self.base_policy,
-                    base_policy=("MyPool compresses Base; stage2 ranks Base and AnyRes jointly, with no group quotas" if self.base_policy=="joint" else
-                                 "MyPool compresses Base; stage2 protects remaining Base" if self.base_policy=="protect" else
-                                 "MyPool compresses Base; stage2 prunes AnyRes first, then lowest-scoring Base"),
-                    position_policy="MyPool consecutive prefill IDs; stage2 preserves these IDs",
-                    source_policy="normalized original merge coefficients; Base backprojection preserves probability mass")
+                    base_policy=pre_policy + ("; stage2 disabled" if self.share == 0 else
+                                "; stage2 ranks Base and AnyRes jointly, with no group quotas" if self.base_policy=="joint" else
+                                "; stage2 protects remaining Base" if self.base_policy=="protect" else
+                                "; stage2 prunes AnyRes first, then lowest-scoring Base"),
+                    position_policy=position_policy,
+                    source_policy=("native unpad and resize geometry" if self.share == 1 else
+                                   "normalized original merge coefficients; Base backprojection preserves probability mass"))
 
     def recover_legacy_budget(self, original_size):
         """Reconstruct deterministic integer counts, not scores or observed rows.
