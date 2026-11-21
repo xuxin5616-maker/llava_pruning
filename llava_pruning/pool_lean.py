@@ -54,7 +54,8 @@ def pack_device_rows(projected_views, decisions, grid, newline, merge_type, *, p
     return packed, roles
 
 
-def compress_views(features, scores, metric, keeps, grid, projector, newline, merge_type, *, source_provenance=True, prepared=None):
+def compress_views(features, scores, metric, keeps, grid, projector, newline, merge_type, *, source_provenance=True,
+                   prepared=None, minimum_crop_keep=pool.MINIMUM_CROP_KEEP):
     if features.shape[:2] != scores.shape or metric.shape[:2] != scores.shape:
         raise ValueError("Lean compression feature/score/Key shapes disagree")
     if features.shape[0] != len(keeps) or features.shape[1] != 729:
@@ -66,7 +67,8 @@ def compress_views(features, scores, metric, keeps, grid, projector, newline, me
     spatial_indices=prepared["spatial_indices"] if prepared is not None else torch.arange(729,device=features.device)
     compressed, decisions = [], []
     for view,keep in enumerate(keeps):
-        if type(keep) is not int or not 4 <= keep <= 729:
+        minimum = minimum_crop_keep if view else pool.MINIMUM_CROP_KEEP
+        if type(keep) is not int or not minimum <= keep <= 729:
             raise ValueError("Invalid lean view quota")
         dominant = keep if keep == 729 else round(keep*pool.DOMINANT_RATIO)
         output, decision = pool.compress_tokens(features[view:view+1],scores[view:view+1],metric[view:view+1],
@@ -159,7 +161,8 @@ def encode(adapter, images, *, compress_global=None):
     keeps = [base_d+base_c]+[crop["keep"] for crop in allocation["crops"]]
     packed,decisions,roles = compress_views(features,selected_scores,keys["metric"],keeps,
         adapter.geometry.grid,adapter.core.mm_projector,adapter.core.image_newline,adapter.core.config.mm_patch_merge_type,
-        source_provenance=adapter.mode=="base_full",prepared=adapter.prepared)
+        source_provenance=adapter.mode=="base_full",prepared=adapter.prepared,
+        minimum_crop_keep=getattr(adapter, "minimum_crop_keep", pool.MINIMUM_CROP_KEEP))
     adapter.allocation,adapter.device_decisions,adapter.roles = allocation,decisions,roles
     # Minimal fields consumed by prepare/pack, no reporting lists or heatmaps.
     adapter.stats = dict(final_llm_visual_tokens=len(packed),full_grid_identity=False)

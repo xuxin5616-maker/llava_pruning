@@ -54,7 +54,8 @@ def stage2_view_budget(final, base, protected, base_policy="protect"):
     return dict(base_keep=base_keep, anyres_keep=content-base_keep, protected_newlines=protected)
 
 
-def pre_view_budget(plan, crop_count, side=27, final_newline=False, minimum=4, base_policy="protect"):
+def pre_view_budget(plan, crop_count, side=27, final_newline=False, minimum=4, base_policy="protect",
+                    *, minimum_crop_keep=None):
     """Split the exact packed pre-budget proportionally between Base / AnyRes.
 
     MyPool's sparse row newlines are reserved BEFORE content apportionment.
@@ -62,19 +63,22 @@ def pre_view_budget(plan, crop_count, side=27, final_newline=False, minimum=4, b
     """
     if type(crop_count) is not int or crop_count < 1 or type(side) is not int or side < 1:
         raise ValueError("Invalid crop geometry")
+    crop_minimum = minimum if minimum_crop_keep is None else minimum_crop_keep
+    if type(crop_minimum) is not int or not 0 <= crop_minimum <= side * side:
+        raise ValueError("Invalid AnyRes crop minimum")
     # caller supplies actual grid HEIGHT in plan, never assumes a square grid.
     rows = plan["raw_grid_height"] * side
     protected = rows + int(final_newline)
     content = plan["pre_llm_tokens"] - protected
     capacities = (side * side, crop_count * side * side)
     total = sum(capacities)
-    if not (crop_count + 1) * minimum <= content <= total:
+    if not minimum + crop_count * crop_minimum <= content <= total:
         raise ValueError("Pre-budget cannot preserve MyPool crop minima and raw row newlines")
     keeps, remainders = zip(*(divmod(content * c, total) for c in capacities))
     keeps = list(keeps)
     for i in sorted(range(2), key=lambda i: (-remainders[i], i))[:content - sum(keeps)]:
         keeps[i] += 1
-    if keeps[0] < minimum or keeps[1] < crop_count * minimum:
+    if keeps[0] < minimum or keeps[1] < crop_count * crop_minimum:
         raise ValueError("Pre-budget cannot preserve independent Base / AnyRes minima")
     stage2_view_budget(plan["final_llm_tokens"], keeps[0], protected, base_policy)
     return dict(base_keep=keeps[0], anyres_keep=keeps[1], protected_newlines=protected)

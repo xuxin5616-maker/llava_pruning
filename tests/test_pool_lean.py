@@ -23,6 +23,22 @@ from llava_pruning.backend import LlavaBackend
 
 
 class LeanPoolTests(unittest.TestCase):
+    def test_small_anyres_quotas_keep_the_original_split_and_structural_rows(self):
+        features = torch.randn(5, 729, 8)
+        scores = torch.rand(5, 729)
+        keys = torch.randn(5, 729, 4)
+        quota = [400, 0, 1, 2, 3]
+        projector = torch.nn.Identity()
+        newline = torch.full((8,), -1.)
+        packed, decisions, roles = compress_views(features, scores, keys, quota, (2, 2), projector,
+                                                    newline, "spatial_unpad", minimum_crop_keep=0)
+        self.assertEqual(packed.shape[0], sum(quota) + 54)
+        self.assertEqual(int((roles == 2).sum()), 54)
+        for keep, decision in zip(quota[1:], decisions[1:]):
+            self.assertEqual(decision["dominant_count"], keep)
+            self.assertEqual(decision["contextual_count"], 0)
+            self.assertTrue(bool((decision["cluster_assignments"] == -1).all()))
+
     @classmethod
     def setUpClass(cls):
         cls.threads=torch.get_num_threads()

@@ -115,6 +115,8 @@ def mapped_scores(base_log, base_records, anyres_records, geometry):
 
 
 class PoolDistillAdapter(pool.CustomPruningAdapter):
+    minimum_crop_keep = pool.MINIMUM_CROP_KEEP
+
     def __init__(self, core, settings, *, rate, share, mode, lean=False, predictor_input="full", base_mapping="reference",
                  base_policy="protect", student_layer=2):
         super().__init__(core, settings)
@@ -146,7 +148,7 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         self.plan["raw_grid_height"] = self.geometry.grid[1]
         self.view_plan = pre_view_budget(self.plan, self.geometry.tile_count,
                                         final_newline=self.core.config.mm_patch_merge_type.endswith("_add_newl"),
-                                        base_policy=self.base_policy)
+                                        base_policy=self.base_policy, minimum_crop_keep=self.minimum_crop_keep)
         if self.lean:
             from .pool_lean import prepare_geometry
             shape_key=(tuple(self.geometry.grid),self.geometry.token_side)
@@ -179,11 +181,11 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         # it is NOT the public experiment rate.
         target = self.view_plan["anyres_keep"]
         raw = self.geometry.tile_count * 729
-        allocator_rate = 100 * (1 - (target - .25) / raw)
+        allocator_rate = 100 * (1 - (target - .25) / raw) if target else 100.
         allocation, probability = pool.allocate_spatial_probability_budgets(
             raw_redundancy, first["base_token_indices"], self.geometry.grid, spatial["spatial_prior"],
             prune_rate=allocator_rate, mix_weight=self.settings.spatial_strength,
-            temperature=self.settings.allocation_temperature, minimum_keep=pool.MINIMUM_CROP_KEEP,audit=not self.lean)
+            temperature=self.settings.allocation_temperature, minimum_keep=self.minimum_crop_keep, audit=not self.lean)
         if allocation["target_anyres_keep"] != target:
             raise RuntimeError("MyPool allocator changed the exact hybrid AnyRes target")
         keep = self.view_plan["base_keep"]
@@ -291,7 +293,8 @@ class PoolDistillAdapter(pool.CustomPruningAdapter):
         return scores
 
     def select(self, ranking, spatial, original):
-        if spatial != self.spatial or original != self.plan["pre_llm_tokens"]:
+        packed_tokens = len(self.records) if self.records is not None else self.plan["pre_llm_tokens"]
+        if spatial != self.spatial or original != packed_tokens:
             raise ValueError("Hybrid selection mismatches sparse token order")
         if self.base_policy == "joint":
             budget = stage2_view_budget(self.plan["final_llm_tokens"], len(self.base), len(self.protected), "joint")

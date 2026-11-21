@@ -26,6 +26,55 @@ from test_pool_spatial import _Tower
 
 class PrefillKVTests(unittest.TestCase):
     @torch.inference_mode()
+    def test_kmin_sweep_respects_each_crop_floor_with_fixed_hybrid_budgets(self):
+        threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        self.addCleanup(torch.set_num_threads, threads)
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            checkpoint = folder / "best.pt"
+            for mode in ("mvtecmode", "mmadmode"):
+                jobs = entry.schedule(mode, [1, 2], kmin_sweep=True)
+                self.assertEqual(len({job["job_id"] for job in jobs}), 15)
+                for rate in (50, 70, 90):
+                    self.assertEqual(tuple(job["kmin"] for job in jobs if job["prune_rate"] == rate), entry.KMIN_VALUES)
+                model, options = model_and_options(28)
+                core = model.get_model()
+                core.config.image_grid_pinpoints = [[768, 768]]
+                core.vision_tower = _Tower()
+                core.vision_tower.features = core.vision_tower.features[:5]
+                size = (768, 768)
+                options.update(images=[torch.zeros(5, 3, 384, 384)], image_sizes=[size], max_new_tokens=1)
+                make_checkpoint(checkpoint, core)
+                spec = dict(mode=mode, checkpoint={"path": str(checkpoint)})
+                original = next(job for job in entry.schedule(mode, [1])
+                                if job["method"] == "hybrid_baseline" and job["prune_rate"] == 90)
+                expected = None
+                for job in (original, *jobs[-5:]):
+                    with self.subTest(mode=mode, kmin=job.get("kmin")), \
+                            patch.object(entry, "student_identity", return_value=spec["checkpoint"]):
+                        method = entry.build_method(SimpleNamespace(model=model), [], spec, job, folder)
+                        method.configure(core, 90)
+                        method.prepare_inputs(size, options["inputs"])
+                        allocate = method.adapter.allocate_view_budgets
+                        # Three crops can absorb the budget; almost no mass goes to the fourth.
+                        scores = torch.tensor([0., 0., 0., 2.]).numpy()
+                        with method.generation_context(model), patch.object(
+                                method.adapter, "allocate_view_budgets", side_effect=lambda raw, first, spatial: allocate(scores, first, spatial)):
+                            result = model.generate(**options)
+                        keeps = [crop["keep"] for crop in method.adapter.allocation["crops"]]
+                        self.assertEqual(keeps[-1], job.get("kmin", 4))
+                        stats = method.stats(core, 90)
+                        counts = tuple(stats[key] for key in ("pre_base_tokens", "pre_anyres_tokens", "stage2_llm_visual_tokens"))
+                        if expected is None:
+                            expected = counts, keeps, result.sequences
+                        else:
+                            self.assertEqual(counts, expected[0])
+                            if job["kmin"] == 4:
+                                self.assertEqual(keeps, expected[1])
+                                torch.testing.assert_close(result.sequences, expected[2], rtol=0, atol=0)
+
+    @torch.inference_mode()
     def test_lambda_sweep_endpoints_disable_the_correct_stage_and_keep_tail(self):
         threads = torch.get_num_threads()
         torch.set_num_threads(1)
